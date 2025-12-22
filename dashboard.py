@@ -1880,12 +1880,18 @@ with tabs[6]:
                     "min_trade_frac": auto_reco_min_trade_pct,
                     "disable_staleness": True,
                 }
-                trades_bt, equity_bt = run_backtest(daily_batches, initial_bankroll_bt, strategy_params, price_df=price_df_bt)
+                trades_bt, equity_bt, all_priced_bt = run_backtest(
+                    daily_batches, initial_bankroll_bt, strategy_params, 
+                    price_df=price_df_bt, return_all_priced=True
+                )
                 st.session_state["bt_trades"] = trades_bt
                 st.session_state["bt_equity"] = equity_bt
+                st.session_state["bt_all_priced"] = all_priced_bt
                 st.session_state["bt_initial"] = initial_bankroll_bt
                 # Show debug info
-                st.info(f"Backtest complete: {len(daily_batches)} batches processed, {len(trades_bt)} trades, {len(trades_bt[trades_bt['settled']==True]) if 'settled' in trades_bt.columns and not trades_bt.empty else 0} settled")
+                n_settled = len(trades_bt[trades_bt['settled']==True]) if 'settled' in trades_bt.columns and not trades_bt.empty else 0
+                n_all_priced = len(all_priced_bt) if all_priced_bt is not None and not all_priced_bt.empty else 0
+                st.info(f"Backtest complete: {len(daily_batches)} batches processed, {len(trades_bt)} trades, {n_settled} settled, {n_all_priced} total priced contracts")
             except Exception as e:
                 st.error(f"Backtest failed: {e}")
                 import traceback
@@ -2090,6 +2096,86 @@ with tabs[6]:
                             template="plotly_white",
                         )
                         st.plotly_chart(fig_rel_bt, width="stretch")
+                
+                # --- Calibration by Model Probability Bin (All Priced Contracts) ---
+                all_priced_bt = st.session_state.get("bt_all_priced")
+                if all_priced_bt is not None and isinstance(all_priced_bt, pd.DataFrame) and not all_priced_bt.empty:
+                    # Use exact same bin edges as PnL table for direct comparability
+                    calib_bins = [0.0, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.01]
+                    ap = all_priced_bt.copy()
+                    
+                    # Filter to resolved contracts only
+                    ap = ap[ap["outcome_yes"].notna()].copy()
+                    
+                    if not ap.empty:
+                        ap["model_prob_used"] = pd.to_numeric(ap["model_prob_used"], errors="coerce")
+                        ap["market_yes_price"] = pd.to_numeric(ap["market_yes_price"], errors="coerce")
+                        ap["outcome_yes"] = pd.to_numeric(ap["outcome_yes"], errors="coerce")
+                        
+                        ap["prob_bin"] = pd.cut(
+                            ap["model_prob_used"],
+                            bins=calib_bins,
+                            right=True,
+                            include_lowest=True,
+                        )
+                        
+                        # Compute squared error for Brier score
+                        ap["sq_error"] = (ap["outcome_yes"] - ap["model_prob_used"]) ** 2
+                        ap["model_edge"] = ap["model_prob_used"] - ap["market_yes_price"]
+                        
+                        calib_agg = (
+                            ap.dropna(subset=["prob_bin"])
+                            .groupby("prob_bin", observed=True)
+                            .agg(
+                                n_contracts=("model_prob_used", "size"),
+                                mean_model_prob=("model_prob_used", "mean"),
+                                realized_yes_rate=("outcome_yes", "mean"),
+                                mean_market_price=("market_yes_price", "mean"),
+                                mean_model_edge=("model_edge", "mean"),
+                                brier_score=("sq_error", "mean"),
+                            )
+                        )
+                        
+                        if not calib_agg.empty:
+                            calib_agg = calib_agg.reset_index()
+                            calib_agg["calibration_error"] = calib_agg["realized_yes_rate"] - calib_agg["mean_model_prob"]
+                            calib_agg["prob_bin_str"] = calib_agg["prob_bin"].astype(str)
+                            
+                            # Rename and reorder columns for display
+                            display_calib = calib_agg[[
+                                "prob_bin_str", "n_contracts", "mean_model_prob", "realized_yes_rate", 
+                                "calibration_error", "mean_market_price", "mean_model_edge", "brier_score"
+                            ]].copy()
+                            display_calib.columns = [
+                                "Model Prob Bin", "# Contracts", "Avg Model Prob", "Realized YES Rate",
+                                "Calibration Error", "Avg Market Price", "Avg Model Edge", "Brier Score"
+                            ]
+                            
+                            # Round for display
+                            for col in ["Avg Model Prob", "Realized YES Rate", "Calibration Error", "Avg Market Price", "Avg Model Edge", "Brier Score"]:
+                                display_calib[col] = display_calib[col].round(4)
+                            
+                            st.subheader("Calibration by Model Probability Bin (All Priced Contracts)")
+                            st.caption(f"Shows calibration metrics for ALL {len(ap)} evaluated contracts (not just traded). Calibration Error = Realized YES Rate - Avg Model Prob.")
+                            st.dataframe(display_calib, width="stretch", hide_index=True)
+                            
+                            # Bar chart for calibration error
+                            fig_calib = px.bar(
+                                calib_agg,
+                                x="prob_bin_str",
+                                y="calibration_error",
+                                title="Calibration Error by Model Probability Bin (All Priced Contracts)",
+                                labels={"prob_bin_str": "Model Probability Bin", "calibration_error": "Calibration Error"},
+                                template="plotly_white",
+                                color="calibration_error",
+                                color_continuous_scale=["red", "white", "green"],
+                                color_continuous_midpoint=0,
+                            )
+                            fig_calib.update_layout(coloraxis_showscale=False)
+                            st.plotly_chart(fig_calib, width="stretch")
+                    else:
+                        st.info("No resolved contracts available for calibration analysis.")
+                        
         elif equity_bt is not None and isinstance(equity_bt, pd.DataFrame) and not equity_bt.empty:
             eq_fig = px.line(equity_bt, x="pricing_date", y="bankroll", title="Equity curve", template="plotly_white")
             st.plotly_chart(eq_fig, width="stretch")

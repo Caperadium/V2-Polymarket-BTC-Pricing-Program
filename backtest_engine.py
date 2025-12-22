@@ -21,7 +21,7 @@ import logging
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -100,6 +100,7 @@ class BacktestEngine:
         self._open_positions: List[OpenPosition] = []
         self._closed_trades: List[Dict] = []
         self._equity_snapshots: List[Dict] = []
+        self._all_priced_contracts: List[Dict] = []  # Track ALL evaluated contracts
         self._trade_counter: int = 0
     
     def _load_btc_prices(self) -> None:
@@ -228,6 +229,54 @@ class BacktestEngine:
         )
         return et_noon.astimezone(timezone.utc)
     
+    def resolve_outcome_yes(
+        self, 
+        expiry_date: pd.Timestamp, 
+        strike: float
+    ) -> Tuple[Optional[float], Optional[float]]:
+        """
+        Authoritative source for outcome resolution.
+        
+        Args:
+            expiry_date: Contract expiry date
+            strike: Contract strike price
+            
+        Returns:
+            Tuple of (outcome_yes, btc_price_at_settlement)
+            - outcome_yes: 1.0 if btc_price > strike (strict >), else 0.0
+            - btc_price_at_settlement: BTC price at 12:00 ET on expiry day
+            - Both are None if price data is unavailable
+        """
+        try:
+            expiry_dt_utc = self._get_expiry_datetime(expiry_date)
+            btc_price = self._get_btc_price_at(expiry_dt_utc)
+            
+            if btc_price is None:
+                return None, None
+            
+            # Strict inequality: YES wins if btc_price > strike
+            outcome_yes = 1.0 if btc_price > strike else 0.0
+            return outcome_yes, btc_price
+            
+        except Exception:
+            return None, None
+    
+    def _get_model_prob_col(self, df: pd.DataFrame) -> Optional[str]:
+        """
+        Get the model probability column name using preference order.
+        Mirrors auto_reco's column selection logic.
+        
+        Preference: p_model_fit > p_real_mc > model_probability
+        
+        Returns:
+            Column name if found, None otherwise
+        """
+        for col in ["p_model_fit", "p_real_mc", "model_probability"]:
+            if col in df.columns:
+                return col
+        return None
+    
+
     def _settle_positions(self, current_time: pd.Timestamp) -> float:
         """
         Settle positions whose expiry_date <= current_time.
@@ -260,11 +309,10 @@ class BacktestEngine:
                 remaining.append(pos)
                 continue
             
-            # Get settlement price at expiry noon ET
-            expiry_dt_utc = self._get_expiry_datetime(pos_expiry)
-            btc_price = self._get_btc_price_at(expiry_dt_utc)
+            # Use authoritative resolve_outcome_yes() for outcome determination
+            outcome_yes, btc_price = self.resolve_outcome_yes(pos_expiry, pos.strike)
             
-            if btc_price is None:
+            if outcome_yes is None:
                 # No price data - log warning and skip (keep position open for now)
                 # Or force settle if >2 days past expiry
                 days_past = (current_time - pos_expiry).days
@@ -276,19 +324,12 @@ class BacktestEngine:
                     payout = pos.stake
                     pnl = 0.0
                     outcome_yes = np.nan
+                    btc_price = np.nan
                 else:
                     remaining.append(pos)
                     continue
             else:
-                # Determine outcome
-                # YES wins if btc_price > strike
-                # NO wins if btc_price <= strike
-                if btc_price > pos.strike:
-                    outcome_yes = 1.0
-                else:
-                    outcome_yes = 0.0
-                
-                # Calculate payout
+                # Calculate payout using resolved outcome
                 if pos.side.upper() == "YES":
                     payout = pos.size_shares * outcome_yes
                 else:
@@ -337,6 +378,84 @@ class BacktestEngine:
         
         # Convert open positions to DataFrame for auto_reco
         positions_df = _positions_to_df(self._open_positions)
+        
+        # --- Log ALL priced contracts BEFORE calling recommend_trades ---
+        model_prob_col = self._get_model_prob_col(batch_df)
+        if model_prob_col is not None:
+            # Get spot price at snapshot time for moneyness calculation
+            snapshot_spot = self._get_btc_price_at(current_time)
+            
+            # Determine market price column
+            market_col = None
+            for col in ["market_price", "market_pr"]:
+                if col in batch_df.columns:
+                    market_col = col
+                    break
+            
+            # Determine expiry key column
+            expiry_key_col = None
+            for col in ["expiry_key", "expiry_date"]:
+                if col in batch_df.columns:
+                    expiry_key_col = col
+                    break
+            
+            # Determine DTE column (prefer existing, else compute)
+            dte_col = None
+            for col in ["t_days", "T_days", "dte_days"]:
+                if col in batch_df.columns:
+                    dte_col = col
+                    break
+            
+            for _, row in batch_df.iterrows():
+                try:
+                    strike = float(row.get("strike", np.nan))
+                    model_prob = float(row.get(model_prob_col, np.nan))
+                    market_yes_price = float(row.get(market_col, np.nan)) if market_col else np.nan
+                    expiry_key = str(row.get(expiry_key_col, "")) if expiry_key_col else ""
+                    slug = str(row.get("slug", ""))
+                    
+                    # Parse expiry date
+                    raw_expiry = row.get("expiry_date")
+                    try:
+                        expiry_date = pd.to_datetime(raw_expiry)
+                    except Exception:
+                        expiry_date = pd.NaT
+                    
+                    # Compute moneyness: (strike - spot) / spot
+                    if snapshot_spot is not None and snapshot_spot > 0 and not np.isnan(strike):
+                        moneyness = (strike - snapshot_spot) / snapshot_spot
+                    else:
+                        moneyness = np.nan
+                    
+                    # Get DTE
+                    if dte_col and dte_col in row.index:
+                        dte_days = float(row.get(dte_col, np.nan))
+                    elif pd.notna(expiry_date):
+                        # Compute from dates
+                        try:
+                            dte_days = (expiry_date - current_time).total_seconds() / 86400.0
+                        except Exception:
+                            dte_days = np.nan
+                    else:
+                        dte_days = np.nan
+                    
+                    self._all_priced_contracts.append({
+                        "snapshot_time": current_time,
+                        "expiry_date": expiry_date,
+                        "strike": strike,
+                        "spot_price": snapshot_spot if snapshot_spot is not None else np.nan,
+                        "market_yes_price": market_yes_price,
+                        "model_prob_used": model_prob,
+                        "expiry_key": expiry_key,
+                        "slug": slug,
+                        "moneyness": moneyness,
+                        "dte_days": dte_days,
+                        "outcome_yes": np.nan,  # Resolved later
+                        "btc_price_at_settlement": np.nan,  # Resolved later
+                    })
+                except Exception:
+                    # Skip malformed rows
+                    continue
         
         # Build strategy params with disable_staleness for backtest
         params = {
@@ -467,14 +586,22 @@ class BacktestEngine:
                 "trade_id": position.trade_id,
             })
     
-    def run(self) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    def run(
+        self,
+        return_all_priced: bool = False
+    ) -> Union[Tuple[pd.DataFrame, pd.DataFrame], Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]]:
         """
         Execute the backtest across all batches.
         
+        Args:
+            return_all_priced: If True, also return all_priced_df with every evaluated contract
+        
         Returns:
-            Tuple of (trades_df, equity_df):
+            If return_all_priced=False: Tuple of (trades_df, equity_df)
+            If return_all_priced=True: Tuple of (trades_df, equity_df, all_priced_df)
             - trades_df: All trade entries and settlements
             - equity_df: Equity curve snapshots
+            - all_priced_df: Every evaluated contract with outcome resolution
         """
         # Load BTC prices
         self._load_btc_prices()
@@ -484,6 +611,7 @@ class BacktestEngine:
         self._open_positions = []
         self._closed_trades = []
         self._equity_snapshots = []
+        self._all_priced_contracts = []  # Reset all priced contracts
         
         # Sort batches chronologically by batch_timestamp or pricing_date
         sorted_batches = []
@@ -516,6 +644,8 @@ class BacktestEngine:
         
         if not sorted_batches:
             logger.warning("No valid batches to process")
+            if return_all_priced:
+                return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
             return pd.DataFrame(), pd.DataFrame()
         
         # Simulation loop
@@ -549,7 +679,51 @@ class BacktestEngine:
             trades_df = trades_df.sort_values("trade_id", key=lambda x: x.str[1:].astype(int))
         equity_df = pd.DataFrame(self._equity_snapshots)
         
+        if return_all_priced:
+            all_priced_df = self._resolve_all_priced_contracts()
+            return trades_df, equity_df, all_priced_df
+        
         return trades_df, equity_df
+    
+    def _resolve_all_priced_contracts(self) -> pd.DataFrame:
+        """
+        Resolve outcomes for all priced contracts.
+        
+        Uses vectorized grouping by (expiry_date, strike) to minimize 
+        redundant price lookups.
+        
+        Returns:
+            DataFrame with all priced contracts and resolved outcome_yes
+        """
+        if not self._all_priced_contracts:
+            return pd.DataFrame()
+        
+        all_priced_df = pd.DataFrame(self._all_priced_contracts)
+        
+        # Group by unique (expiry_date, strike) pairs for efficient resolution
+        # Create a resolution lookup
+        resolution_cache: Dict[Tuple, Tuple[Optional[float], Optional[float]]] = {}
+        
+        for idx, row in all_priced_df.iterrows():
+            expiry = row["expiry_date"]
+            strike = row["strike"]
+            
+            # Skip if missing required fields
+            if pd.isna(expiry) or pd.isna(strike):
+                continue
+            
+            cache_key = (expiry, strike)
+            
+            if cache_key not in resolution_cache:
+                # Resolve once per unique (expiry, strike) pair
+                outcome_yes, btc_price = self.resolve_outcome_yes(expiry, strike)
+                resolution_cache[cache_key] = (outcome_yes, btc_price)
+            
+            outcome_yes, btc_price = resolution_cache[cache_key]
+            all_priced_df.at[idx, "outcome_yes"] = outcome_yes if outcome_yes is not None else np.nan
+            all_priced_df.at[idx, "btc_price_at_settlement"] = btc_price if btc_price is not None else np.nan
+        
+        return all_priced_df
 
 
 # Convenience function for simple usage
@@ -559,7 +733,8 @@ def run_backtest(
     strategy_params: Dict,
     btc_price_path: str = "DATA/btc_intraday_1m.csv",
     price_df: Optional[pd.DataFrame] = None,
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    return_all_priced: bool = False,
+) -> Union[Tuple[pd.DataFrame, pd.DataFrame], Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]]:
     """
     Run backtest across sorted daily batches.
     
@@ -571,9 +746,11 @@ def run_backtest(
         strategy_params: Dictionary of strategy parameters
         btc_price_path: Path to BTC intraday data (used if price_df not provided)
         price_df: Optional pre-loaded BTC price DataFrame (takes precedence over file path)
+        return_all_priced: If True, also return all_priced_df with every evaluated contract
         
     Returns:
-        Tuple of (trades_df, equity_df)
+        If return_all_priced=False: Tuple of (trades_df, equity_df)
+        If return_all_priced=True: Tuple of (trades_df, equity_df, all_priced_df)
     """
     engine = BacktestEngine(
         market_data_batches=daily_batches,
@@ -582,4 +759,5 @@ def run_backtest(
         btc_price_path=btc_price_path,
         price_df=price_df,
     )
-    return engine.run()
+    return engine.run(return_all_priced=return_all_priced)
+
