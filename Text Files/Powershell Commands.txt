@@ -1,0 +1,1 @@
+python batch_pricing_runner.py --slug-pattern "bitcoin-above-on-december-{}" --day-range 21 27
