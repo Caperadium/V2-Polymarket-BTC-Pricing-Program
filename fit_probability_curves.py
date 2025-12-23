@@ -39,6 +39,12 @@ try:
 except ImportError:  # pragma: no cover - Python <3.9 fallback
     ZoneInfo = None
 
+# ---------- Global Calibration ----------
+# Logit shift calibration: p_cal = sigmoid(logit(p) + B)
+# B=0.0 preserves original; B<0 shifts probabilities downward uniformly
+# This avoids inflating low p's (unlike symmetric shrink-to-0.5)
+PROB_LOGIT_SHIFT_B = -0.7
+
 # ---------- Logistic model helpers ----------
 
 def logistic_raw(x: np.ndarray, a: float, b: float) -> np.ndarray:
@@ -308,6 +314,16 @@ def process_batch(
             "rn_fit_ok": bool(rn_fit and rn_fit.success),
         })
 
+    # Apply logit shift calibration: p_cal = sigmoid(logit(p) + BIAS_SHIFT_B)
+    # This pushes probabilities uniformly downward without inflating low p's
+    eps = 1e-6
+    p_fit = df["p_model_fit"].values
+    p_clipped = np.clip(p_fit, eps, 1 - eps)
+    logit_p = np.log(p_clipped / (1 - p_clipped))
+    logit_cal = logit_p + PROB_LOGIT_SHIFT_B
+    p_cal = 1 / (1 + np.exp(-logit_cal))
+    df["p_model_cal"] = np.clip(p_cal, eps, 1 - eps)
+
     if "T_bucket" in df.columns:
         df = df.drop(columns=["T_bucket"])
 
@@ -408,6 +424,11 @@ def main():
         action="store_true",
         help="If set, save outputs directly in output-dir without creating a timestamped subfolder.",
     )
+    parser.add_argument(
+        "--generate-plots",
+        action="store_true",
+        help="If set, generate curve plots (default: no plots for faster processing).",
+    )
     args = parser.parse_args()
 
     # Auto-detect input file if not specified
@@ -439,19 +460,20 @@ def main():
     )
     copy_metadata_files(input_path, run_dir)
 
-    # Attempt to render plots using the companion script
-    try:
-        subprocess.run(
-            [sys.executable, str((Path(__file__).resolve().parent / "plot_batch_curves.py"))],
-            check=True,
-            cwd=str(run_dir),
-        )
-    except FileNotFoundError:
-        print("Warning: plot_batch_curves.py not found; skipping plots.", file=sys.stderr)
-    except subprocess.CalledProcessError as exc:
-        print(f"Warning: plot_batch_curves.py failed ({exc}).", file=sys.stderr)
-    except Exception as exc:
-        print(f"Warning: unable to run plot_batch_curves.py ({exc}).", file=sys.stderr)
+    # Attempt to render plots using the companion script (only if requested)
+    if args.generate_plots:
+        try:
+            subprocess.run(
+                [sys.executable, str((Path(__file__).resolve().parent / "plot_batch_curves.py"))],
+                check=True,
+                cwd=str(run_dir),
+            )
+        except FileNotFoundError:
+            print("Warning: plot_batch_curves.py not found; skipping plots.", file=sys.stderr)
+        except subprocess.CalledProcessError as exc:
+            print(f"Warning: plot_batch_curves.py failed ({exc}).", file=sys.stderr)
+        except Exception as exc:
+            print(f"Warning: unable to run plot_batch_curves.py ({exc}).", file=sys.stderr)
 
 
 if __name__ == "__main__":

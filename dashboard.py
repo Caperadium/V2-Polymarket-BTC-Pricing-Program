@@ -85,7 +85,7 @@ def compute_edge_series(df: pd.DataFrame) -> pd.Series:
     edge_col = get_column(df, ["edge_vs_market_fit", "edge_vs_market", "edge"])
     if edge_col is not None:
         return df[edge_col].astype(float)
-    model_col = get_column(df, ["p_model_fit", "p_real_mc"])
+    model_col = get_column(df, ["p_model_cal", "p_model_fit", "p_real_mc"])
     price_col = get_column(df, ["market_price", "market_pr"])
     if model_col is None or price_col is None:
         return pd.Series(np.nan, index=df.index)
@@ -364,7 +364,7 @@ def simulate_bankroll_paths(
     """Monte Carlo bankroll simulator using fractional Kelly YES bets."""
     rng = np.random.default_rng(seed)
 
-    model_col = get_column(df, ["p_model_fit", "p_real_mc"])
+    model_col = get_column(df, ["p_model_cal", "p_model_fit", "p_real_mc"])
     price_col = get_column(df, ["market_price", "market_pr"])
     if model_col is None or price_col is None:
         raise ValueError("Batch file missing model or market price columns.")
@@ -721,7 +721,7 @@ def make_prob_plot(g: pd.DataFrame, expiry_label: str) -> go.Figure:
             )
         )
 
-    model_col = get_column(g, ["p_model_fit", "p_real_mc_fit"])
+    model_col = get_column(g, ["p_model_cal", "p_model_fit", "p_real_mc_fit"])
     if model_col:
         fig.add_trace(
             go.Scatter(
@@ -1016,12 +1016,70 @@ else:
     open_unrealized_total = 0.0
 st.sidebar.subheader("Bankroll")
 kelly_fraction_sidebar = st.sidebar.slider("Kelly fraction", 0.05, 0.30, 0.15, 0.01)
+use_fixed_stake = st.sidebar.checkbox("Use Fixed Stake (not Kelly)", value=False)
+fixed_stake_amount = st.sidebar.number_input(
+    "Fixed Stake Amount ($)",
+    min_value=5.0,
+    value=10.0,
+    step=5.0,
+    disabled=not use_fixed_stake,
+    help="When enabled, all trades use this fixed dollar amount instead of Kelly sizing.",
+)
 bankroll_sidebar = st.sidebar.number_input(
     "Current liquid bankroll ($)",
     min_value=100.0,
     value=500.0,
     step=50.0,
     help="Used for portfolio sizing and existing position fractions.",
+)
+use_max_dte = st.sidebar.checkbox("Limit Max Days to Expiry", value=False)
+max_dte_value = st.sidebar.number_input(
+    "Max DTE (days)",
+    min_value=1.0,
+    value=2.0,
+    step=1.0,
+    disabled=not use_max_dte,
+    help="Only recommend trades on contracts expiring within this many days.",
+)
+use_prob_threshold = st.sidebar.checkbox("Use Probability Thresholds", value=False)
+prob_threshold_yes = st.sidebar.number_input(
+    "Trade YES Above or Equal To",
+    min_value=0.0,
+    max_value=1.0,
+    value=0.7,
+    step=0.05,
+    disabled=not use_prob_threshold,
+    help="Trade YES when model probability >= this value.",
+)
+prob_threshold_no = st.sidebar.number_input(
+    "Trade NO Below",
+    min_value=0.0,
+    max_value=1.0,
+    value=0.3,
+    step=0.05,
+    disabled=not use_prob_threshold,
+    help="Trade NO when model probability <= this value.",
+)
+use_max_moneyness = st.sidebar.checkbox("Limit Moneyness", value=False)
+min_moneyness_value = st.sidebar.number_input(
+    "Min |Moneyness|",
+    min_value=0.0,
+    max_value=0.5,
+    value=0.0,
+    step=0.01,
+    format="%.2f",
+    disabled=not use_max_moneyness,
+    help="Only trade contracts where |moneyness| >= this value. Use to exclude ATM.",
+)
+max_moneyness_value = st.sidebar.number_input(
+    "Max |Moneyness|",
+    min_value=0.0,
+    max_value=0.5,
+    value=0.05,
+    step=0.01,
+    format="%.2f",
+    disabled=not use_max_moneyness,
+    help="Only trade contracts where |moneyness| <= this value. 0.05 = ±5% from spot.",
 )
 available_bankroll = bankroll_sidebar + realized_pnl_total + open_unrealized_total
 stability_summary_df, stability_summary_error = try_load_dataframe(stability_summary_path)
@@ -1099,7 +1157,7 @@ with tabs[0]:
             st.subheader("Trades (filtered)")
             trades = df_exp[df_exp["edge_calc"] >= auto_reco_min_edge].copy().sort_values("edge_calc", ascending=False)
             price_col = get_column(df_exp, ["market_price", "market_pr"])
-            model_col = get_column(df_exp, ["p_model_fit", "p_real_mc"])
+            model_col = get_column(df_exp, ["p_model_cal", "p_model_fit", "p_real_mc"])
             show_cols = ["strike"]
             if price_col:
                 show_cols.append(price_col)
@@ -1139,7 +1197,7 @@ with tabs[1]:
                 df_contract = df_exp_all[df_exp_all["strike"].astype(float) == float(selected_strike)]
             df_contract = df_contract.sort_values("pricing_date")
             dt_series = safe_to_datetime(df_contract["pricing_date"])
-            model_col = get_column(df_contract, ["p_model_fit", "p_real_mc"])
+            model_col = get_column(df_contract, ["p_model_cal", "p_model_fit", "p_real_mc"])
             fig = go.Figure()
             if model_col:
                 fig.add_trace(
@@ -1207,7 +1265,7 @@ with tabs[1]:
             if not selected_expiries:
                 st.warning("Select at least one expiry to overlay.")
             else:
-                model_col = get_column(df_cross, ["p_model_fit", "p_real_mc"])
+                model_col = get_column(df_cross, ["p_model_cal", "p_model_fit", "p_real_mc"])
                 if model_col is None:
                     st.info("Model column missing for this pricing date.")
                 else:
@@ -1244,7 +1302,7 @@ with tabs[1]:
     exp_fit_opts = sorted(df_fit_root["expiry_key"].unique())
     fit_expiry = st.selectbox("Expiry (fit)", exp_fit_opts, key="fit_expiry")
     df_fit = df_fit_root[df_fit_root["expiry_key"] == fit_expiry].sort_values("strike")
-    model_col = get_column(df_fit, ["p_model_fit"])
+    model_col = get_column(df_fit, ["p_model_cal", "p_model_fit"])
     if df_fit.empty or model_col is None or "p_real_mc" not in df_fit.columns:
         st.info("No logistic fit column (p_model_fit) found — run curve fitting first.")
     else:
@@ -1289,7 +1347,7 @@ with tabs[1]:
     rn_exp_opts = sorted(df_rn_root["expiry_key"].unique())
     rn_expiry = st.selectbox("Expiry (RN)", rn_exp_opts, key="rn_expiry")
     df_rn = df_rn_root[df_rn_root["expiry_key"] == rn_expiry].sort_values("strike")
-    model_col = get_column(df_rn, ["p_model_fit", "p_real_mc"])
+    model_col = get_column(df_rn, ["p_model_cal", "p_model_fit", "p_real_mc"])
     rn_col = get_column(df_rn, ["risk_neutral_prob_fit", "risk_neutral_prob"])
     price_col = get_column(df_rn, ["market_price", "market_pr"])
     if df_rn.empty or model_col is None or rn_col is None or price_col is None:
@@ -1353,7 +1411,7 @@ with tabs[1]:
     # 6) Monotonicity summary (current date)
     st.subheader("Model Curve Quality")
     st.caption("Checks if model probabilities decrease smoothly as strike prices increase (expected behavior)")
-    model_col = get_column(current_df, ["p_model_fit", "p_real_mc"])
+    model_col = get_column(current_df, ["p_model_cal", "p_model_fit", "p_real_mc"])
     if model_col is None:
         st.info("Model column missing for curve quality check.")
     else:
@@ -1666,6 +1724,14 @@ with tabs[4]:
                 correlation_penalty=auto_reco_corr_penalty,
                 min_trade_usd=min_trade_dollars,
                 disable_staleness=False,
+                use_fixed_stake=use_fixed_stake,
+                fixed_stake_amount=fixed_stake_amount,
+                max_dte=max_dte_value if use_max_dte else None,
+                use_prob_threshold=use_prob_threshold,
+                prob_threshold_yes=prob_threshold_yes,
+                prob_threshold_no=prob_threshold_no,
+                max_moneyness=max_moneyness_value if use_max_moneyness else None,
+                min_moneyness=min_moneyness_value if use_max_moneyness else None,
             )
         except ValueError as exc:
             st.warning(f"Auto recommendations unavailable: {exc}")
@@ -1740,7 +1806,7 @@ with tabs[4]:
             st.plotly_chart(fig_reco, width="stretch")
 
             st.markdown("### Simulate Today's Recommended Portfolio")
-            prob_col = get_column(reco_df, ["model_prob", "p_model_fit", "p_real_mc"])
+            prob_col = get_column(reco_df, ["model_prob", "p_model_cal", "p_model_fit", "p_real_mc"])
             price_col = get_column(reco_df, ["market_price", "market_pr"])
             side_col = get_column(reco_df, ["side", "polymarket_outcome"])
             stake_col = get_column(reco_df, ["suggested_stake", "stake_dollars", "stake_usd", "raw_stake"])
@@ -1879,6 +1945,14 @@ with tabs[6]:
                     "min_trade_usd": None,
                     "min_trade_frac": auto_reco_min_trade_pct,
                     "disable_staleness": True,
+                    "use_fixed_stake": use_fixed_stake,
+                    "fixed_stake_amount": fixed_stake_amount,
+                    "max_dte": max_dte_value if use_max_dte else None,
+                    "use_prob_threshold": use_prob_threshold,
+                    "prob_threshold_yes": prob_threshold_yes,
+                    "prob_threshold_no": prob_threshold_no,
+                    "max_moneyness": max_moneyness_value if use_max_moneyness else None,
+                    "min_moneyness": min_moneyness_value if use_max_moneyness else None,
                 }
                 trades_bt, equity_bt, all_priced_bt = run_backtest(
                     daily_batches, initial_bankroll_bt, strategy_params, 
@@ -1953,9 +2027,17 @@ with tabs[6]:
                 
                 # Trades by Expiry
                 st.subheader("Trades by Expiry")
+                st.caption("Groups trades by contract expiration date, not by when the trade was placed.")
                 if "expiry_date" in trades_view.columns:
                     # Prefer expiry_key if available for cleaner grouping, else expiry_date
                     group_col = "expiry_key" if "expiry_key" in trades_view.columns else "expiry_date"
+                    
+                    # Check for trades with missing expiry data
+                    total_trades = len(trades_view)
+                    trades_with_expiry = trades_view[group_col].notna().sum()
+                    missing_count = total_trades - trades_with_expiry
+                    if missing_count > 0:
+                        st.warning(f"⚠️ {missing_count} trade(s) have missing expiry dates and are not shown in this table.")
                     
                     # Group and count
                     expiry_counts = trades_view.groupby(group_col, observed=True).size().reset_index(name="Trades Taken")
@@ -1970,8 +2052,75 @@ with tabs[6]:
                 else:
                     st.info("No expiry date column found to aggregate trades.")
 
+                # Moneyness histogram for taken trades
+                moneyness_col = get_column(trades_view, ["moneyness"])
+                if moneyness_col is not None:
+                    st.subheader("Moneyness Distribution")
+                    tv_moneyness = trades_view.copy()
+                    tv_moneyness["abs_moneyness"] = pd.to_numeric(tv_moneyness[moneyness_col], errors="coerce").abs()
+                    tv_moneyness = tv_moneyness[tv_moneyness["abs_moneyness"].notna()]
+                    if not tv_moneyness.empty:
+                        fig_moneyness = px.histogram(
+                            tv_moneyness,
+                            x="abs_moneyness",
+                            nbins=20,
+                            title="Distribution of |Moneyness| for Traded Contracts",
+                            labels={"abs_moneyness": "|Moneyness|", "count": "Trade Count"},
+                            template="plotly_white",
+                        )
+                        fig_moneyness.update_layout(bargap=0.1)
+                        st.plotly_chart(fig_moneyness, width="stretch")
+
+                # Spearman correlation: trade direction vs momentum_6hr
+                momentum_col = get_column(trades_view, ["momentum_6hr"])
+                side_col = get_column(trades_view, ["side"])
+                if momentum_col is not None and side_col is not None:
+                    from scipy.stats import spearmanr
+                    tv_corr = trades_view.copy()
+                    tv_corr["_momentum"] = pd.to_numeric(tv_corr[momentum_col], errors="coerce")
+                    tv_corr["_direction"] = tv_corr[side_col].apply(lambda x: 1 if str(x).upper() == "YES" else -1)
+                    tv_corr = tv_corr[tv_corr["_momentum"].notna()]
+                    if len(tv_corr) >= 3:
+                        rho, pval = spearmanr(tv_corr["_direction"], tv_corr["_momentum"])
+                        st.metric(
+                            "Direction vs Momentum Correlation",
+                            f"{rho:.3f}",
+                            help=f"Spearman ρ between trade direction (+1=YES, -1=NO) and 6hr momentum. p-value: {pval:.4f}"
+                        )
+                
+                # PNL by momentum sign
+                momentum_col = get_column(trades_view, ["momentum_6hr"])
+                if momentum_col is not None and "pnl" in trades_view.columns:
+                    tv_mom = trades_view.copy()
+                    tv_mom["_momentum"] = pd.to_numeric(tv_mom[momentum_col], errors="coerce")
+                    tv_mom["_pnl"] = pd.to_numeric(tv_mom["pnl"], errors="coerce")
+                    tv_mom = tv_mom[tv_mom["_momentum"].notna() & tv_mom["_pnl"].notna()]
+                    
+                    if not tv_mom.empty:
+                        pos_mom_mask = tv_mom["_momentum"] > 0
+                        neg_mom_mask = tv_mom["_momentum"] < 0
+                        
+                        pnl_positive_momentum = tv_mom.loc[pos_mom_mask, "_pnl"].sum()
+                        pnl_negative_momentum = tv_mom.loc[neg_mom_mask, "_pnl"].sum()
+                        n_positive_trades = pos_mom_mask.sum()
+                        n_negative_trades = neg_mom_mask.sum()
+                        
+                        col_pos_mom, col_neg_mom = st.columns(2)
+                        with col_pos_mom:
+                            st.metric(
+                                "PNL (Positive Momentum)",
+                                f"${pnl_positive_momentum:,.2f}",
+                                help=f"Total PNL from {n_positive_trades} trades with positive 6hr momentum (BTC trending up)"
+                            )
+                        with col_neg_mom:
+                            st.metric(
+                                "PNL (Negative Momentum)",
+                                f"${pnl_negative_momentum:,.2f}",
+                                help=f"Total PNL from {n_negative_trades} trades with negative 6hr momentum (BTC trending down)"
+                            )
+
                 # Brier scores on settled trades
-                prob_col = get_column(trades_view, ["p_model_fit", "model_prob"])
+                prob_col = get_column(trades_view, ["p_model_cal", "p_model_fit", "model_prob"])
                 market_col = get_column(trades_view, ["market_price"])
                 outcome_col = get_column(trades_view, ["outcome_yes"])
                 if prob_col and outcome_col:
@@ -2173,9 +2322,292 @@ with tabs[6]:
                             )
                             fig_calib.update_layout(coloraxis_showscale=False)
                             st.plotly_chart(fig_calib, width="stretch")
+                            
+                # ---------------------------------------------------------------
+                # RESIDUAL (MOMENTUM-NEUTRAL) SIGNAL METRICS
+                # ---------------------------------------------------------------
+                # Diagnose whether model's predictive signal is independent of 
+                # short-term momentum by regressing out momentum from model prob,
+                # then computing AUC/Spearman on residuals vs realized outcomes.
+                # ---------------------------------------------------------------
+                
+                st.subheader("Residual (Momentum-Neutral) Signal Metrics (All Priced, DTE≤2)")
+                
+                # --- Helper: robust column selection ---
+                def _get_col(df: pd.DataFrame, candidates: list):
+                    """Return first column name that exists in df, else None."""
+                    for c in candidates:
+                        if c in df.columns:
+                            return c
+                    return None
+                
+                # Select columns with preference order
+                prob_col_residual = _get_col(all_priced_bt, [
+                    "p_model_cal", "p_model_fit", "p_real_mc", 
+                    "model_probability", "model_prob_used"
+                ])
+                market_col_residual = _get_col(all_priced_bt, [
+                    "market_yes_price", "market_price", "yes_price"
+                ])
+                spot_col = _get_col(all_priced_bt, ["spot_price", "btc_spot", "spot"])
+                outcome_col_residual = _get_col(all_priced_bt, ["outcome_yes", "outcome", "resolved_outcome"])
+                time_col = _get_col(all_priced_bt, ["snapshot_time", "pricing_date", "batch_timestamp"])
+                dte_col = _get_col(all_priced_bt, ["dte_days", "T_days"])
+                
+                # Check required columns exist
+                missing_cols = []
+                if prob_col_residual is None:
+                    missing_cols.append("probability (p_model_cal/p_model_fit/...)")
+                if market_col_residual is None:
+                    missing_cols.append("market YES price (market_yes_price/market_price/...)")
+                if spot_col is None:
+                    missing_cols.append("spot price (spot_price/btc_spot/spot)")
+                if outcome_col_residual is None:
+                    missing_cols.append("outcome (outcome_yes/outcome/...)")
+                if time_col is None:
+                    missing_cols.append("timestamp (snapshot_time/pricing_date/...)")
+                
+                if missing_cols:
+                    st.warning(f"Cannot compute residual metrics: missing columns: {', '.join(missing_cols)}")
+                else:
+                    # Work on a copy
+                    resid_df = all_priced_bt.copy()
+                    
+                    # --- Convert and clean data ---
+                    # Ensure timestamp is datetime
+                    resid_df["_time"] = pd.to_datetime(resid_df[time_col], errors="coerce", utc=True)
+                    resid_df["_prob"] = pd.to_numeric(resid_df[prob_col_residual], errors="coerce")
+                    resid_df["_mkt"]  = pd.to_numeric(resid_df[market_col_residual], errors="coerce")
+                    resid_df["_spot"] = pd.to_numeric(resid_df[spot_col], errors="coerce")
+                    resid_df["_outcome"] = pd.to_numeric(resid_df[outcome_col_residual], errors="coerce")
+                    
+                    # Filter to DTE <= 2 (or respect max_dte UI control)
+                    dte_filter_val = max_dte_value if (use_max_dte and 'max_dte_value' in dir()) else 2
+                    dte_filter_val = min(dte_filter_val, 2)  # Cap at 2 for this analysis
+                    if dte_col is not None:
+                        resid_df["_dte"] = pd.to_numeric(resid_df[dte_col], errors="coerce")
+                        resid_df = resid_df[resid_df["_dte"] <= dte_filter_val]
+                    
+                    # Drop rows with missing essential data
+                    n_before_time_filter = len(resid_df)
+                    resid_df = resid_df.dropna(subset=["_time", "_prob", "_mkt", "_spot", "_outcome"])
+                    resid_df = resid_df[resid_df["_outcome"].isin([0, 1])]  # Ensure binary
+                    
+                    # Define trading signal as edge (this is what you actually monetize)
+                    resid_df["_edge"] = resid_df["_prob"] - resid_df["_mkt"]
+                    
+                    if len(resid_df) < 50:
+                        st.info(f"Too few samples for residual test ({len(resid_df)} after filtering). Need at least 50.")
+                    elif resid_df["_outcome"].nunique() < 2:
+                        st.warning("Cannot compute AUC: outcome has only one class after filtering.")
                     else:
-                        st.info("No resolved contracts available for calibration analysis.")
+                        # --- Compute 6-hour momentum ---
+                        # Create helper df of unique (time, spot) sorted by time
+                        resid_df = resid_df.sort_values("_time")
+                        spot_lookup = resid_df[["_time", "_spot"]].drop_duplicates().sort_values("_time")
                         
+                        # Compute t_minus_6h for each row
+                        resid_df["_t_minus_6h"] = resid_df["_time"] - pd.Timedelta(hours=6)
+                        
+                        # Use merge_asof to find nearest prior spot price
+                        # This finds the spot_6h_ago by looking up the closest time <= t_minus_6h
+                        resid_df = resid_df.sort_values("_t_minus_6h")
+                        spot_lookup = spot_lookup.rename(columns={"_time": "_lookup_time", "_spot": "_spot_6h_ago"})
+                        resid_df = pd.merge_asof(
+                            resid_df,
+                            spot_lookup,
+                            left_on="_t_minus_6h",
+                            right_on="_lookup_time",
+                            direction="backward"
+                        )
+                        
+                        # Compute momentum: log(spot / spot_6h_ago)
+                        n_before_momentum = len(resid_df)
+                        resid_df = resid_df[resid_df["_spot_6h_ago"].notna() & (resid_df["_spot_6h_ago"] > 0)]
+                        resid_df["_momentum_6h"] = np.log(resid_df["_spot"] / resid_df["_spot_6h_ago"])
+                        
+                        # Drop any remaining NaN in momentum
+                        resid_df = resid_df.dropna(subset=["_momentum_6h"])
+                        n_dropped_momentum = n_before_momentum - len(resid_df)
+                        
+                        if n_dropped_momentum > 0:
+                            st.caption(f"ℹ️ {n_dropped_momentum} rows dropped due to missing 6h price history.")
+                        
+                        if len(resid_df) < 50:
+                            st.info(f"Too few samples after momentum computation ({len(resid_df)}). Need at least 50.")
+                        else:
+                            # --- Residualization: Regress EDGE on momentum ---
+                            # Linear regression: edge = a + b * momentum_6h + residual
+                            # Edge is what you actually monetize in trading
+                            # Using numpy OLS: beta = (X'X)^(-1) X'y
+                            X = np.column_stack([
+                                np.ones(len(resid_df)),  # Intercept
+                                resid_df["_momentum_6h"].values
+                            ])
+                            y_signal = resid_df["_edge"].values
+                            
+                            # OLS: beta = (X'X)^(-1) X'y
+                            try:
+                                XtX_inv = np.linalg.inv(X.T @ X)
+                                beta = XtX_inv @ (X.T @ y_signal)
+                                intercept_a = beta[0]
+                                beta_momentum = beta[1]
+                                
+                                # Predicted edge and residual
+                                p_hat = X @ beta
+                                residual = y_signal - p_hat
+                                
+                                # R² of regression
+                                ss_res = np.sum(residual ** 2)
+                                ss_tot = np.sum((y_signal - np.mean(y_signal)) ** 2)
+                                r_squared = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
+                                
+                                # --- Compute metrics ---
+                                from scipy.stats import spearmanr
+                                from sklearn.metrics import roc_auc_score
+                                
+                                outcome_arr = resid_df["_outcome"].values
+                                
+                                # Raw EDGE metrics (edge vs outcome)
+                                raw_spearman, raw_spearman_pval = spearmanr(y_signal, outcome_arr)
+                                raw_auc = roc_auc_score(outcome_arr, y_signal)
+                                
+                                # Residual signal metrics (residual vs outcome)
+                                # Residuals are ranking signals, not probabilities - compute AUC directly
+                                # Do NOT apply sigmoid/logit to residual
+                                resid_spearman, resid_spearman_pval = spearmanr(residual, outcome_arr)
+                                resid_auc = roc_auc_score(outcome_arr, residual)
+                                
+                                # Optional: momentum vs outcome (sanity check)
+                                mom_outcome_spearman, mom_outcome_pval = spearmanr(
+                                    resid_df["_momentum_6h"].values, outcome_arr
+                                )
+                                
+                                # --- Residual lift by decile (preferred diagnostic) ---
+                                resid_df["_residual"] = residual
+                                # qcut can fail when many duplicate values; handle duplicates gracefully
+                                try:
+                                    resid_df["_resid_decile"] = pd.qcut(
+                                        resid_df["_residual"],
+                                        q=10,
+                                        labels=False,
+                                        duplicates="drop"
+                                    )
+                                except Exception:
+                                    resid_df["_resid_decile"] = np.nan
+
+                                lift_table = None
+                                top_bottom_lift = None
+                                if resid_df["_resid_decile"].notna().sum() > 0:
+                                    lift_table = (
+                                        resid_df
+                                        .dropna(subset=["_resid_decile"])
+                                        .groupby("_resid_decile", as_index=False)
+                                        .agg(
+                                            n=("_outcome", "size"),
+                                            mean_residual=("_residual", "mean"),
+                                            mean_prob=("_prob", "mean"),
+                                            realized_yes_rate=("_outcome", "mean"),
+                                            mean_momentum=("_momentum_6h", "mean"),
+                                        )
+                                        .sort_values("_resid_decile")
+                                    )
+                                    lift_table["_resid_decile"] = lift_table["_resid_decile"].astype(int) + 1
+                                    if len(lift_table) >= 2:
+                                        top_bottom_lift = float(lift_table["realized_yes_rate"].iloc[-1] - lift_table["realized_yes_rate"].iloc[0])
+
+                                # --- Display results ---
+                                n_samples = len(resid_df)
+                                
+                                # Summary table
+                                results_data = {
+                                    "Metric": [
+                                        "N (samples)", 
+                                        "Raw Spearman ρ (p vs outcome)",
+                                        "Raw AUC",
+                                        "Residual Spearman ρ",
+                                        "Residual AUC",
+                                        "β (momentum coef)",
+                                        "α (intercept)",
+                                        "R² (regression)",
+                                        "Momentum vs Outcome ρ"
+                                    ],
+                                    "Value": [
+                                        f"{n_samples:,}",
+                                        f"{raw_spearman:.4f} (p={raw_spearman_pval:.4f})",
+                                        f"{raw_auc:.4f}",
+                                        f"{resid_spearman:.4f} (p={resid_spearman_pval:.4f})",
+                                        f"{resid_auc:.4f}",
+                                        f"{beta_momentum:.6f}",
+                                        f"{intercept_a:.4f}",
+                                        f"{r_squared:.4f}",
+                                        f"{mom_outcome_spearman:.4f} (p={mom_outcome_pval:.4f})"
+                                    ]
+                                }
+                                results_table = pd.DataFrame(results_data)
+                                st.dataframe(results_table, width="stretch", hide_index=True)
+                                
+                                # Residual lift table (preferred)
+                                st.markdown("**Residual lift by decile (diagnostic):**")
+                                if lift_table is None or lift_table.empty:
+                                    st.info("Residual decile lift table unavailable (insufficient unique residual values).")
+                                else:
+                                    st.dataframe(
+                                        lift_table.rename(columns={
+                                            "_resid_decile": "Residual Decile (1=lowest)",
+                                            "n": "N",
+                                            "mean_residual": "Mean Residual",
+                                            "mean_prob": "Mean Model Prob",
+                                            "realized_yes_rate": "Realized YES Rate",
+                                            "mean_momentum": "Mean Momentum (6h)",
+                                        }),
+                                        width="stretch",
+                                        hide_index=True
+                                    )
+                                    if top_bottom_lift is not None:
+                                        st.caption(f"Top–bottom realized YES lift (decile 10 minus decile 1): {top_bottom_lift:+.4f}")
+
+                                # Interpretation (use lift/monotonicity, not residual AUC)
+                                st.markdown("**Interpretation:**")
+                                if raw_auc > 0.85:
+                                    st.warning(
+                                        "Raw AUC is extremely high for a real market. This often indicates leakage or label contamination. "
+                                        "Verify snapshot_time/expiry_time alignment and confirm p_model_cal is not trained on the same outcomes."
+                                    )
+                                if top_bottom_lift is not None:
+                                    if top_bottom_lift > 0.05:
+                                        st.success("✅ Residual signal shows meaningful lift across deciles (non-momentum structure likely present).")
+                                    elif top_bottom_lift < -0.05:
+                                        st.error("⚠️ Residual looks like anti-signal (top decile underperforms bottom).")
+                                    else:
+                                        st.info("ℹ️ Residual lift is small; remaining signal after momentum removal may be weak or noisy.")
+                                else:
+                                    st.info("ℹ️ Unable to compute top–bottom lift reliably; check residual distribution and sample size.")
+                                    
+                            except np.linalg.LinAlgError:
+                                st.warning("Could not compute regression (singular matrix).")
+                            except ImportError as ie:
+                                st.warning(f"Missing dependency for residual metrics: {ie}")
+                            except Exception as e:
+                                st.warning(f"Error computing residual metrics: {e}")
+                
+                # Download button for all priced contracts (filtered by max DTE if enabled)
+                # Place outside the nested blocks so it always appears when all_priced_bt exists
+                download_df = all_priced_bt.copy()
+                if use_max_dte and "dte_days" in download_df.columns:
+                    download_df["dte_days"] = pd.to_numeric(download_df["dte_days"], errors="coerce")
+                    download_df = download_df[download_df["dte_days"] <= max_dte_value]
+                    label_suffix = f" (DTE ≤ {max_dte_value})"
+                else:
+                    label_suffix = ""
+                csv_all_priced = download_df.to_csv(index=False)
+                st.download_button(
+                    label=f"📥 Download All Priced Contracts{label_suffix} (CSV)",
+                    data=csv_all_priced,
+                    file_name="all_priced_contracts.csv",
+                    mime="text/csv",
+                )
+                    
         elif equity_bt is not None and isinstance(equity_bt, pd.DataFrame) and not equity_bt.empty:
             eq_fig = px.line(equity_bt, x="pricing_date", y="bankroll", title="Equity curve", template="plotly_white")
             st.plotly_chart(eq_fig, width="stretch")

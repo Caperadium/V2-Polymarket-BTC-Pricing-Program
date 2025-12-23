@@ -55,6 +55,8 @@ class OpenPosition:
     trade_id: str = ""
     kelly_applied: float = np.nan
     expiry_key: str = ""
+    moneyness: float = np.nan
+    momentum_6hr: float = np.nan
 
 
 def _positions_to_df(open_positions: List[OpenPosition]) -> pd.DataFrame:
@@ -266,12 +268,12 @@ class BacktestEngine:
         Get the model probability column name using preference order.
         Mirrors auto_reco's column selection logic.
         
-        Preference: p_model_fit > p_real_mc > model_probability
+        Preference: p_model_cal > p_model_fit > p_real_mc > model_probability
         
         Returns:
             Column name if found, None otherwise
         """
-        for col in ["p_model_fit", "p_real_mc", "model_probability"]:
+        for col in ["p_model_cal", "p_model_fit", "p_real_mc", "model_probability"]:
             if col in df.columns:
                 return col
         return None
@@ -351,6 +353,8 @@ class BacktestEngine:
                 "size_shares": pos.size_shares,
                 "model_prob": pos.model_prob,
                 "market_price": pos.market_price,
+                "moneyness": pos.moneyness,
+                "momentum_6hr": pos.momentum_6hr,
                 "btc_price_at_expiry": btc_price if btc_price is not None else np.nan,
                 "outcome_yes": outcome_yes,
                 "payout": payout,
@@ -439,6 +443,10 @@ class BacktestEngine:
                     else:
                         dte_days = np.nan
                     
+                    # Skip already-expired contracts (snapshot_time > expiry_date)
+                    if pd.notna(dte_days) and dte_days < 0:
+                        continue
+                    
                     self._all_priced_contracts.append({
                         "snapshot_time": current_time,
                         "expiry_date": expiry_date,
@@ -456,6 +464,12 @@ class BacktestEngine:
                 except Exception:
                     # Skip malformed rows
                     continue
+        
+        # Add moneyness column to batch_df if not present (needed for moneyness filter)
+        if "moneyness" not in batch_df.columns and "strike" in batch_df.columns:
+            if snapshot_spot is not None and snapshot_spot > 0:
+                batch_df = batch_df.copy()
+                batch_df["moneyness"] = (pd.to_numeric(batch_df["strike"], errors="coerce") - snapshot_spot) / snapshot_spot
         
         # Build strategy params with disable_staleness for backtest
         params = {
@@ -488,6 +502,22 @@ class BacktestEngine:
             min_trade_frac = self.strategy_params.get("min_trade_frac", 0.01)
             min_trade_usd = self._running_bankroll * min_trade_frac
         params["min_trade_usd"] = min_trade_usd
+        
+        # Fixed stake sizing params
+        params["use_fixed_stake"] = self.strategy_params.get("use_fixed_stake", False)
+        params["fixed_stake_amount"] = self.strategy_params.get("fixed_stake_amount", 10.0)
+        
+        # Max DTE filter
+        params["max_dte"] = self.strategy_params.get("max_dte", None)
+        
+        # Probability threshold mode
+        params["use_prob_threshold"] = self.strategy_params.get("use_prob_threshold", False)
+        params["prob_threshold_yes"] = self.strategy_params.get("prob_threshold_yes", 0.7)
+        params["prob_threshold_no"] = self.strategy_params.get("prob_threshold_no", 0.3)
+        
+        # Moneyness filter
+        params["max_moneyness"] = self.strategy_params.get("max_moneyness", None)
+        params["min_moneyness"] = self.strategy_params.get("min_moneyness", None)
         
         # Call auto_reco with current open positions
         reco_list = recommend_trades(
@@ -544,7 +574,19 @@ class BacktestEngine:
 
             expiry_key_str = str(trade.get("expiry_key", ""))
             
-            # Create position
+            # Compute moneyness and momentum for this trade
+            trade_moneyness = np.nan
+            momentum_6hr = np.nan
+            snapshot_spot_at_trade = self._get_btc_price_at(current_time)
+            if snapshot_spot_at_trade is not None and snapshot_spot_at_trade > 0:
+                if not np.isnan(float(trade.get("strike", np.nan))):
+                    trade_moneyness = (float(trade.get("strike")) - snapshot_spot_at_trade) / snapshot_spot_at_trade
+                time_6h_ago = current_time - pd.Timedelta(hours=6)
+                spot_6h_ago = self._get_btc_price_at(time_6h_ago)
+                if spot_6h_ago is not None and spot_6h_ago > 0:
+                    momentum_6hr = float(np.log(snapshot_spot_at_trade / spot_6h_ago))
+            
+            # Create position with moneyness and momentum
             position = OpenPosition(
                 pricing_date=current_time,
                 expiry_date=expiry_ts,
@@ -559,11 +601,13 @@ class BacktestEngine:
                 trade_id=f"T{self._trade_counter}",
                 kelly_applied=float(trade.get("kelly_fraction_applied", np.nan)),
                 expiry_key=expiry_key_str,
+                moneyness=trade_moneyness,
+                momentum_6hr=momentum_6hr,
             )
             self._trade_counter += 1
             self._open_positions.append(position)
             
-            # Log trade entry
+            # Log trade entry (use values from position)
             self._closed_trades.append({
                 "pricing_date": current_time,
                 "expiry_date": expiry_ts,
@@ -575,6 +619,8 @@ class BacktestEngine:
                 "size_shares": size_shares,
                 "model_prob": position.model_prob,
                 "market_price": price_yes,
+                "moneyness": position.moneyness,
+                "momentum_6hr": position.momentum_6hr,
                 "btc_price_at_expiry": np.nan,
                 "outcome_yes": np.nan,
                 "payout": np.nan,

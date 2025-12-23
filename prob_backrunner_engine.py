@@ -274,7 +274,13 @@ def run_backtest_loop(
 
 
 def run_curve_fitting() -> bool:
-    """Run fit_probability_curves.py on each batch file in the unfitted results."""
+    """
+    Run curve fitting on each batch file in the unfitted results.
+    
+    Uses direct function call instead of subprocess for 10-50x speedup.
+    """
+    from fit_probability_curves import process_batch
+    
     logger.info("Running curve fitting on unfitted results...")
     
     FITTED_DIR.mkdir(parents=True, exist_ok=True)
@@ -292,30 +298,24 @@ def run_curve_fitting() -> bool:
     for i, batch_file in enumerate(batch_files):
         # Output directory for this batch (uses batch filename stem)
         output_dir = FITTED_DIR / batch_file.stem
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        output_batch_csv = output_dir / "batch_with_fits.csv"
+        output_curve_csv = output_dir / "curve_params.csv"
         
         try:
-            result = subprocess.run(
-                [
-                    sys.executable, "fit_probability_curves.py",
-                    "--input", str(batch_file),
-                    "--output-dir", str(output_dir),
-                    "--no-timestamp",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=60,  # 1 minute per file
+            process_batch(
+                input_csv=str(batch_file),
+                output_batch_csv=str(output_batch_csv),
+                output_curve_params_csv=str(output_curve_csv),
+                use_rn_prob=False,
             )
-            if result.returncode == 0:
-                success_count += 1
-            else:
-                logger.debug(f"fit_probability_curves.py failed for {batch_file.name}: {result.stderr}")
-        except subprocess.TimeoutExpired:
-            logger.warning(f"Timeout fitting {batch_file.name}")
+            success_count += 1
         except Exception as e:
-            logger.warning(f"Error fitting {batch_file.name}: {e}")
+            logger.debug(f"Curve fitting failed for {batch_file.name}: {e}")
         
         # Progress logging
-        if (i + 1) % 20 == 0 or i == len(batch_files) - 1:
+        if (i + 1) % 50 == 0 or i == len(batch_files) - 1:
             logger.info(f"Curve fitting progress: {i + 1}/{len(batch_files)} files")
     
     logger.info(f"Curve fitting complete. {success_count}/{len(batch_files)} files fitted successfully.")

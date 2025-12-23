@@ -178,6 +178,14 @@ def recommend_trades(
     disable_staleness: bool = False,
     check_existing_consistency: bool = False,
     current_open_positions: Optional[pd.DataFrame] = None,
+    use_fixed_stake: bool = False,
+    fixed_stake_amount: float = 10.0,
+    max_dte: Optional[float] = None,
+    use_prob_threshold: bool = False,
+    prob_threshold_yes: float = 0.7,
+    prob_threshold_no: float = 0.3,
+    max_moneyness: Optional[float] = None,
+    min_moneyness: Optional[float] = None,
 ) -> List[TradeRecommendation]:
     """
     Rank opportunities and size positions using fractional Kelly.
@@ -195,7 +203,7 @@ def recommend_trades(
     expiry_series = _derive_expiry_key(data)
     price_col = _pick_column(data, ["market_price", "market_pr", "Polymarket_Price"])
     # Prefer fitted logistic model probability, fallback to raw MC probability
-    model_col = _pick_column(data, ["p_model_fit", "model_probability", "p_real_mc", "Model_Prob"])
+    model_col = _pick_column(data, ["p_model_cal", "p_model_fit", "p_real_mc", "model_probability", "Model_Prob"])
     # Prefer fitted RN/market curve, fallback to raw RN probability
     rn_col = _pick_column(data, ["p_rn_fit", "risk_neutral_prob_fit", "risk_neutral_prob"])
     pricing_col = _pick_column(data, ["pricing_date", "date", "as_of_date"])
@@ -295,6 +303,27 @@ def recommend_trades(
     if data.empty:
         return []
 
+    # Apply max DTE filter if specified
+    if max_dte is not None:
+        t_col = _pick_column(data, ["t_days", "T_days", "dte_days"])
+        if t_col is not None:
+            data["_dte"] = pd.to_numeric(data[t_col], errors="coerce")
+            data = data[data["_dte"] <= max_dte].copy()
+            if data.empty:
+                return []
+
+    # Apply moneyness filter if specified
+    if max_moneyness is not None or min_moneyness is not None:
+        m_col = _pick_column(data, ["moneyness"])
+        if m_col is not None:
+            data["_moneyness"] = pd.to_numeric(data[m_col], errors="coerce").abs()
+            if max_moneyness is not None:
+                data = data[data["_moneyness"] <= max_moneyness].copy()
+            if min_moneyness is not None:
+                data = data[data["_moneyness"] >= min_moneyness].copy()
+            if data.empty:
+                return []
+
     candidates: List[Dict[str, object]] = []
     for _, row in data.iterrows():
         p = float(row["model_prob"])
@@ -318,13 +347,26 @@ def recommend_trades(
             "total_multiplier": float(row["total_multiplier"]),
         }
         yes_edge = p - q
-        if yes_edge >= min_edge and min_price <= q <= max_price:
-            candidates.append({**base_info, "side": "YES", "edge": yes_edge, "entry_price": q})
-        if allow_no:
-            no_price = 1.0 - q
-            no_edge = q - p
-            if no_edge >= min_edge and min_price <= no_price <= max_price:
-                candidates.append({**base_info, "side": "NO", "edge": no_edge, "entry_price": no_price})
+        no_edge = q - p
+        
+        # Probability threshold mode: trade based on model_prob thresholds
+        if use_prob_threshold:
+            # Trade YES if p >= threshold_yes
+            if p >= prob_threshold_yes and min_price <= q <= max_price:
+                candidates.append({**base_info, "side": "YES", "edge": yes_edge, "entry_price": q})
+            # Trade NO if p <= threshold_no
+            if allow_no:
+                no_price = 1.0 - q
+                if p <= prob_threshold_no and min_price <= no_price <= max_price:
+                    candidates.append({**base_info, "side": "NO", "edge": no_edge, "entry_price": no_price})
+        else:
+            # Edge-based mode (original logic)
+            if yes_edge >= min_edge and min_price <= q <= max_price:
+                candidates.append({**base_info, "side": "YES", "edge": yes_edge, "entry_price": q})
+            if allow_no:
+                no_price = 1.0 - q
+                if no_edge >= min_edge and min_price <= no_price <= max_price:
+                    candidates.append({**base_info, "side": "NO", "edge": no_edge, "entry_price": no_price})
 
     if not candidates:
         return []
@@ -419,8 +461,16 @@ def recommend_trades(
             f_star = kelly_fraction_yes(p, q)
         else:
             f_star = kelly_fraction_no(p, q)
+        
+        # Handle zero/negative kelly by using 0.0 instead of skipping
         if f_star <= 0.0:
+            kelly_full_vals.append(0.0)
+            kelly_full_effective_vals.append(0.0)
+            kelly_target_vals.append(0.0)
+            kelly_existing_vals.append(0.0)
+            kelly_incremental_vals.append(0.0)
             continue
+            
         multiplier = row.get("total_multiplier", 1.0)
         corr_mult = float(row.get("corr_multiplier", 1.0))
         f_star_effective = f_star * corr_mult * multiplier
@@ -676,7 +726,11 @@ def recommend_trades(
     if limit_active:
         candidates_df["kelly_eff"] = final_eff_list
 
-    candidates_df["raw_stake"] = bankroll * candidates_df["kelly_eff"]
+    # Calculate stake: fixed amount or Kelly-proportional
+    if use_fixed_stake:
+        candidates_df["raw_stake"] = fixed_stake_amount
+    else:
+        candidates_df["raw_stake"] = bankroll * candidates_df["kelly_eff"]
     candidates_df = candidates_df[candidates_df["raw_stake"] >= min_trade_usd]
     if candidates_df.empty:
         LAST_RECO_DEBUG = debug_df

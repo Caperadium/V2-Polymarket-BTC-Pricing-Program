@@ -1,0 +1,1 @@
+Test if this strat is essentially a momentum filter by checking correlation between trades and last 6 or 12hr of btc price
