@@ -124,7 +124,7 @@ def check_variance_consistency(garch_params: dict, n_samples: int = 10000, seed:
     """
     import logging
     
-    np.random.seed(seed)
+    rng = np.random.default_rng(seed)
     
     omega = garch_params['omega']
     alpha = garch_params['alpha']
@@ -139,7 +139,7 @@ def check_variance_consistency(garch_params: dict, n_samples: int = 10000, seed:
         scale_factor = 1.0
     
     # Simulate 1-day returns: r = sigma * z where z ~ scaled Student-t
-    z = t.rvs(nu, size=n_samples) * scale_factor
+    z = rng.standard_t(nu, size=n_samples) * scale_factor
     sigma = np.sqrt(model_variance)
     returns = sigma * z
     
@@ -184,8 +184,7 @@ def simulate_paths(
         use_momentum_gating: If True, only apply momentum drift when |mu| > MOMENTUM_GATE_MULT * sigma.
             Gating decision is made GLOBALLY (once per run), not per-path.
     """
-    if seed is not None:
-        np.random.seed(seed)
+    rng = np.random.default_rng(seed)
 
     # Resolve Jump Parameters
     if jump_params is None:
@@ -247,7 +246,7 @@ def simulate_paths(
         else:
             scale_factor = 1.0 
             
-        z_t = t.rvs(nu, size=n_sims) * scale_factor
+        z_t = rng.standard_t(nu, size=n_sims) * scale_factor
         
         step_variance = variances * dt
         step_sigma = np.sqrt(step_variance)
@@ -275,8 +274,8 @@ def simulate_paths(
         # else: variance unchanged for fractional step
         
         # 6. COMPOUND POISSON JUMPS (Multi-jump aggregation)
-        k = np.random.poisson(lam_daily * dt, size=n_sims)  # int array
-        k_down = np.random.binomial(k, p_crash)  # int array
+        k = rng.poisson(lam_daily * dt, size=n_sims)  # int array
+        k_down = rng.binomial(k, p_crash)  # int array
         k_up = k - k_down
         
         # Explicit masking - do NOT rely on Gamma(0, ...) = 0
@@ -286,9 +285,9 @@ def simulate_paths(
         mask_up = k_up > 0
         
         if np.any(mask_down):
-            down_mag[mask_down] = np.random.gamma(k_down[mask_down], scale=1.0 / eta_down)
+            down_mag[mask_down] = rng.gamma(k_down[mask_down], scale=1.0 / eta_down)
         if np.any(mask_up):
-            up_mag[mask_up] = np.random.gamma(k_up[mask_up], scale=1.0 / eta_up)
+            up_mag[mask_up] = rng.gamma(k_up[mask_up], scale=1.0 / eta_up)
         
         jump_sizes = up_mag - down_mag  # log-return: up=positive, down=negative
             
@@ -408,7 +407,7 @@ if __name__ == "__main__":
     # Test 1: Multi-Jump Aggregation (compare 99th percentile)
     # -------------------------------------------------------------------------
     print("\n[Test 1] Multi-Jump Aggregation...")
-    np.random.seed(42)
+    rng1 = np.random.default_rng(42)
     
     n_test = 100000
     lam_high = 500.0  # Very high annual lambda for testing
@@ -419,34 +418,34 @@ if __name__ == "__main__":
     dt_test = 1.0
     
     # New implementation (multi-jump)
-    k = np.random.poisson(lam_daily_test * dt_test, size=n_test)
-    k_down = np.random.binomial(k, p_crash_test)
+    k = rng1.poisson(lam_daily_test * dt_test, size=n_test)
+    k_down = rng1.binomial(k, p_crash_test)
     k_up = k - k_down
     down_mag = np.zeros(n_test)
     up_mag = np.zeros(n_test)
     mask_down, mask_up = k_down > 0, k_up > 0
     if np.any(mask_down):
-        down_mag[mask_down] = np.random.gamma(k_down[mask_down], scale=1.0 / eta_down_test)
+        down_mag[mask_down] = rng1.gamma(k_down[mask_down], scale=1.0 / eta_down_test)
     if np.any(mask_up):
-        up_mag[mask_up] = np.random.gamma(k_up[mask_up], scale=1.0 / eta_up_test)
+        up_mag[mask_up] = rng1.gamma(k_up[mask_up], scale=1.0 / eta_up_test)
     jump_sizes_new = np.abs(up_mag - down_mag)
     q99_new = np.percentile(jump_sizes_new, 99)
     
     # Old implementation (single jump, capped at 1)
-    np.random.seed(42)  # Reset seed
-    n_jumps_old = np.random.poisson(lam_daily_test * dt_test, size=n_test)
+    rng1_old = np.random.default_rng(42)  # Fresh RNG with same seed
+    n_jumps_old = rng1_old.poisson(lam_daily_test * dt_test, size=n_test)
     has_jump_old = n_jumps_old > 0
     jump_sizes_old = np.zeros(n_test)
     n_jumpers = np.sum(has_jump_old)
     if n_jumpers > 0:
-        is_crash = np.random.rand(n_jumpers) < p_crash_test
+        is_crash = rng1_old.random(n_jumpers) < p_crash_test
         mags = np.zeros(n_jumpers)
         n_crashes = np.sum(is_crash)
         if n_crashes > 0:
-            mags[is_crash] = np.random.exponential(1.0 / eta_down_test, size=n_crashes)
+            mags[is_crash] = rng1_old.exponential(1.0 / eta_down_test, size=n_crashes)
         n_pumps = n_jumpers - n_crashes
         if n_pumps > 0:
-            mags[~is_crash] = np.random.exponential(1.0 / eta_up_test, size=n_pumps)
+            mags[~is_crash] = rng1_old.exponential(1.0 / eta_up_test, size=n_pumps)
         jump_sizes_old[has_jump_old] = mags
     q99_old = np.percentile(np.abs(jump_sizes_old), 99)
     
@@ -460,7 +459,7 @@ if __name__ == "__main__":
     # Test 2: Fractional dt Variance Preservation
     # -------------------------------------------------------------------------
     print("\n[Test 2] Fractional dt Variance Preservation...")
-    np.random.seed(42)
+    rng2 = np.random.default_rng(42)
     
     n_test2 = 1000
     v0 = 0.0004  # Initial variance
@@ -475,7 +474,7 @@ if __name__ == "__main__":
     
     # Simulate one fractional step
     scale_factor = np.sqrt((nu_test - 2) / nu_test) if nu_test > 2 else 1.0
-    z_t = t.rvs(nu_test, size=n_test2) * scale_factor
+    z_t = rng2.standard_t(nu_test, size=n_test2) * scale_factor
     step_sigma = np.sqrt(variances * dt_frac)
     log_prices += step_sigma * z_t
     

@@ -203,7 +203,7 @@ def recommend_trades(
     expiry_series = _derive_expiry_key(data)
     price_col = _pick_column(data, ["market_price", "market_pr", "Polymarket_Price"])
     # Prefer fitted logistic model probability, fallback to raw MC probability
-    model_col = _pick_column(data, ["p_model_cal", "p_model_fit", "p_real_mc", "model_probability", "Model_Prob"])
+    model_col = _pick_column(data, ["p_model_cal", "p_real_mc", "p_model_fit", "model_probability", "Model_Prob"])
     # Prefer fitted RN/market curve, fallback to raw RN probability
     rn_col = _pick_column(data, ["p_rn_fit", "risk_neutral_prob_fit", "risk_neutral_prob"])
     pricing_col = _pick_column(data, ["pricing_date", "date", "as_of_date"])
@@ -490,9 +490,12 @@ def recommend_trades(
     candidates_df["kelly_existing"] = kelly_existing_vals
     candidates_df["kelly_eff"] = kelly_incremental_vals
 
-    candidates_df = candidates_df[candidates_df["kelly_eff"] > 0]
-    if candidates_df.empty:
-        return []
+    # When using fixed stake, don't filter by Kelly sizing - use edge only
+    # (edge filter already applied via min_edge earlier)
+    if not use_fixed_stake:
+        candidates_df = candidates_df[candidates_df["kelly_eff"] > 0]
+        if candidates_df.empty:
+            return []
 
     # Sort by score and apply per-expiry logic using _select_expiry_candidates
     candidates_df = candidates_df.sort_values("score", ascending=False)

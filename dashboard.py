@@ -41,6 +41,10 @@ from positions import (
     get_open_positions,
     sync_open_positions_with_batch,
 )
+from sweep_config import SweepConfig
+
+# Load default config for sidebar defaults
+_DEFAULTS = SweepConfig()
 
 
 # ---------------------------------------------------------------------------
@@ -966,7 +970,7 @@ diag_upload = st.sidebar.file_uploader(
 )
 
 st.sidebar.subheader("Strategy Settings")
-auto_reco_enabled = st.sidebar.checkbox("Enable auto recommendations", value=True)
+auto_reco_enabled = True  # Always enabled
 auto_reco_min_edge = st.sidebar.number_input("Min edge", min_value=0.0, max_value=0.5, value=0.06, step=0.005)
 auto_reco_max_bets = st.sidebar.number_input("Max bets per expiry", min_value=1, max_value=10, value=3, step=1)
 auto_reco_max_expiry_frac = st.sidebar.slider("Max capital per expiry (frac of bankroll)", 0.05, 1.0, 0.15, 0.05)

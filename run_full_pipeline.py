@@ -86,13 +86,8 @@ Examples:
     if not run_step("Running Batch Pricing", batch_cmd):
         sys.exit(1)
     
-    # Step 3: Fit probability curves
-    fit_cmd = [python, "fit_probability_curves.py"]
-    if args.use_rn_prob:
-        fit_cmd.append("--use-rn-prob")
-    
-    if not run_step("Fitting Probability Curves", fit_cmd):
-        sys.exit(1)
+    # Note: batch_pricing_runner.py already runs fit_probability_curves internally
+    # No need to run it again here
     
     print(f"\n{'='*60}")
     print("🎉 PIPELINE COMPLETE!")

@@ -1,0 +1,13 @@
+[16:10:16] Starting run 0060
+[16:10:16] Config: {'max_net_delta_frac': 1.0, 'use_stability_penalty': False, 'use_fixed_stake': True, 'use_prob_threshold': True, 'prob_threshold_yes': 0.6, 'prob_threshold_no': 0.45, 'max_bets_per_expiry': 8}
+[16:10:16] Strategy params: {'kelly_fraction': 0.15, 'min_edge': 0.06, 'max_bets_per_expiry': 8, 'max_capital_per_expiry_frac': 0.15, 'max_capital_total_frac': 0.4, 'max_net_delta_frac': 1.0, 'min_price': 0.03, 'max_price': 0.95, 'min_model_prob': 0.0, 'max_model_prob': 1.0, 'use_stability_penalty': False, 'correlation_penalty': 0.25, 'min_trade_frac': 0.01, 'allow_no': True, 'use_fixed_stake': True, 'fixed_stake_amount': 10.0, 'use_prob_threshold': True, 'prob_threshold_yes': 0.6, 'prob_threshold_no': 0.45, 'max_dte': 2.0, 'max_moneyness': None, 'min_moneyness': None}
+[16:10:16] Running BacktestEngine...
+[16:10:18] Backtest complete: 80 trades, 758 priced contracts
+[16:10:18] Saved 80 trades to taken_trades.csv
+[16:10:18] Running Monte Carlo shuffle test...
+[16:10:19] Decile MC complete: actual_pnl=$138.55, percentile=100.00%, mode=decile_conditioned_all_priced
+[16:10:19] Saved montecarlo_results.csv
+[16:10:19] Saved run_config.md
+[16:10:19] Saved equity_curve.csv
+[16:10:19] Saved pnl_by_expiry.csv
+[16:10:19] Run 0060 completed successfully

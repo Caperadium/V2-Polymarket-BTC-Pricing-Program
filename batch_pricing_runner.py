@@ -257,14 +257,20 @@ def main():
             expiry_et = expiry_utc.astimezone(et_tz)
             expiry_et_str = expiry_et.strftime("%b %d %H:%M ET")
             
+            # Generate slug from title (lowercase, replace spaces with hyphens)
+            slug = re.sub(r'[^a-z0-9\\-]', '', title.lower().replace(' ', '-').replace('$', '').replace(',', ''))
+            
             result_rows.append({
-                'Date': date_key,
-                'Expiry_ET': expiry_et_str,
-                'Strike': strike,
-                'Polymarket_Price': poly_price,
-                'Model_Prob': round(model_prob, 4),
-                'Edge': round(edge, 4)
+                # Match prob_backrunner_engine.py output format for compatibility
+                'slug': slug,
+                'strike': strike,
+                'market_price': poly_price,
+                'p_real_mc': model_prob,  # Use same column name as backrunner
+                'T_days': days_to_expiry,  # Float days to expiry
+                'date': now_utc,  # Pricing date (when we ran the pricing)
+                'expiry_date': expiry_utc,  # UTC timestamp of expiry
             })
+
             
     # 4. Save CSV
     # 4. Save CSV

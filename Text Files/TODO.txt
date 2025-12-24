@@ -1,1 +1,2 @@
-Test if this strat is essentially a momentum filter by checking correlation between trades and last 6 or 12hr of btc price
+The shrinkage and calibration, does that need to be recalibrated??
+Have the paramater config a global file that everyone can pull from and edit instead of it being locked in the dashboard

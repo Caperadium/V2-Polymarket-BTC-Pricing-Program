@@ -1,1 +1,3 @@
-python batch_pricing_runner.py --slug-pattern "bitcoin-above-on-december-{}" --day-range 21 27
+python run_full_pipeline.py --slug-pattern "bitcoin-above-on-december-{}" --day-range 23 29
+
+python parameter_sweep.py --batch-dir "C:\Users\Kieran Trythall\Documents\Trading\Prediction Market Contract Pricing\V2 BTC Contract Pricing\backtested_probabilities\fitted" --fixed use_fixed_stake=true --sweep max_bets_per_expiry=3,4,5,6 --workers 8 --fixed max_net_delta_frac=1 --fixed use_prob_threshold=true --limited --sweep prob_threshold_yes=1,.9,.8,.7,.6,.5 --sweep prob_threshold_no=0,.1,.2,.3,.4,.5 --sweep min_edge=0,.01,.02,.03,.04,.05,.06 
