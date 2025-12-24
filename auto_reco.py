@@ -202,8 +202,8 @@ def recommend_trades(
     data = df.copy()
     expiry_series = _derive_expiry_key(data)
     price_col = _pick_column(data, ["market_price", "market_pr", "Polymarket_Price"])
-    # Prefer fitted logistic model probability, fallback to raw MC probability
-    model_col = _pick_column(data, ["p_model_cal", "p_real_mc", "p_model_fit", "model_probability", "Model_Prob"])
+    # Prefer raw Monte Carlo probability, fallback to fitted or calibrated
+    model_col = _pick_column(data, ["p_real_mc", "p_model_fit", "p_model_cal", "model_probability", "Model_Prob"])
     # Prefer fitted RN/market curve, fallback to raw RN probability
     rn_col = _pick_column(data, ["p_rn_fit", "risk_neutral_prob_fit", "risk_neutral_prob"])
     pricing_col = _pick_column(data, ["pricing_date", "date", "as_of_date"])
