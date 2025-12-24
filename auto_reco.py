@@ -349,15 +349,15 @@ def recommend_trades(
         yes_edge = p - q
         no_edge = q - p
         
-        # Probability threshold mode: trade based on model_prob thresholds
+        # Probability threshold mode: trade based on model_prob thresholds + edge requirement
         if use_prob_threshold:
-            # Trade YES if p >= threshold_yes
-            if p >= prob_threshold_yes and min_price <= q <= max_price:
+            # Trade YES if p >= threshold_yes AND edge >= min_edge
+            if p >= prob_threshold_yes and yes_edge >= min_edge and min_price <= q <= max_price:
                 candidates.append({**base_info, "side": "YES", "edge": yes_edge, "entry_price": q})
-            # Trade NO if p <= threshold_no
+            # Trade NO if p <= threshold_no AND edge >= min_edge
             if allow_no:
                 no_price = 1.0 - q
-                if p <= prob_threshold_no and min_price <= no_price <= max_price:
+                if p <= prob_threshold_no and no_edge >= min_edge and min_price <= no_price <= max_price:
                     candidates.append({**base_info, "side": "NO", "edge": no_edge, "entry_price": no_price})
         else:
             # Edge-based mode (original logic)
