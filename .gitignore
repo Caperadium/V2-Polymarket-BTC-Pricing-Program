@@ -4,7 +4,8 @@
 *.jpg
 *.jpeg
 *.gif
-
+parameter_sweeps/
+parameter_sweeps/saved
 # Python
 __pycache__/
 *.py[cod]

@@ -530,6 +530,207 @@ def run_single_sweep(
         return (run_index, False)
 
 
+def analyze_dte_buckets(output_dir: Path) -> None:
+    """
+    Analyze sweep results by DTE (days-to-expiry) buckets.
+    
+    First identifies top 10 runs (percentile > 95%, z-score > 2, sorted by PnL),
+    then computes AVERAGE metrics per DTE bucket across those runs.
+    
+    Buckets: 1-2 days, 3-4 days, 5-6 days
+    """
+    if not output_dir.exists():
+        logger.error(f"Output directory not found: {output_dir}")
+        return
+    
+    # Define DTE buckets (0-2 includes same-day and next-day trades)
+    DTE_BUCKETS = [
+        (0, 2, "0-2 days"),
+        (2, 4, "2-4 days"),
+        (4, 6, "4-6 days"),
+    ]
+    
+    # Step 1: Find top 10 runs by criteria
+    run_stats = []
+    for entry in output_dir.iterdir():
+        if not entry.is_dir() or not entry.name.isdigit():
+            continue
+        
+        mc_path = entry / "montecarlo_results.csv"
+        if not mc_path.exists():
+            continue
+        
+        try:
+            mc_df = pd.read_csv(mc_path)
+            if mc_df.empty or "z_score" not in mc_df.columns:
+                continue
+            
+            z_score = float(mc_df["z_score"].iloc[0])
+            percentile = float(mc_df.get("percentile", [0]).iloc[0])
+            actual_pnl = float(mc_df.get("actual_pnl", [0]).iloc[0])
+            shuffled_mean = float(mc_df.get("shuffled_mean", [0]).iloc[0])
+            
+            # Gate: percentile > 95% and z-score > 2
+            if percentile > 0.95 and z_score > 2.0:
+                run_stats.append({
+                    "run_path": entry,
+                    "z_score": z_score,
+                    "percentile": percentile,
+                    "actual_pnl": actual_pnl,
+                    "shuffled_mean": shuffled_mean,
+                })
+        except Exception:
+            continue
+    
+    if not run_stats:
+        print("\nNo runs meet criteria (percentile > 95%, z-score > 2)")
+        return
+    
+    # Sort by PnL descending, take top 10
+    run_stats.sort(key=lambda x: x["actual_pnl"], reverse=True)
+    top_runs = run_stats[:10]
+    
+    print(f"\n{'='*80}")
+    print(f"ANALYSIS BY DTE BUCKETS (Top {len(top_runs)} runs by PnL, gated by percentile>95% & z>2)")
+    print(f"{'='*80}\n")
+    
+    # Step 2: For each DTE bucket, collect metrics from each top run
+    for min_dte, max_dte, label in DTE_BUCKETS:
+        bucket_metrics = []
+        
+        for run in top_runs:
+            run_path = run["run_path"]
+            trades_path = run_path / "taken_trades.csv"
+            
+            if not trades_path.exists():
+                continue
+            
+            try:
+                trades_df = pd.read_csv(trades_path)
+                if trades_df.empty:
+                    continue
+                
+                # Calculate DTE
+                entry_col = None
+                for col in ["pricing_date", "entry_time", "entry_date"]:
+                    if col in trades_df.columns:
+                        entry_col = col
+                        break
+                
+                if "expiry_date" in trades_df.columns and entry_col:
+                    trades_df["expiry_dt"] = pd.to_datetime(trades_df["expiry_date"], errors="coerce")
+                    trades_df["entry_dt"] = pd.to_datetime(trades_df[entry_col], errors="coerce")
+                    if trades_df["expiry_dt"].dt.tz is not None:
+                        trades_df["expiry_dt"] = trades_df["expiry_dt"].dt.tz_convert(None)
+                    if trades_df["entry_dt"].dt.tz is not None:
+                        trades_df["entry_dt"] = trades_df["entry_dt"].dt.tz_convert(None)
+                    trades_df["dte"] = (trades_df["expiry_dt"] - trades_df["entry_dt"]).dt.total_seconds() / 86400
+                elif "T_days" in trades_df.columns:
+                    trades_df["dte"] = trades_df["T_days"]
+                else:
+                    continue
+                
+                # Filter to settled trades
+                if "settled" in trades_df.columns:
+                    settled_col = trades_df["settled"]
+                    if settled_col.dtype == 'object':
+                        settled = trades_df[settled_col.astype(str).str.lower().isin(["true", "1"])].copy()
+                    else:
+                        settled = trades_df[settled_col == True].copy()
+                else:
+                    settled = trades_df.copy()
+                
+                if "pnl" not in settled.columns:
+                    continue
+                
+                # Filter to this DTE bucket
+                bucket_trades = settled[(settled["dte"] >= min_dte) & (settled["dte"] <= max_dte)]
+                
+                if bucket_trades.empty:
+                    continue
+                
+                # Compute edge if missing
+                if "edge" not in bucket_trades.columns:
+                    if "model_prob" in bucket_trades.columns and "entry_price" in bucket_trades.columns and "side" in bucket_trades.columns:
+                        bucket_trades = bucket_trades.copy()
+                        # Edge = P(win) - entry_price
+                        # For YES: P(win) = model_prob
+                        # For NO: P(win) = 1 - model_prob
+                        bucket_trades["edge"] = bucket_trades.apply(
+                            lambda r: r["model_prob"] - r["entry_price"] if str(r["side"]).upper() == "YES"
+                                      else (1 - r["model_prob"]) - r["entry_price"],
+                            axis=1
+                        )
+                
+                # Compute metrics for this run's bucket
+                pnl = bucket_trades["pnl"].sum()
+                count = len(bucket_trades)
+                pnl_per_trade = pnl / count if count > 0 else 0
+                
+                valid_edges = bucket_trades["edge"].dropna() if "edge" in bucket_trades.columns else pd.Series([])
+                mean_edge = valid_edges.mean() if len(valid_edges) > 0 else np.nan
+                median_edge = valid_edges.median() if len(valid_edges) > 0 else np.nan
+                p90_edge = np.percentile(valid_edges, 90) if len(valid_edges) > 0 else np.nan
+                
+                # Worst expiry in this bucket
+                worst_expiry_pnl = 0.0
+                if "expiry_date" in bucket_trades.columns:
+                    for exp, grp in bucket_trades.groupby("expiry_date", observed=True):
+                        exp_pnl = grp["pnl"].sum()
+                        if exp_pnl < worst_expiry_pnl:
+                            worst_expiry_pnl = exp_pnl
+                
+                bucket_metrics.append({
+                    "pnl": pnl,
+                    "count": count,
+                    "pnl_per_trade": pnl_per_trade,
+                    "mean_edge": mean_edge,
+                    "median_edge": median_edge,
+                    "p90_edge": p90_edge,
+                    "worst_expiry": worst_expiry_pnl,
+                    "shuffled_mean": run["shuffled_mean"],
+                    "z_score": run["z_score"],
+                })
+                
+            except Exception:
+                continue
+        
+        if not bucket_metrics:
+            print(f"--- {label}: No data ---\n")
+            continue
+        
+        # Average metrics across top runs
+        n = len(bucket_metrics)
+        avg_pnl = sum(m["pnl"] for m in bucket_metrics) / n
+        avg_count = sum(m["count"] for m in bucket_metrics) / n
+        avg_pnl_per_trade = sum(m["pnl_per_trade"] for m in bucket_metrics) / n
+        avg_z = sum(m["z_score"] for m in bucket_metrics) / n
+        avg_shuffled = sum(m["shuffled_mean"] for m in bucket_metrics) / n
+        avg_worst = sum(m["worst_expiry"] for m in bucket_metrics) / n
+        
+        valid_mean_edges = [m["mean_edge"] for m in bucket_metrics if not np.isnan(m["mean_edge"])]
+        valid_median_edges = [m["median_edge"] for m in bucket_metrics if not np.isnan(m["median_edge"])]
+        valid_p90_edges = [m["p90_edge"] for m in bucket_metrics if not np.isnan(m["p90_edge"])]
+        
+        avg_mean_edge = sum(valid_mean_edges) / len(valid_mean_edges) if valid_mean_edges else np.nan
+        avg_median_edge = sum(valid_median_edges) / len(valid_median_edges) if valid_median_edges else np.nan
+        avg_p90_edge = sum(valid_p90_edges) / len(valid_p90_edges) if valid_p90_edges else np.nan
+        
+        print(f"--- {label} (avg of {n} runs) ---")
+        print(f"  Trade Count:     {avg_count:.1f}")
+        print(f"  Settled PnL:     ${avg_pnl:.2f}")
+        print(f"  PnL/Trade:       ${avg_pnl_per_trade:.2f}")
+        print(f"  Z-Score:         {avg_z:.3f}")
+        print(f"  Shuffled Mean:   ${avg_shuffled:.2f}")
+        print(f"  Mean Edge:       {avg_mean_edge:.4f}" if not np.isnan(avg_mean_edge) else "  Mean Edge:       N/A")
+        print(f"  Median Edge:     {avg_median_edge:.4f}" if not np.isnan(avg_median_edge) else "  Median Edge:     N/A")
+        print(f"  90p Edge:        {avg_p90_edge:.4f}" if not np.isnan(avg_p90_edge) else "  90p Edge:        N/A")
+        print(f"  Worst Expiry:    ${avg_worst:.2f}")
+        print()
+    
+    print(f"{'='*80}\n")
+
+
 def analyze_top_runs(output_dir: Path, top_n: int = 3) -> List[int]:
     """
     Analyze completed runs and print summary of top N by Z-score.
@@ -906,6 +1107,13 @@ def main():
         help="In-sample date range filter. Format: YYYY-MM-DD-YYYY-MM-DD. "
              "Only includes data within this date range (inclusive).",
     )
+    
+    parser.add_argument(
+        "--dte_bucket",
+        action="store_true",
+        help="Analyze results by DTE buckets (1-2, 3-4, 5-6 days). "
+             "Mutually exclusive with --limited.",
+    )
 
     
     args = parser.parse_args()
@@ -917,6 +1125,11 @@ def main():
         for name in sorted(get_parameter_names()):
             print(f"  {name} (default: {defaults[name]})")
         return 0
+    
+    # Check mutual exclusivity of --limited and --dte_bucket
+    if args.limited and args.dte_bucket:
+        logger.error("--limited and --dte_bucket are mutually exclusive. Choose one.")
+        return 1
     
     # Parse sweep and fixed parameters
     try:
@@ -1089,11 +1302,20 @@ def main():
                 shutil.move(str(src), str(dst))
                 moved_count += 1
         
-        # Delete the entire temp directory
-        if temp_dir.exists():
-            shutil.rmtree(temp_dir)
-        
-        print(f"Saved {moved_count} top runs to {saved_dir}, deleted temp folder")
+        print(f"Saved {moved_count} top runs to {saved_dir}")
+    
+    # Analyze by DTE buckets if --dte_bucket is set
+    elif args.dte_bucket:
+        analyze_dte_buckets(output_dir)
+    
+    # Always delete temp folder contents after run (keep folder structure)
+    if temp_dir.exists():
+        for item in temp_dir.iterdir():
+            if item.is_dir():
+                shutil.rmtree(item)
+            else:
+                item.unlink()
+        print(f"Cleared temp folder contents: {temp_dir}")
     
     return 0 if failed == 0 else 1
 

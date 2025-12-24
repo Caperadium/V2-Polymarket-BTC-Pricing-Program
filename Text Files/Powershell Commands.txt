@@ -1,3 +1,5 @@
-python run_full_pipeline.py --slug-pattern "bitcoin-above-on-december-{}" --day-range 23 29
+python run_full_pipeline.py --slug-pattern "bitcoin-above-on-december-{}" --day-range 24 30
 
+
+python parameter_sweep.py --batch-dir "C:\Users\Kieran Trythall\Documents\Trading\Prediction Market Contract Pricing\V2 BTC Contract Pricing\backtested_probabilities\fitted" --sweep prob_threshold_yes=0.55,0.6,0.65,0.7,0.75,0.8 --sweep prob_threshold_no=0.25,0.3,0.35,0.4,0.45 --fixed max_net_delta_frac=1 --fixed use_stability_penalty=false --fixed use_fixed_stake=true --all_trades --fixed use_prob_threshold=true --sweep max_bets_per_expiry=5,6,7,8 --mc-iterations 1500 --sweep max_dte=2,3,4,5,6 --dte_bucket
 python parameter_sweep.py --batch-dir "C:\Users\Kieran Trythall\Documents\Trading\Prediction Market Contract Pricing\V2 BTC Contract Pricing\backtested_probabilities\fitted" --fixed use_fixed_stake=true --sweep max_bets_per_expiry=3,4,5,6 --workers 8 --fixed max_net_delta_frac=1 --fixed use_prob_threshold=true --limited --sweep prob_threshold_yes=1,.9,.8,.7,.6,.5 --sweep prob_threshold_no=0,.1,.2,.3,.4,.5 --sweep min_edge=0,.01,.02,.03,.04,.05,.06 
