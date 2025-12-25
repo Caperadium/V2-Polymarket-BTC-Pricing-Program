@@ -59,6 +59,13 @@ PRICE_STALE_HARD_HOURS = 6.0
 DEFAULT_MIN_TRADE_USD = 5.0
 
 LAST_RECO_DEBUG: Optional[pd.DataFrame] = None
+LAST_RECO_THRESHOLD_DEBUG: Optional[Dict[str, int]] = None
+
+
+def reset_threshold_debug() -> None:
+    """Reset the threshold debug accumulator. Call at start of each backtest run."""
+    global LAST_RECO_THRESHOLD_DEBUG
+    LAST_RECO_THRESHOLD_DEBUG = None
 
 
 @dataclass
@@ -325,6 +332,13 @@ def recommend_trades(
                 return []
 
     candidates: List[Dict[str, object]] = []
+    
+    # Debug counters for probability threshold mode
+    debug_yes_passed_prob_no_edge = 0
+    debug_no_passed_prob_no_edge = 0
+    debug_yes_passed_all = 0
+    debug_no_passed_all = 0
+    
     for _, row in data.iterrows():
         p = float(row["model_prob"])
         q = float(row["market_price"])
@@ -352,13 +366,26 @@ def recommend_trades(
         # Probability threshold mode: trade based on model_prob thresholds + edge requirement
         if use_prob_threshold:
             # Trade YES if p >= threshold_yes AND edge >= min_edge
-            if p >= prob_threshold_yes and yes_edge >= min_edge and min_price <= q <= max_price:
-                candidates.append({**base_info, "side": "YES", "edge": yes_edge, "entry_price": q})
+            yes_passed_prob = p >= prob_threshold_yes and min_price <= q <= max_price
+            yes_passed_edge = yes_edge >= min_edge
+            if yes_passed_prob:
+                if yes_passed_edge:
+                    candidates.append({**base_info, "side": "YES", "edge": yes_edge, "entry_price": q})
+                    debug_yes_passed_all += 1
+                else:
+                    debug_yes_passed_prob_no_edge += 1
+            
             # Trade NO if p <= threshold_no AND edge >= min_edge
             if allow_no:
                 no_price = 1.0 - q
-                if p <= prob_threshold_no and no_edge >= min_edge and min_price <= no_price <= max_price:
-                    candidates.append({**base_info, "side": "NO", "edge": no_edge, "entry_price": no_price})
+                no_passed_prob = p <= prob_threshold_no and min_price <= no_price <= max_price
+                no_passed_edge = no_edge >= min_edge
+                if no_passed_prob:
+                    if no_passed_edge:
+                        candidates.append({**base_info, "side": "NO", "edge": no_edge, "entry_price": no_price})
+                        debug_no_passed_all += 1
+                    else:
+                        debug_no_passed_prob_no_edge += 1
         else:
             # Edge-based mode (original logic)
             if yes_edge >= min_edge and min_price <= q <= max_price:
@@ -367,6 +394,29 @@ def recommend_trades(
                 no_price = 1.0 - q
                 if no_edge >= min_edge and min_price <= no_price <= max_price:
                     candidates.append({**base_info, "side": "NO", "edge": no_edge, "entry_price": no_price})
+
+    # Log debug info for probability threshold mode
+    if use_prob_threshold:
+        import logging
+        _logger = logging.getLogger(__name__)
+        _logger.info(
+            f"[auto_reco] Prob threshold debug: "
+            f"YES(passed_prob_no_edge={debug_yes_passed_prob_no_edge}, passed_all={debug_yes_passed_all}), "
+            f"NO(passed_prob_no_edge={debug_no_passed_prob_no_edge}, passed_all={debug_no_passed_all})"
+        )
+        # ACCUMULATE in module-level variable (for backtest which calls this many times)
+        global LAST_RECO_THRESHOLD_DEBUG
+        if LAST_RECO_THRESHOLD_DEBUG is None:
+            LAST_RECO_THRESHOLD_DEBUG = {
+                "yes_passed_prob_no_edge": 0,
+                "yes_passed_all": 0,
+                "no_passed_prob_no_edge": 0,
+                "no_passed_all": 0,
+            }
+        LAST_RECO_THRESHOLD_DEBUG["yes_passed_prob_no_edge"] += debug_yes_passed_prob_no_edge
+        LAST_RECO_THRESHOLD_DEBUG["yes_passed_all"] += debug_yes_passed_all
+        LAST_RECO_THRESHOLD_DEBUG["no_passed_prob_no_edge"] += debug_no_passed_prob_no_edge
+        LAST_RECO_THRESHOLD_DEBUG["no_passed_all"] += debug_no_passed_all
 
     if not candidates:
         return []

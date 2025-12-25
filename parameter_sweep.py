@@ -390,6 +390,13 @@ def run_single_sweep(
         log(f"Starting run {run_index:04d}")
         log(f"Config: {current_sweep_values}")
         
+        # Reset threshold debug accumulator for this run
+        try:
+            from auto_reco import reset_threshold_debug
+            reset_threshold_debug()
+        except Exception:
+            pass
+        
         # Convert config to strategy params
         strategy_params = config.to_strategy_params()
         log(f"Strategy params: {strategy_params}")
@@ -410,6 +417,17 @@ def run_single_sweep(
             trades_df, equity_df = engine.run(return_all_priced=False)
             all_priced_df = None
             log(f"Backtest complete: {len(trades_df)} trades")
+        
+        # Log probability threshold debug info if available
+        try:
+            from auto_reco import LAST_RECO_THRESHOLD_DEBUG
+            if LAST_RECO_THRESHOLD_DEBUG is not None:
+                log(f"Prob threshold debug: YES(passed_prob_no_edge={LAST_RECO_THRESHOLD_DEBUG.get('yes_passed_prob_no_edge', 0)}, "
+                    f"passed_all={LAST_RECO_THRESHOLD_DEBUG.get('yes_passed_all', 0)}), "
+                    f"NO(passed_prob_no_edge={LAST_RECO_THRESHOLD_DEBUG.get('no_passed_prob_no_edge', 0)}, "
+                    f"passed_all={LAST_RECO_THRESHOLD_DEBUG.get('no_passed_all', 0)})")
+        except Exception:
+            pass
         
         # Save taken trades
         trades_path = run_folder / "taken_trades.csv"
@@ -829,8 +847,30 @@ def analyze_top_runs(output_dir: Path, top_n: int = 3) -> List[int]:
                 except Exception:
                     pass
 
+            # Parse probability threshold debug info from logs.txt
+            prob_threshold_debug = None
+            logs_path = entry / "logs.txt"
+            if logs_path.exists():
+                try:
+                    log_content = logs_path.read_text(encoding="utf-8")
+                    # Look for: Prob threshold debug: YES(passed_prob_no_edge=X, passed_all=Y), NO(...)
+                    import re as logs_re
+                    match = logs_re.search(
+                        r"Prob threshold debug: YES\(passed_prob_no_edge=(\d+), passed_all=(\d+)\), "
+                        r"NO\(passed_prob_no_edge=(\d+), passed_all=(\d+)\)",
+                        log_content
+                    )
+                    if match:
+                        prob_threshold_debug = {
+                            "yes_passed_prob_no_edge": int(match.group(1)),
+                            "yes_passed_all": int(match.group(2)),
+                            "no_passed_prob_no_edge": int(match.group(3)),
+                            "no_passed_all": int(match.group(4)),
+                        }
+                except Exception:
+                    pass
 
-            
+                        
             # Get starting and final equity
             starting_equity = np.nan
             final_equity = np.nan
@@ -893,6 +933,7 @@ def analyze_top_runs(output_dir: Path, top_n: int = 3) -> List[int]:
                 "min_trade_edge": min_trade_edge,
                 "max_trade_edge": max_trade_edge,
                 "sweep_values": sweep_values,
+                "prob_threshold_debug": prob_threshold_debug,
             })
             
         except Exception as e:
@@ -974,6 +1015,18 @@ def analyze_top_runs(output_dir: Path, top_n: int = 3) -> List[int]:
         if r['num_settled'] > 0 and not np.isnan(r['actual_pnl']):
             pnl_per_trade = r['actual_pnl'] / r['num_settled']
             print(f"  PnL/Trade: ${pnl_per_trade:.2f}")
+        
+        # Show probability threshold debug info if available
+        ptd = r.get('prob_threshold_debug')
+        if ptd:
+            print("")
+            print("Prob Threshold Filter Stats:")
+            print(f"  YES: passed_threshold={ptd.get('yes_passed_prob_no_edge', 0) + ptd.get('yes_passed_all', 0)}, "
+                  f"passed_edge={ptd.get('yes_passed_all', 0)}, "
+                  f"filtered_no_edge={ptd.get('yes_passed_prob_no_edge', 0)}")
+            print(f"  NO:  passed_threshold={ptd.get('no_passed_prob_no_edge', 0) + ptd.get('no_passed_all', 0)}, "
+                  f"passed_edge={ptd.get('no_passed_all', 0)}, "
+                  f"filtered_no_edge={ptd.get('no_passed_prob_no_edge', 0)}")
 
         print("")
         print("Equity (includes open positions):")
