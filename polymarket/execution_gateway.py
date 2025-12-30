@@ -88,15 +88,31 @@ def submit_intent(
         (Submission, None) on success or (None, error_message) on failure
     """
     try:
+        # Resolve the actual CLOB token_id from the contract slug and outcome
+        # The intent.contract is a slug, but CLOB needs the numeric token_id
+        # Use intent.outcome (YES/NO) not intent.action (BUY/SELL)
+        token_id = provider.fetch_clob_token_id(intent.contract, intent.outcome)
+        
+        if not token_id:
+            error_msg = f"Could not resolve token_id for {intent.contract} ({intent.outcome})"
+            logger.error(error_msg)
+            return None, error_msg
+        
         # Call provider to place order
         response = provider.place_order(
-            token_id=intent.contract,
+            token_id=token_id,
             side=intent.action,
             price=intent.limit_price,
             size=intent.size_shares,
         )
         
-        # Create submission record
+        # Check if order placement succeeded
+        if not response.get("success"):
+            error_msg = response.get("error", "Unknown error from place_order")
+            logger.error(f"Order placement failed for {intent.intent_id[:8]}...: {error_msg}")
+            return None, f"Order placement failed: {error_msg}"
+        
+        # Create submission record only on success
         submission_id = str(uuid.uuid4())
         submitted_at = utc_now_iso()
         

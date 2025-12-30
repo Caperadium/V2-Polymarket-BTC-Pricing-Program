@@ -450,13 +450,36 @@ def update_intent_status(
 
 def check_duplicate_intents(intents: List[OrderIntent]) -> List[str]:
     """
-    Check for duplicate contract/expiry/outcome in a batch.
+    Check for duplicate contract/expiry/outcome in a batch and against existing orders.
+    
+    Only considers existing orders that are APPROVED, SUBMITTED, or FILLED.
+    Cancelled orders are excluded from duplicate check.
     
     Returns list of duplicate descriptions.
     """
     seen = set()
     duplicates = []
     
+    # First, load existing non-cancelled intents from DB
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        # Query existing intents that are NOT cancelled (DRAFT, APPROVED, SUBMITTED, FILLED)
+        # Only SUBMITTED and FILLED are truly "active"
+        cursor.execute("""
+            SELECT contract, expiry, outcome, status
+            FROM intents
+            WHERE status IN ('APPROVED', 'SUBMITTED', 'FILLED')
+        """)
+        
+        for row in cursor.fetchall():
+            key = (row[0], row[1], row[2])  # contract, expiry, outcome
+            seen.add(key)
+            
+    finally:
+        conn.close()
+    
+    # Now check new intents against existing + each other
     for intent in intents:
         key = (intent.contract, intent.expiry, intent.outcome)
         if key in seen:
@@ -464,3 +487,28 @@ def check_duplicate_intents(intents: List[OrderIntent]) -> List[str]:
         seen.add(key)
     
     return duplicates
+
+
+def clear_draft_intents() -> int:
+    """
+    Delete all DRAFT intents from the database.
+    
+    This should be called before generating new orders to clear the slate.
+    
+    Returns:
+        Number of intents deleted
+    """
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "DELETE FROM intents WHERE status = ?",
+            (IntentStatus.DRAFT,),
+        )
+        deleted = cursor.rowcount
+        conn.commit()
+        logger.info(f"Cleared {deleted} draft intents")
+        return deleted
+    finally:
+        conn.close()
+

@@ -174,8 +174,7 @@ def render_time_series_line(
     st.plotly_chart(fig, width="stretch")
 
 
-def build_position_key(slug: str, side: str, expiry: str) -> str:
-    return f"{slug}|{side}|{expiry}"
+
 
 
 def append_resolved_entry(path: Path, entry: dict) -> None:
@@ -208,17 +207,7 @@ def append_resolved_entry(path: Path, entry: dict) -> None:
     df.to_csv(path, index=False)
 
 
-def ensure_position_keys(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        df["position_key"] = []
-        return df
-    def _key(row):
-        slug = str(row.get("slug") or "")
-        side = str(row.get("side") or "")
-        expiry = str(row.get("expiry_key") or row.get("expiry_date") or "")
-        return build_position_key(slug, side, expiry)
-    df["position_key"] = df.apply(_key, axis=1)
-    return df
+
 
 
 def compute_realized_pnl_total(positions_df: pd.DataFrame, resolved_df: pd.DataFrame) -> float:
@@ -814,7 +803,7 @@ st.title("BTC Prediction Market Dashboard")
 st.sidebar.header("Data Sources & Settings")
 
 # Batch inputs (paths + uploads)
-# Batch inputs (paths + uploads)
+
 if "batch_paths" not in st.session_state:
     st.session_state["batch_paths"] = []
 
@@ -995,12 +984,9 @@ reco_price_min = min(auto_reco_min_price, auto_reco_max_price)
 reco_price_max = max(auto_reco_min_price, auto_reco_max_price)
 
 
-def ingest_optional(path: str, upload):
-    return ingest_csv(path, upload)
 
-
-regime_df = ingest_optional(regime_path, regime_upload)
-resolved_df = ingest_optional(resolved_path, resolved_upload)
+regime_df = ingest_csv(regime_path, regime_upload)
+resolved_df = ingest_csv(resolved_path, resolved_upload)
 resolved_path_editable = bool(resolved_path)
 resolved_file_path = Path(resolved_path) if resolved_path_editable else None
 if resolved_df is not None:
@@ -1486,7 +1472,7 @@ with tabs[1]:
                     ]
                     if c in ratio_df.columns
                 ]
-                st.dataframe(ratio_df[display_cols], use_container_width=True)
+                st.dataframe(ratio_df[display_cols], width='stretch')
             else:
                 st.info("No sigma/IV data found for the selected expiry; upload matching volatility_diagnostics.csv.")
 

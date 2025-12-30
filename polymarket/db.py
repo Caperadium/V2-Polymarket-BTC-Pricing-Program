@@ -122,12 +122,74 @@ def init_db() -> None:
             )
         """)
         
+        # ---------------------------------------------------------------------------
+        # Polymarket API Ledger Tables (for realized PnL and drawdown metrics)
+        # ---------------------------------------------------------------------------
+        
+        # pm_trades: Ingested trades from CLOB /data/trades endpoint
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS pm_trades (
+                trade_id TEXT PRIMARY KEY,
+                user_address TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                market_slug TEXT,
+                market_id TEXT,
+                condition_id TEXT,
+                token_id TEXT,
+                side TEXT,
+                price REAL,
+                size REAL,
+                notional REAL,
+                fee REAL,
+                maker_taker TEXT,
+                order_id TEXT,
+                raw_json TEXT
+            )
+        """)
+        
+        # pm_closed_positions: Ingested from Data-API /closed-positions
+        # Primary source for realized PnL
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS pm_closed_positions (
+                position_id TEXT PRIMARY KEY,
+                user_address TEXT NOT NULL,
+                condition_id TEXT,
+                market_slug TEXT,
+                title TEXT,
+                outcome TEXT,
+                outcome_index INTEGER,
+                avg_price REAL,
+                size REAL,
+                total_bought REAL,
+                realized_pnl REAL,
+                cur_price REAL,
+                resolved_at TEXT,
+                end_date TEXT,
+                raw_json TEXT
+            )
+        """)
+        
+        # pm_sync_metadata: Track sync state for idempotent incremental updates
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS pm_sync_metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT,
+                updated_at TEXT NOT NULL
+            )
+        """)
+        
         # Indexes for performance
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_intents_status ON intents(status)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_intents_created_at ON intents(created_at)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_intents_run_id ON intents(run_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_submissions_intent ON submissions(intent_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_submissions_status ON submissions(status)")
+        
+        # Indexes for Polymarket ledger tables
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_pm_trades_timestamp ON pm_trades(timestamp)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_pm_trades_user ON pm_trades(user_address)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_pm_closed_positions_user ON pm_closed_positions(user_address)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_pm_closed_positions_resolved ON pm_closed_positions(resolved_at)")
         
         conn.commit()
         logger.info(f"Database initialized at {DB_PATH}")

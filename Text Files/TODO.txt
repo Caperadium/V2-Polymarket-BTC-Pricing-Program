@@ -1,2 +1,4 @@
 The shrinkage and calibration, does that need to be recalibrated??
 Have the paramater config a global file that everyone can pull from and edit instead of it being locked in the dashboard
+
+VWAP (Volume Weighted Average Price) Pricing for proposed order size

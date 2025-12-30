@@ -23,6 +23,8 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 
+from vol_gate import compute_vol_gate
+
 
 def load_latest_fitted_batch(directory: str = "fitted_batch_results") -> Optional[pd.DataFrame]:
     """
@@ -209,11 +211,70 @@ def recommend_trades(
     data = df.copy()
     expiry_series = _derive_expiry_key(data)
     price_col = _pick_column(data, ["market_price", "market_pr", "Polymarket_Price"])
-    # Prefer raw Monte Carlo probability, fallback to fitted or calibrated
-    model_col = _pick_column(data, ["p_real_mc", "p_model_fit", "p_model_cal", "model_probability", "Model_Prob"])
+    # Prefer calibrated model probability for edge calculation
+    model_col = _pick_column(data, ["p_model_cal", "p_model_fit", "p_real_mc", "model_probability", "Model_Prob"])
     # Prefer fitted RN/market curve, fallback to raw RN probability
     rn_col = _pick_column(data, ["p_rn_fit", "risk_neutral_prob_fit", "risk_neutral_prob"])
     pricing_col = _pick_column(data, ["pricing_date", "date", "as_of_date"])
+
+    # -------------------------------------------------------------------------
+    # Volatility Gate Integration
+    # -------------------------------------------------------------------------
+    try:
+        # Load BTC data for Volatility Gate
+        # Assuming run from root where DATA/ exists
+        btc_path = Path("DATA/btc_intraday_1m.csv")
+        
+        # If not found in current dir, try parent (if running from pages/)
+        if not btc_path.exists():
+            btc_path_parent = Path("../DATA/btc_intraday_1m.csv")
+            if btc_path_parent.exists():
+                btc_path = btc_path_parent
+        
+        if btc_path.exists():
+            # Load BTC DF
+            # Optimization: could cache this if calling repeatedly, but requirement says "In auto_reco... from vol_gate..."
+            # For backtests this might be slow if called per-step, but fine for console generation.
+            btc_df = pd.read_csv(btc_path)
+            
+            # Use current time (UTC)
+            now_utc = datetime.now(timezone.utc)
+            
+            # Compute Gate
+            vg = compute_vol_gate(btc_df, now_utc)
+            
+            # Logging
+            print(f"[VolGate] Regime={vg.regime} Reason={vg.reason}")
+            
+            # 1. Block New Entries
+            if not vg.allow_new_entries:
+                print(f"[VolGate] [BLOCK] New entries disabled by Volatility Gate ({vg.regime}). Returning 0 trades.")
+                LAST_RECO_DEBUG = pd.DataFrame()
+                return []
+            
+            # 2. Adjust Edge Requirement
+            # edge_add_cents is in cents (e.g. 2.0). Min edge is probability space (0.xx).
+            # Convert cents to probability: 2.0 cents = 0.02
+            extra_edge_prob = vg.edge_add_cents / 100.0
+            if extra_edge_prob > 0:
+                old_min_edge = min_edge
+                min_edge += extra_edge_prob
+                print(f"[VolGate] [EDGE] Added +{extra_edge_prob:.4f} edge buffer. min_edge: {old_min_edge} -> {min_edge}")
+                
+            # 3. Adjust Kelly Multiplier
+            if vg.kelly_mult != 1.0:
+                old_kelly = kelly_fraction
+                kelly_fraction *= vg.kelly_mult
+                print(f"[VolGate] [KELLY] Scaled Kelly fraction by x{vg.kelly_mult:.2f}. kelly_fraction: {old_kelly} -> {kelly_fraction}")
+                
+        else:
+            print(f"[VolGate] [WARN] Warning: BTC data not found at {btc_path}. Skipping Volatility Gate checks.")
+            
+    except Exception as e:
+        print(f"[VolGate] [ERROR] Error executing Volatility Gate: {e}")
+        # Do not crash the entire reco pipeline, just continue without gate?
+        # User requested "Pure function style: no network calls...". If file load fails, maybe we should warn.
+        pass
 
     if price_col is None or model_col is None:
         raise ValueError("Batch file missing market_price or model probability columns.")
@@ -361,7 +422,15 @@ def recommend_trades(
             "total_multiplier": float(row["total_multiplier"]),
         }
         yes_edge = p - q
-        no_edge = q - p
+        
+        # Get NO price: prefer actual no_ask_price column, fallback to 1-q
+        if "no_ask_price" in row.index and pd.notna(row.get("no_ask_price")):
+            no_price = float(row["no_ask_price"])
+        else:
+            no_price = 1.0 - q
+        
+        # NO edge: (1 - model_prob) - no_price = probability of NO - cost to buy NO
+        no_edge = (1.0 - p) - no_price
         
         # Probability threshold mode: trade based on model_prob thresholds + edge requirement
         if use_prob_threshold:
@@ -377,7 +446,6 @@ def recommend_trades(
             
             # Trade NO if p <= threshold_no AND edge >= min_edge
             if allow_no:
-                no_price = 1.0 - q
                 no_passed_prob = p <= prob_threshold_no and min_price <= no_price <= max_price
                 no_passed_edge = no_edge >= min_edge
                 if no_passed_prob:
@@ -391,7 +459,6 @@ def recommend_trades(
             if yes_edge >= min_edge and min_price <= q <= max_price:
                 candidates.append({**base_info, "side": "YES", "edge": yes_edge, "entry_price": q})
             if allow_no:
-                no_price = 1.0 - q
                 if no_edge >= min_edge and min_price <= no_price <= max_price:
                     candidates.append({**base_info, "side": "NO", "edge": no_edge, "entry_price": no_price})
 

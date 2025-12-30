@@ -31,15 +31,16 @@ logger = logging.getLogger(__name__)
 
 def reconcile_submissions(provider: PolymarketProvider) -> Dict[str, Any]:
     """
-    Reconcile submission statuses with the provider.
+    Reconcile submission statuses with the Polymarket CLOB API.
     
-    MVP Implementation:
-    - Queries open submissions from database
-    - Queries open orders from provider
-    - For submissions not found in open orders, marks as FILLED
-    - For submissions found, keeps status as OPEN
+    For each open submission:
+    - Queries the CLOB API for the order's current status
+    - Updates local submission/intent status based on real status
     
-    In production, this would check actual order status from the API.
+    CLOB statuses: LIVE, MATCHED, CANCELLED
+    - LIVE = still open on the book
+    - MATCHED = fully filled
+    - CANCELLED = cancelled
     
     Args:
         provider: The PolymarketProvider to query
@@ -51,32 +52,66 @@ def reconcile_submissions(provider: PolymarketProvider) -> Dict[str, Any]:
     
     if not open_submissions:
         logger.info("No open submissions to reconcile")
-        return {"open": 0, "updated": 0, "unchanged": 0}
+        return {"open": 0, "filled": 0, "cancelled": 0, "still_open": 0, "errors": 0}
     
-    # Get open orders from provider
-    open_orders = provider.get_open_orders()
-    open_order_ids = {order.get("order_id") for order in open_orders if order.get("order_id")}
+    logger.info(f"Reconciling {len(open_submissions)} open submissions")
     
-    updated = 0
-    unchanged = 0
+    filled = 0
+    cancelled = 0
+    still_open = 0
+    errors = 0
     
     for submission in open_submissions:
-        if submission.order_id in open_order_ids:
-            # Order still open - no change
-            unchanged += 1
-            logger.debug(f"Submission {submission.submission_id[:8]}... still open")
-        else:
-            # Order not found in open orders
-            # In MVP, this likely means it was never really placed (fake provider)
-            # In production, we'd check if it was filled/cancelled
-            # For now, keep it OPEN
-            unchanged += 1
-            logger.debug(f"Submission {submission.submission_id[:8]}... not in open orders (keeping OPEN for MVP)")
+        if not submission.order_id:
+            # No order_id means the order was never actually placed
+            # Mark as cancelled so it doesn't stay in "submitted" state forever
+            logger.info(f"Submission {submission.submission_id[:8]}... has no order_id - marking as CANCELLED")
+            update_submission_status(submission.submission_id, SubmissionStatus.CANCELLED)
+            cancelled += 1
+            continue
+        
+        try:
+            # Query CLOB API for order status
+            order_status = provider.fetch_order_status(submission.order_id)
+            
+            if order_status is None:
+                # Order not found - may have been fully matched and removed
+                # Check if it could have been filled
+                logger.info(f"Order {submission.order_id[:12]}... not found - marking as FILLED")
+                update_submission_status(submission.submission_id, SubmissionStatus.FILLED)
+                filled += 1
+                continue
+            
+            status = order_status.get("status", "").upper()
+            
+            if status == "MATCHED":
+                # Fully filled
+                logger.info(f"Order {submission.order_id[:12]}... is MATCHED (filled)")
+                update_submission_status(submission.submission_id, SubmissionStatus.FILLED)
+                filled += 1
+            elif status in ("CANCELLED", "CANCELED"):  # Handle both spellings
+                logger.info(f"Order {submission.order_id[:12]}... is CANCELLED")
+                update_submission_status(submission.submission_id, SubmissionStatus.CANCELLED)
+                cancelled += 1
+            elif status == "LIVE":
+                # Still open
+                logger.debug(f"Order {submission.order_id[:12]}... still LIVE")
+                still_open += 1
+            else:
+                # Unknown status
+                logger.warning(f"Order {submission.order_id[:12]}... has unknown status: {status}")
+                still_open += 1
+                
+        except Exception as e:
+            logger.error(f"Error reconciling submission {submission.submission_id[:8]}...: {e}")
+            errors += 1
     
     result = {
         "open": len(open_submissions),
-        "updated": updated,
-        "unchanged": unchanged,
+        "filled": filled,
+        "cancelled": cancelled,
+        "still_open": still_open,
+        "errors": errors,
     }
     
     logger.info(f"Reconciliation complete: {result}")
