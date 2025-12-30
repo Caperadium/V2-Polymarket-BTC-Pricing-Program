@@ -24,9 +24,10 @@ import pandas as pd
 import streamlit as st
 
 # Add parent directory to path for imports
-sys.path.insert(0, str(Path(__file__).parent.parent))
+# Add project root to path for imports
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from auto_reco import recommend_trades, recommendations_to_dataframe, load_latest_fitted_batch
+from core.strategy.auto_reco import recommend_trades, recommendations_to_dataframe, load_latest_fitted_batch
 from polymarket.db import init_db, get_connection
 from polymarket.models import (
     OrderIntent,
@@ -314,18 +315,7 @@ with st.expander("Auto-Reco Parameters", expanded=True):
             min_value=0.05,
             max_value=1.0,
             value=0.40,
-            step=0.05,
             help="Maximum total fraction of bankroll to deploy",
-        )
-    
-    with param_row2_col3:
-        max_net_delta_frac = st.slider(
-            "Net Delta Limit (+/-)",
-            min_value=0.0,
-            max_value=1.0,
-            value=1.0,
-            step=0.05,
-            help="Cap net directional exposure (Long - Short). 0.2 = max 20% net long or short. 1.0 = no cap.",
         )
     
     # Row 3: Price filters
@@ -374,14 +364,6 @@ with st.expander("Auto-Reco Parameters", expanded=True):
     
     with param_row4_col1:
         use_stability_penalty = st.checkbox("Use Stability Penalty", value=False)
-        correlation_penalty = st.slider(
-            "Correlation Penalty",
-            min_value=0.0,
-            max_value=1.0,
-            value=0.0,
-            step=0.05,
-            help="0.0 = no shrink; 1.0 = strong shrink when many trades share same expiry/direction",
-        )
     
     with param_row4_col2:
         min_trade_pct = st.slider(
@@ -485,13 +467,11 @@ reco_params = {
     "max_bets_per_expiry": max_bets_per_expiry,
     "max_capital_per_expiry_frac": max_capital_per_expiry_frac,
     "max_capital_total_frac": max_capital_total_frac,
-    "max_net_delta_frac": max_net_delta_frac,
     "min_price": min_price,
     "max_price": max_price,
     "min_model_prob": min_model_prob,
     "max_model_prob": max_model_prob,
     "use_stability_penalty": use_stability_penalty,
-    "correlation_penalty": correlation_penalty,
     "min_trade_usd": min_trade_usd,
     "use_fixed_stake": use_fixed_stake,
     "fixed_stake_amount": fixed_stake_amount,
@@ -515,7 +495,7 @@ st.header("🚀 Run Pricing Engine")
 
 # Import date utilities
 from polymarket.date_utils import compute_expiry_dates, group_dates_by_month, format_date_range_summary
-from run_full_pipeline import run_pipeline_programmatic, verify_pipeline_output
+from scripts.pipelines.run_full_pipeline import run_pipeline_programmatic, verify_pipeline_output
 
 # Initialize session state for engine
 if "engine_running" not in st.session_state:
@@ -963,13 +943,11 @@ if generate_clicked:
                     "max_bets_per_expiry": max_bets_per_expiry,
                     "max_capital_per_expiry_frac": max_capital_per_expiry_frac,
                     "max_capital_total_frac": max_capital_total_frac,
-                    "max_net_delta_frac": max_net_delta_frac,
                     "min_price": min_price,
                     "max_price": max_price,
                     "min_model_prob": min_model_prob,
                     "max_model_prob": max_model_prob,
                     "use_stability_penalty": use_stability_penalty,
-                    "correlation_penalty": correlation_penalty,
                     # When using fixed stake, set min to that amount to avoid filtering
                     "min_trade_usd": fixed_stake_amount if use_fixed_stake else min_trade_usd,
                     "use_fixed_stake": use_fixed_stake,

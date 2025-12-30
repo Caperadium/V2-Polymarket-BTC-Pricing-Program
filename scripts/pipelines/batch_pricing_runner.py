@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 import pytz
 from typing import Dict, List, Tuple
 
-from btc_pricing_engine import load_and_prep_data, fit_garch_model, simulate_paths, get_contract_probability
+from core.pricing.btc_pricing_engine import load_and_prep_data, fit_garch_model, simulate_paths, get_contract_probability
 
 # Setup Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -291,7 +291,7 @@ def main():
         
         # Run Curve Fitting
         try:
-            import fit_probability_curves
+            from core.pricing import fit_probability_curves
             logger.info("Fitting probability curves...")
             
             # Setup output paths for curve fitting

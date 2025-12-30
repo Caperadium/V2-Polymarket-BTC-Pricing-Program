@@ -31,10 +31,14 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+import sys
 
-from auto_reco import LAST_RECO_DEBUG, recommend_trades, recommendations_to_dataframe
-from backtest_engine import run_backtest
-from positions import (
+# Add root directory to sys.path to find 'core' and 'scripts' packages
+sys.path.append(str(Path(__file__).parent.parent))
+
+from core.strategy.auto_reco import LAST_RECO_DEBUG, recommend_trades, recommendations_to_dataframe
+from scripts.backtesting.backtest_engine import run_backtest
+from core.data.positions import (
     enrich_positions_with_batch,
     load_positions,
     ensure_position_keys,
@@ -42,6 +46,7 @@ from positions import (
     sync_open_positions_with_batch,
 )
 from sweep_config import SweepConfig
+from core.pricing.btc_pricing_engine import calculate_probabilities
 
 # Load default config for sidebar defaults
 _DEFAULTS = SweepConfig()
@@ -971,14 +976,6 @@ auto_reco_min_prob = st.sidebar.number_input("Min model prob", min_value=0.0, ma
 auto_reco_max_prob = st.sidebar.number_input("Max model prob", min_value=0.0, max_value=1.0, value=1.0, step=0.01)
 auto_reco_use_penalty = st.sidebar.checkbox("Use stability penalty", value=True)
 auto_reco_allow_no = True
-auto_reco_corr_penalty = st.sidebar.slider(
-    "Correlation penalty (per expiry & direction)",
-    0.0,
-    1.0,
-    0.25,
-    0.05,
-    help="0.0 = no shrink; 1.0 = strong shrink when many trades share the same expiry and direction.",
-)
 auto_reco_min_trade_pct = st.sidebar.slider("Min stake (% of bankroll)", 1, 10, 1, 1) / 100.0
 reco_price_min = min(auto_reco_min_price, auto_reco_max_price)
 reco_price_max = max(auto_reco_min_price, auto_reco_max_price)
@@ -1703,7 +1700,6 @@ with tabs[4]:
                 max_bets_per_expiry=auto_reco_max_bets,
                 max_capital_per_expiry_frac=auto_reco_max_expiry_frac,
                 max_capital_total_frac=auto_reco_max_total_frac,
-                max_net_delta_frac=auto_reco_net_delta,
                 min_price=reco_price_min,
                 max_price=reco_price_max,
                 min_model_prob=auto_reco_min_prob,
@@ -1711,7 +1707,6 @@ with tabs[4]:
                 require_active=True,
                 use_stability_penalty=auto_reco_use_penalty,
                 allow_no=auto_reco_allow_no,
-                correlation_penalty=auto_reco_corr_penalty,
                 min_trade_usd=min_trade_dollars,
                 disable_staleness=False,
                 use_fixed_stake=use_fixed_stake,
@@ -1923,7 +1918,6 @@ with tabs[6]:
                     "max_bets_per_expiry": auto_reco_max_bets,
                     "max_capital_per_expiry_frac": auto_reco_max_expiry_frac,
                     "max_capital_total_frac": auto_reco_max_total_frac,
-                    "max_net_delta_frac": auto_reco_net_delta,
                     "min_price": reco_price_min,
                     "max_price": reco_price_max,
                     "min_model_prob": auto_reco_min_prob,
@@ -1931,7 +1925,6 @@ with tabs[6]:
                     "require_active": False,  # Must be False for historical backtesting
                     "use_stability_penalty": auto_reco_use_penalty,
                     "allow_no": auto_reco_allow_no,
-                    "correlation_penalty": auto_reco_corr_penalty,
                     "min_trade_usd": None,
                     "min_trade_frac": auto_reco_min_trade_pct,
                     "disable_staleness": True,

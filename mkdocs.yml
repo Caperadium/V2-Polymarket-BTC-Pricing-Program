@@ -1,0 +1,64 @@
+site_name: BTC Polymarket Pricing
+theme:
+  name: material
+  palette:
+    primary: indigo
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - search.highlight
+    - content.code.copy
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          paths: ["."]
+markdown_extensions:
+  - admonition
+  - pymdownx.highlight
+  - pymdownx.superfences
+  - pymdownx.tabbed
+  - toc:
+      permalink: true
+nav:
+  - Home: index.md
+  - Getting Started:
+    - Installation: getting-started/installation.md
+    - Quickstart: getting-started/quickstart.md
+    - Configuration: getting-started/configuration.md
+  - Concepts:
+    - Architecture: concepts/architecture.md
+    - Pricing Engine: concepts/pricing-engine.md
+    - Probability Fitting: concepts/probability-fitting.md
+    - Kelly Sizing: concepts/kelly-sizing.md
+    - Vol Gate: concepts/vol-gate.md
+    - Risk Controls: concepts/risk-controls.md
+  - Guides:
+    - Full Pipeline: guides/full-pipeline.md
+    - Batch Pricing: guides/batch-pricing.md
+    - Dashboard: guides/running-dashboard.md
+    - Polymarket Console: guides/polymarket-console.md
+    - Backtesting: guides/backtesting.md
+    - Parameter Sweeps: guides/parameter-sweeps.md
+  - API Reference:
+    - Core:
+      - BTC Pricing: api-reference/core/btc-pricing-engine.md
+      - Probability Fitting: api-reference/core/fit-probability.md
+      - Data Fetcher: api-reference/core/data-fetcher.md
+      - Positions: api-reference/core/positions.md
+      - auto_reco: api-reference/core/auto-reco.md
+      - vol_gate: api-reference/core/vol-gate.md
+    - Polymarket:
+      - Provider: api-reference/polymarket/provider.md
+      - Execution: api-reference/polymarket/execution-gateway.md
+      - Intents: api-reference/polymarket/intent-builder.md
+    - Pipelines:
+      - Full Pipeline: api-reference/pipelines/run-full-pipeline.md
+      - Batch Pricing: api-reference/pipelines/batch-pricing-runner.md
+  - Development:
+    - Contributing: development/contributing.md
+    - Testing: development/testing.md
+    - Changelog: development/changelog.md
+  - Appendix:
+    - Glossary: appendix/glossary.md

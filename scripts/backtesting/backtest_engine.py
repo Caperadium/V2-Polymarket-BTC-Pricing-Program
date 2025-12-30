@@ -33,7 +33,7 @@ except Exception:
     # Fallback for older Python
     ET_ZONE = timezone(timedelta(hours=-5))
 
-from auto_reco import recommend_trades, recommendations_to_dataframe
+from core.strategy.auto_reco import recommend_trades, recommendations_to_dataframe
 
 # Configure module logger
 logger = logging.getLogger(__name__)

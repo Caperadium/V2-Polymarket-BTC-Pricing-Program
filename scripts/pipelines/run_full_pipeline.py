@@ -70,7 +70,7 @@ def run_pipeline_programmatic(
     if not skip_data_fetch:
         log("Step 1: Fetching BTC data...")
         try:
-            import data_fetcher
+            from core.data import data_fetcher
             # data_fetcher.main() fetches and saves data
             # We need to call it without sys.exit
             data_fetcher.main()
@@ -89,8 +89,8 @@ def run_pipeline_programmatic(
     
     try:
         # Import batch pricing internals
-        from btc_pricing_engine import load_and_prep_data, fit_garch_model, simulate_paths, get_contract_probability
-        import batch_pricing_runner
+        from core.pricing.btc_pricing_engine import load_and_prep_data, fit_garch_model, simulate_paths, get_contract_probability
+        import scripts.pipelines.batch_pricing_runner as batch_pricing_runner
         
         # Load data once
         log("Loading BTC data and fitting GARCH model...")
@@ -228,7 +228,7 @@ def run_pipeline_programmatic(
             
             # Fit curves
             try:
-                import fit_probability_curves
+                from core.pricing import fit_probability_curves
                 fit_probability_curves.process_batch(
                     input_csv=output_path,
                     output_batch_csv=f"{fitted_output_dir}/batch_with_fits.csv",
@@ -350,14 +350,15 @@ Examples:
     
     # Step 1: Fetch data
     if not args.skip_data_fetch:
-        if not run_step("Fetching BTC Data", [python, "data_fetcher.py"]):
+        # data_fetcher is now in core/data/data_fetcher.py
+        if not run_step("Fetching BTC Data", [python, "core/data/data_fetcher.py"]):
             sys.exit(1)
     else:
         print("\n⏭️  Skipping data fetch (--skip-data-fetch)")
     
     # Step 2: Run batch pricing
     batch_cmd = [
-        python, "batch_pricing_runner.py",
+        python, "scripts/pipelines/batch_pricing_runner.py",
         "--slug-pattern", args.slug_pattern,
         "--day-range", str(args.day_range[0]), str(args.day_range[1]),
         "--num-sims", str(args.num_sims),
