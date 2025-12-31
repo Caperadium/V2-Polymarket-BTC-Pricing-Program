@@ -34,31 +34,26 @@ from core.strategy.vol_gate import VolGateResult, compute_vol_gate
 # Configure logging
 logger = logging.getLogger(__name__)
 
+
 # -----------------------------------------------------------------------------
 # Constants & Defaults
 # -----------------------------------------------------------------------------
 
-
-MAX_CAP_PER_EXPIRY_FRAC_DEFAULT = 0.15
-MAX_CAP_TOTAL_FRAC_DEFAULT = 0.35
-STALE_SOFT_HOURS = 4.0
-STALE_HARD_HOURS = 12.0
-DEFAULT_MIN_TRADE_USD = 5.0
-DEFAULT_REBALANCE_MIN_ADD_USD = 5.0
-DEFAULT_REBALANCE_MIN_REDUCE_USD = 10.0
-DEFAULT_EXIT_HYSTERESIS = 0.02  # Edge below entry but above exit = HOLD
-
-
-# -----------------------------------------------------------------------------
-# Target Role Enum (replaces string-based 'source' field)
-# -----------------------------------------------------------------------------
-
-class TargetRole(str, Enum):
-    """Role of a target position in the portfolio pipeline."""
-    ENTRY = "entry"           # New entry or increase (subject to consistency filter)
-    EXIT = "exit"             # SELL signal (never filtered)
-    HOLD_SAFETY = "hold_safety"  # Held position to keep (never filtered)
-    NEUTRAL = "neutral"       # No action (pass-through)
+from core.strategy.common import (
+    MAX_CAP_PER_EXPIRY_FRAC_DEFAULT,
+    MAX_CAP_TOTAL_FRAC_DEFAULT,
+    STALE_SOFT_HOURS,
+    STALE_HARD_HOURS,
+    DEFAULT_MIN_TRADE_USD,
+    DEFAULT_REBALANCE_MIN_ADD_USD,
+    DEFAULT_REBALANCE_MIN_REDUCE_USD,
+    DEFAULT_EXIT_HYSTERESIS,
+    TargetRole,
+    TargetPosition,
+    DeltaIntent,
+    TradeRecommendation,
+    RebalanceConfig,
+)
 
 # Debug state
 LAST_RECO_DEBUG: Optional[pd.DataFrame] = None
@@ -69,151 +64,6 @@ def reset_threshold_debug() -> None:
     """Reset the threshold debug accumulator."""
     global LAST_RECO_THRESHOLD_DEBUG
     LAST_RECO_THRESHOLD_DEBUG = None
-
-
-# -----------------------------------------------------------------------------
-# Data Structures
-# -----------------------------------------------------------------------------
-
-@dataclass
-class TargetPosition:
-    """Represents the ideal state for a single contract."""
-    key: str  # Unique identifier
-    slug: str
-    side: str  # YES or NO
-    expiry_key: str
-    strike: float
-    condition_id: Optional[str]
-    
-    target_fraction: float  # Ideal Kelly fraction
-    target_usd: float  # target_fraction * bankroll
-    
-    model_prob: float
-    market_price: float
-    entry_price: float  # Price to execute (ask for buys)
-    effective_edge: float
-    
-    allocation_score: float  # For ranking new capital allocation
-    exit_score: float  # For ranking reductions
-    
-    role: TargetRole  # Role in portfolio pipeline (replaces 'source' string)
-    
-    # Debug/metadata
-    kelly_full: float = 0.0
-    kelly_mult_applied: float = 1.0
-    stability_penalty: float = 1.0
-    stale_mult: float = 1.0
-    
-    metadata: Dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
-class DeltaIntent:
-    """Represents the trade action from Current to Target."""
-    key: str
-    slug: str
-    side: str
-    expiry_key: str
-    strike: float
-    
-    action: Literal["BUY", "SELL", "HOLD"]
-    amount_usd: float  # Absolute amount to trade
-    signed_delta_usd: float  # + for buy, - for sell
-    
-    current_usd: float  # Cost basis at risk before trade
-    target_usd: float  # Desired exposure after trade
-    
-    price_mode: Optional[str]  # TAKER_ASK, TAKER_BID, or None for HOLD
-    limit_price_hint: Optional[float]  # For UI display
-    
-    model_prob: float
-    effective_edge: float
-    reason: str
-    
-    # Compatibility fields for TradeRecommendation consumers
-    question: str = ""
-    entry_price: float = 0.0
-    market_price: float = 0.0
-    kelly_fraction_full: float = 0.0
-    kelly_fraction_full_effective: float = 0.0
-    kelly_fraction_target: float = 0.0
-    kelly_fraction_existing: float = 0.0
-    kelly_fraction_applied: float = 0.0
-    suggested_stake: float = 0.0
-    expected_value_per_contract: float = 0.0
-    expected_value_dollars: float = 0.0
-    expiry_group_risk: float = 0.0
-    stability_penalty: float = 1.0
-    stale_mult: float = 1.0
-    batch_age_hours: Optional[float] = None
-    expiry_shape_label: str = "none"
-    direction: str = ""
-    notes: str = ""
-    rn_prob: Optional[float] = None
-    pricing_date: Optional[pd.Timestamp] = None
-
-
-# Legacy alias for backwards compatibility
-TradeRecommendation = DeltaIntent
-
-
-# -----------------------------------------------------------------------------
-# Config Dataclass
-# -----------------------------------------------------------------------------
-
-@dataclass
-class RebalanceConfig:
-    """Configuration for the rebalancing pipeline."""
-    bankroll: float
-    
-    # Edge & Entry
-    min_edge_entry: float = 0.02
-    min_edge_exit: float = 0.00  # Hysteresis: exit only when below this
-    spread_cost: float = 0.0  # Conservative default
-    
-    # Kelly & Sizing
-    kelly_fraction: float = 0.15
-    use_fixed_stake: bool = False
-    fixed_stake_amount: float = 10.0
-    
-    # Caps
-    max_capital_per_expiry_frac: float = MAX_CAP_PER_EXPIRY_FRAC_DEFAULT
-    max_capital_total_frac: float = MAX_CAP_TOTAL_FRAC_DEFAULT
-    max_bets_per_expiry: int = 3
-    
-    # Delta Caps
-    max_add_per_cycle_usd: float = float("inf")
-    max_reduce_per_cycle_usd: float = float("inf")
-    
-    # Churn Control
-    rebalance_min_add_usd: float = DEFAULT_REBALANCE_MIN_ADD_USD
-    rebalance_min_reduce_usd: float = DEFAULT_REBALANCE_MIN_REDUCE_USD
-    min_trade_usd: float = DEFAULT_MIN_TRADE_USD
-    
-    # Filters
-    min_price: float = 0.03
-    max_price: float = 0.95
-    min_model_prob: float = 0.0
-    max_model_prob: float = 1.0
-    max_dte: Optional[float] = None
-    max_moneyness: Optional[float] = None
-    min_moneyness: Optional[float] = None
-    require_active: bool = True
-    allow_no: bool = True
-    
-    # Stability
-    use_stability_penalty: bool = True
-    disable_staleness: bool = False
-    
-    # Safety Policies
-    missing_target_policy: Literal["KEEP", "EXIT"] = "KEEP"
-    risk_off_targets_to_zero: bool = True
-    cap_breach_delever: bool = False
-    
-    # Prob threshold mode
-    use_prob_threshold: bool = False
-    prob_threshold_yes: float = 0.7
-    prob_threshold_no: float = 0.3
 
 
 # -----------------------------------------------------------------------------
@@ -308,15 +158,15 @@ def generate_key(
     return f"{slug}|{expiry}|{strike:.2f}|{effective_side}"
 
 
-def compute_current_exposure_usd(
+def compute_current_exposure_mtm(
     positions_df: Optional[pd.DataFrame],
     bankroll: float
 ) -> Dict[str, float]:
     """
-    Compute current exposure in USD (cost basis) per position key.
+    Compute current exposure in USD (Mark-To-Market) per position key.
     
     Returns:
-        Dict mapping key -> current_usd (net cost basis, clamped >= 0)
+        Dict mapping key -> current_mtm_value (clamped >= 0)
     """
     if positions_df is None or positions_df.empty:
         return {}
@@ -325,19 +175,24 @@ def compute_current_exposure_usd(
     
     for _, pos in positions_df.iterrows():
         key = generate_key(pos)
-        entry_price = float(pos.get("entry_price", 0))
+        # Use market price for exposure (Market Value)
+        # Fallback to entry_price only if market_price missing/zero
+        price = float(pos.get("market_price", 0))
+        if price <= 0:
+             price = float(pos.get("entry_price", 0))
+             
         size_shares = float(pos.get("size_shares", 0))
         
-        if pd.isna(entry_price) or pd.isna(size_shares):
+        if price <= 0 or size_shares <= 0:
             continue
         
-        cost_basis = entry_price * size_shares
+        market_value = price * size_shares
         
         # If sells are tracked, subtract proceeds
         # For now: sell_proceeds = 0 (long-only)
         sell_proceeds = 0.0
         
-        net = cost_basis - sell_proceeds
+        net = market_value - sell_proceeds
         exposure[key] = max(0.0, exposure[key] + net)
     
     return dict(exposure)
@@ -543,10 +398,12 @@ def build_targets(
                     model_prob=0.5,
                     market_price=0.5,
                     entry_price=0.5,
+                    exit_price=0.5,
                     effective_edge=0.0,
                     allocation_score=0.0,
                     exit_score=0.0,
                     role=role,
+                    is_fallback_price=False,
                 )
         return targets
     
@@ -627,9 +484,16 @@ def build_targets(
         yes_is_held = yes_cur_usd > 0
         
         yes_price = q
+        yes_is_fallback = True
         if "yes_ask_price" in row.index and pd.notna(row.get("yes_ask_price")):
             yes_price = float(row["yes_ask_price"])
+            yes_is_fallback = False
         yes_effective_edge = (p - yes_price) - config.spread_cost
+        
+        # YES Exit Price (Bid)
+        yes_exit = q # Default to mid if missing
+        if "yes_bid_price" in row.index and pd.notna(row.get("yes_bid_price")):
+            yes_exit = float(row["yes_bid_price"])
         
         if config.min_price <= yes_price <= config.max_price:
             candidates.append({
@@ -647,8 +511,12 @@ def build_targets(
                 "is_held": yes_is_held,
                 "side": "YES",
                 "entry_price": yes_price,
+                "exit_price": yes_exit,
                 "market_price": yes_price,
                 "effective_edge": yes_effective_edge,
+                "market_price": yes_price,
+                "effective_edge": yes_effective_edge,
+                "is_fallback_price": yes_is_fallback,
             })
         
         # NO side - generate key WITH side
@@ -658,9 +526,16 @@ def build_targets(
             no_is_held = no_cur_usd > 0
             
             no_price = 1.0 - q
+            no_is_fallback = True
             if "no_ask_price" in row.index and pd.notna(row.get("no_ask_price")):
                 no_price = float(row["no_ask_price"])
+                no_is_fallback = False
             no_effective_edge = ((1.0 - p) - no_price) - config.spread_cost
+            
+            # NO Exit Price (Bid)
+            no_exit = 1.0 - q
+            if "no_bid_price" in row.index and pd.notna(row.get("no_bid_price")):
+                no_exit = float(row["no_bid_price"])
             
             if config.min_price <= no_price <= config.max_price:
                 candidates.append({
@@ -678,8 +553,12 @@ def build_targets(
                     "is_held": no_is_held,
                     "side": "NO",
                     "entry_price": no_price,
+                    "exit_price": no_exit,
                     "market_price": no_price,
                     "effective_edge": no_effective_edge,
+                    "market_price": no_price,
+                    "effective_edge": no_effective_edge,
+                    "is_fallback_price": no_is_fallback,
                 })
     
     if not candidates:
@@ -719,10 +598,20 @@ def build_targets(
         # Kelly calculation - use entry_price consistently for both sides
         entry_p = row["entry_price"]
         if side == "YES":
-            f_star = kelly_fraction_yes(p, entry_p)
+            # Buying YES: Win if YES (prob p), Cost = entry_p
+            p_win = p
+            cost = entry_p
         else:
-            # For NO: p_no = 1-p, cost = entry_price
-            f_star = kelly_fraction_no(p, entry_p)
+            # Buying NO: Win if NO (prob 1-p), Cost = entry_p
+            p_win = 1.0 - p
+            cost = entry_p
+        
+        # Standard Kelly: f = (p_win - cost) / (1 - cost)
+        # (Assuming payout is 1 unit, profit is 1-cost, loss is cost)
+        if 1.0 - cost > 1e-9:
+            f_star = max(0.0, (p_win - cost) / (1.0 - cost))
+        else:
+            f_star = 0.0
         
         # Apply vol gate kelly multiplier
         f_star_scaled = f_star * vol_gate_result.kelly_mult * stability * stale_mult
@@ -731,7 +620,11 @@ def build_targets(
         f_target = min(config.kelly_fraction * f_star_scaled, 0.30)
         
         # Entry eligibility check
-        passes_entry = eff_edge >= required_edge_entry
+        # STRICT GATE: If new entries disallowed (e.g. stale), force fail
+        if not vol_gate_result.allow_new_entries:
+            passes_entry = False
+        else:
+            passes_entry = eff_edge >= required_edge_entry
         passes_exit = eff_edge >= required_edge_exit
         
         # Determine target and role
@@ -756,6 +649,7 @@ def build_targets(
         df_cand.loc[idx, "allocation_score"] = eff_edge * vol_gate_result.kelly_mult if target_frac > 0 else 0.0
         df_cand.loc[idx, "exit_score"] = eff_edge
         df_cand.loc[idx, "kelly_full"] = f_star
+        df_cand.loc[idx, "kelly_mult_applied"] = vol_gate_result.kelly_mult
         df_cand.loc[idx, "kelly_mult_applied"] = vol_gate_result.kelly_mult
         df_cand.loc[idx, "role"] = role_str
     
@@ -909,6 +803,7 @@ def build_targets(
             model_prob=row["model_prob"],
             market_price=row["market_price"],
             entry_price=row["entry_price"],
+            exit_price=row.get("exit_price", row["entry_price"]),
             effective_edge=row["effective_edge"],
             allocation_score=row["allocation_score"],
             exit_score=row["exit_score"],
@@ -917,6 +812,7 @@ def build_targets(
             kelly_mult_applied=row.get("kelly_mult_applied", 1.0),
             stability_penalty=row.get("stability_penalty", 1.0),
             stale_mult=row.get("stale_mult", 1.0),
+            is_fallback_price=row.get("is_fallback_price", False),
             metadata={"question": row.get("question", "")},
         )
     
@@ -949,10 +845,12 @@ def build_targets(
                 model_prob=0.5,
                 market_price=0.5,
                 entry_price=0.5,
+                exit_price=0.5,
                 effective_edge=0.0,
                 allocation_score=0.0,
                 exit_score=-1.0,  # Low priority for exit
                 role=TargetRole.HOLD_SAFETY if target_usd > 0 else TargetRole.EXIT,
+                is_fallback_price=False,
             )
     
     # Debug: check key matching
@@ -1003,28 +901,37 @@ def compute_deltas(
             side = tgt.side
             expiry_key = tgt.expiry_key
             strike = tgt.strike
+            condition_id = tgt.condition_id
             entry_price = tgt.entry_price
             market_price = tgt.market_price
             question = tgt.metadata.get("question", "")
             alloc_score = tgt.allocation_score
             exit_score = tgt.exit_score
+            exit_price = tgt.exit_price
+            is_fallback = tgt.is_fallback_price
         else:
-            # Missing target - apply policy
+            # Missing target (Position held but no model output)
             if config.missing_target_policy == "KEEP":
-                tgt_usd = cur_usd
+                tgt_usd = cur_usd  # Hold current exposure
             else:
-                tgt_usd = 0.0
-            model_prob = 0.5
+                tgt_usd = 0.0  # Force exit
+                
+            # Sentinel values - Do NOT fabricate an executable trade
+            model_prob = 0.0
             eff_edge = 0.0
+            # Parse slug from key just for display, don't rely on it for execution
             slug = key.split("|")[0] if "|" in key else key
-            side = "YES"
+            side = "YES" 
             expiry_key = "unknown"
             strike = 0.0
-            entry_price = 0.5
-            market_price = 0.5
-            question = ""
+            condition_id = None
+            entry_price = 0.0 
+            market_price = 0.0
+            question = "Held position (target missing)"
             alloc_score = 0.0
-            exit_score = -1.0
+            exit_score = -999.0 # Prioritize clearing if exiting
+            exit_price = entry_price  # Use entry price as fallback for exit
+            is_fallback = False
         
         # Risk-off override (Priority 1)
         if not vol_gate_result.allow_new_entries and config.risk_off_targets_to_zero:
@@ -1077,17 +984,19 @@ def compute_deltas(
         
         intent = DeltaIntent(
             key=key,
+            intent_key=f"{key}|{action}",
             slug=slug,
             side=side,
             expiry_key=expiry_key,
             strike=strike,
+            condition_id=condition_id,
             action=action,
             amount_usd=amount,
             signed_delta_usd=raw_delta,
             current_usd=cur_usd,
             target_usd=tgt_usd,
             price_mode=price_mode,
-            limit_price_hint=entry_price,
+            limit_price_hint=exit_price if action == "SELL" else entry_price,
             model_prob=model_prob,
             effective_edge=eff_edge,
             reason=reason,
@@ -1098,6 +1007,7 @@ def compute_deltas(
             expected_value_per_contract=eff_edge,
             expected_value_dollars=eff_edge * amount,
             direction=side,
+            is_fallback_price=is_fallback,
         )
         
         # Store for cap processing
@@ -1188,6 +1098,10 @@ def recommend_trades(
     btc_price_df: Optional[pd.DataFrame] = None,
     risk_off_targets_to_zero: bool = True,
     missing_target_policy: Literal["KEEP", "EXIT"] = "KEEP",
+    return_all: bool = False,
+    # Compatibility arguments to match RebalanceConfig fields
+    min_edge_entry: Optional[float] = None,
+    **kwargs: Any,
 ) -> List[DeltaIntent]:
     """
     Public API: Generate trade recommendations using the 3-stage pipeline.
@@ -1204,10 +1118,13 @@ def recommend_trades(
         return []
     
     # Build config
+    # Prefer min_edge_entry from arguments/kwargs, fallback to legacy min_edge
+    final_min_edge = min_edge_entry if min_edge_entry is not None else min_edge
+    
     config = RebalanceConfig(
         bankroll=bankroll,
-        min_edge_entry=min_edge,
-        min_edge_exit=min_edge - DEFAULT_EXIT_HYSTERESIS,
+        min_edge_entry=final_min_edge,
+        min_edge_exit=final_min_edge - DEFAULT_EXIT_HYSTERESIS,
         kelly_fraction=kelly_fraction,
         use_fixed_stake=use_fixed_stake,
         fixed_stake_amount=fixed_stake_amount,
@@ -1233,6 +1150,9 @@ def recommend_trades(
         prob_threshold_no=prob_threshold_no,
         risk_off_targets_to_zero=risk_off_targets_to_zero,
         missing_target_policy=missing_target_policy,
+        # Extract cycle caps from kwargs if present (defaults to 100k/200k in RebalanceConfig)
+        max_add_per_cycle_usd=kwargs.get("max_add_per_cycle_usd", 100000.0),
+        max_reduce_per_cycle_usd=kwargs.get("max_reduce_per_cycle_usd", 200000.0),
     )
     
     # Load BTC data for vol gate
@@ -1268,7 +1188,7 @@ def recommend_trades(
         else:
             combined_positions = current_open_positions
     
-    current_exposure = compute_current_exposure_usd(combined_positions, bankroll)
+    current_exposure = compute_current_exposure_mtm(combined_positions, bankroll)
     
     # Stage 1: Build Targets
     targets = build_targets(
@@ -1287,17 +1207,42 @@ def recommend_trades(
         config=config,
     )
     
-    # Filter to only actionable intents
-    actionable = [i for i in intents if i.action != "HOLD" and i.amount_usd >= min_trade_usd]
+    # Filter to only actionable intents unless return_all is True
+    if return_all:
+        actionable = intents
+    else:
+        actionable = [i for i in intents if i.action != "HOLD" and i.amount_usd >= min_trade_usd]
     
     # Populate legacy fields for backwards compatibility
+    # Populate legacy fields / Safe Mapping
     for intent in actionable:
-        if intent.action == "BUY":
-            intent.suggested_stake = intent.amount_usd
-            intent.kelly_fraction_applied = intent.amount_usd / bankroll if bankroll > 0 else 0
-        else:
-            intent.suggested_stake = -intent.amount_usd  # Negative for sells
-            intent.kelly_fraction_applied = -intent.amount_usd / bankroll if bankroll > 0 else 0
+        t = targets.get(intent.key)
+        if not t:
+            continue
+
+        # Safely map attributes using metadata or defaults
+        intent.question = t.metadata.get("question", "") if hasattr(t, "metadata") else ""
+        
+        # Ensure prices are float
+        intent.entry_price = float(t.entry_price or 0.0)
+        intent.market_price = float(t.market_price or 0.0)
+
+        # Consistent hint
+        intent.limit_price_hint = float(t.entry_price or t.market_price or 0.0)
+
+        # Recalculate EV dollars based on ACTUAL capped amount
+        # (DeltaIntent constructor sets this pre-cap, so we must update it)
+        if intent.effective_edge:
+             intent.expected_value_dollars = float(intent.effective_edge) * float(intent.amount_usd)
+
+        # Additional logic for derived fields
+        intent.suggested_stake = intent.amount_usd
+        intent.direction = "Long" if intent.side == "YES" else "Short"
+        
+        # Map fractions safely
+        current_value = current_exposure.get(intent.key, 0.0)
+        intent.kelly_fraction_existing = current_value / bankroll if bankroll > 0 else 0
+        intent.kelly_fraction_applied = -intent.amount_usd / bankroll if bankroll > 0 else 0
         
         intent.notes = f"{intent.action}: {intent.reason}"
     

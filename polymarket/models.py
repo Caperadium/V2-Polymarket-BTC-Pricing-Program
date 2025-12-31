@@ -71,6 +71,7 @@ class OrderIntent:
     """Represents a trade intent."""
     intent_id: str
     run_id: str
+    intent_key: str  # Logical key for stability
     created_at: str  # ISO format
     contract: str
     outcome: str  # YES or NO
@@ -97,10 +98,21 @@ class OrderIntent:
     
     @classmethod
     def from_row(cls, row) -> "OrderIntent":
-        """Create OrderIntent from a database row."""
+        """
+        Create OrderIntent from a database row (dict or sqlite3.Row).
+        """
+        # Helper to safely get value whether row is dict or sqlite3.Row
+        def get_val(key, default=None):
+            if hasattr(row, "keys"):
+                return row[key] if key in row.keys() else default
+            return default
+
+        intent_key = get_val("intent_key", "") or "" 
+        
         return cls(
             intent_id=row["intent_id"],
             run_id=row["run_id"],
+            intent_key=intent_key,
             created_at=row["created_at"],
             contract=row["contract"],
             outcome=row["outcome"],
@@ -112,14 +124,14 @@ class OrderIntent:
             expiry=row["expiry"] or "",
             strategy=row["strategy"] or "",
             params_json=row["params_json"] or "{}",
-            model_prob=row["model_prob"],
-            market_prob=row["market_prob"],
-            edge=row["edge"],
-            ev=row["ev"],
+            model_prob=get_val("model_prob"),
+            market_prob=get_val("market_prob"),
+            edge=get_val("edge"),
+            ev=get_val("ev"),
             status=row["status"],
-            approved_at=row["approved_at"],
-            approved_snapshot_json=row["approved_snapshot_json"],
-            submitted_at=row["submitted_at"],
+            approved_at=get_val("approved_at"),
+            approved_snapshot_json=get_val("approved_snapshot_json"),
+            submitted_at=get_val("submitted_at"),
             notes=row["notes"] or "",
             raw_reco_json=row["raw_reco_json"] or "{}",
         )
@@ -132,6 +144,7 @@ class OrderIntent:
         return (
             self.intent_id,
             self.run_id,
+            self.intent_key,
             self.created_at,
             self.strategy,
             self.params_json,

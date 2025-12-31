@@ -1,0 +1,10 @@
+[NegativeEdgeDebug] Slug=bitcoin-above-92k-on-december-13 Side=YES Edge=-0.15247 MinEdge=0.08000 PassesEntry=False Role=entry TargetFrac=0.00000 KellyFull=0.00000 VolAdd=2.0 MinEdgeEntryConfig=0.06
+[NegativeEdgeDebug] Slug=bitcoin-above-92k-on-december-13 Side=NO Edge=0.15247 MinEdge=0.08000 PassesEntry=True Role=entry TargetFrac=0.02659 KellyFull=0.35458 VolAdd=2.0 MinEdgeEntryConfig=0.06
+[NegativeEdgeDebug] Slug=bitcoin-above-92k-on-december-13 Side=YES Edge=-0.14837 MinEdge=0.08000 PassesEntry=False Role=entry TargetFrac=0.00000 KellyFull=0.00000 VolAdd=2.0 MinEdgeEntryConfig=0.06
+[NegativeEdgeDebug] Slug=bitcoin-above-92k-on-december-13 Side=NO Edge=0.14837 MinEdge=0.08000 PassesEntry=True Role=entry TargetFrac=0.01969 KellyFull=0.26260 VolAdd=2.0 MinEdgeEntryConfig=0.06
+[NegativeEdgeDebug] Slug=bitcoin-above-92k-on-december-13 Side=YES Edge=-0.07768 MinEdge=0.08000 PassesEntry=False Role=entry TargetFrac=0.00000 KellyFull=0.00000 VolAdd=2.0 MinEdgeEntryConfig=0.06
+[NegativeEdgeDebug] Slug=bitcoin-above-92k-on-december-13 Side=NO Edge=0.07768 MinEdge=0.08000 PassesEntry=False Role=hold_safety TargetFrac=0.01410 KellyFull=0.14385 VolAdd=2.0 MinEdgeEntryConfig=0.06
+[NegativeEdgeDebug] Slug=bitcoin-above-92k-on-december-13 Side=YES Edge=-0.12343 MinEdge=0.08000 PassesEntry=False Role=entry TargetFrac=0.00000 KellyFull=0.00000 VolAdd=2.0 MinEdgeEntryConfig=0.06
+[NegativeEdgeDebug] Slug=bitcoin-above-92k-on-december-13 Side=NO Edge=0.12343 MinEdge=0.08000 PassesEntry=True Role=entry TargetFrac=0.02608 KellyFull=0.34768 VolAdd=2.0 MinEdgeEntryConfig=0.06
+[NegativeEdgeDebug] Slug=bitcoin-above-92k-on-december-13 Side=YES Edge=0.00209 MinEdge=0.08000 PassesEntry=False Role=entry TargetFrac=0.00000 KellyFull=0.00227 VolAdd=2.0 MinEdgeEntryConfig=0.06
+[NegativeEdgeDebug] Slug=bitcoin-above-92k-on-december-13 Side=NO Edge=-0.00209 MinEdge=0.08000 PassesEntry=False Role=exit TargetFrac=0.00000 KellyFull=0.00000 VolAdd=2.0 MinEdgeEntryConfig=0.06

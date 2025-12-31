@@ -216,7 +216,11 @@ def main():
                 contracts_by_date[date_key]['contracts'].append({
                     'strike': strike,
                     'poly_price': poly_price,
-                    'title': title
+                    'title': title,
+                    # Capture CLOB token IDs for order book lookup
+                    'condition_id': market.get('conditionId'),
+                    'clob_token_ids': market.get('clobTokenIds', '[]'),
+                    'outcomes': outcomes,
                 })
 
     # 3. Simulate & Price
@@ -269,6 +273,10 @@ def main():
                 'T_days': days_to_expiry,  # Float days to expiry
                 'date': now_utc,  # Pricing date (when we ran the pricing)
                 'expiry_date': expiry_utc,  # UTC timestamp of expiry
+                # CLOB order book fields (for live price fetching)
+                'condition_id': c.get('condition_id'),
+                'clob_token_ids': c.get('clob_token_ids', '[]'),
+                'outcomes': json.dumps(c.get('outcomes', [])),
             })
 
             

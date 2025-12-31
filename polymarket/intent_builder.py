@@ -12,12 +12,14 @@ Handles:
 
 from __future__ import annotations
 
+from dataclasses import asdict
 import hashlib
 import json
 import logging
 import math
+import sqlite3
 import uuid
-from typing import List, Tuple, Optional, Dict, Any
+from typing import List, Tuple, Optional, Dict, Any, Union
 
 import pandas as pd
 import numpy as np
@@ -69,20 +71,15 @@ def compute_params_hash(params: Dict[str, Any]) -> str:
 
 def compute_intent_id(
     run_id: str,
-    contract: str,
-    expiry: str,
-    outcome: str,
-    action: str,
-    limit_price: float,
-    size_shares: float,
+    intent_key: str,
 ) -> str:
     """
-    Compute deterministic intent_id from key fields.
+    Compute deterministic intent_id from logical key (run_id + logical_intent_key).
     
-    Including run_id ensures each generation batch has unique intents,
-    even if the same trade is recommended multiple times.
+    This ensures that retrying a recommendation (with slightly different price/size)
+    maps to the SAME intent_id, allowing safe upserts.
     """
-    payload = f"{run_id}|{contract}|{expiry}|{outcome}|{action}|{limit_price:.6f}|{size_shares:.6f}"
+    payload = f"{run_id}|{intent_key}"
     return hashlib.sha256(payload.encode()).hexdigest()[:32]
 
 
@@ -140,18 +137,24 @@ def validate_reco_row(row: pd.Series) -> List[str]:
     return warnings
 
 
-def create_run(strategy: str = "auto_reco", params: Optional[Dict] = None) -> Run:
+def create_run(
+    strategy: str = "auto_reco", 
+    params: Optional[Dict] = None,
+    run_id: Optional[str] = None
+) -> Run:
     """
     Create a new run record in the database.
     
     Args:
         strategy: Strategy name
         params: Parameters used for generation
+        run_id: Optional explicit run_id (generates new UUID if None)
         
     Returns:
         The created Run object
     """
-    run_id = str(uuid.uuid4())
+    if run_id is None:
+        run_id = str(uuid.uuid4())
     created_at = utc_now_iso()
     params_json = json.dumps(params or {}, sort_keys=True)
     
@@ -175,6 +178,9 @@ def create_run(strategy: str = "auto_reco", params: Optional[Dict] = None) -> Ru
         )
         conn.commit()
         logger.info(f"Created run {run_id}")
+    except sqlite3.IntegrityError:
+        # Idempotent: if run exists, that's fine (e.g. retry)
+        logger.info(f"Run {run_id} already exists.")
     finally:
         conn.close()
     
@@ -182,131 +188,127 @@ def create_run(strategy: str = "auto_reco", params: Optional[Dict] = None) -> Ru
 
 
 def build_intents_from_reco(
-    df: pd.DataFrame,
-    run: Run,
-) -> Tuple[List[OrderIntent], List[Dict[str, Any]]]:
+    data: Union[pd.DataFrame, List[Any]],
+    run: Union[Run, str],
+) -> List[OrderIntent]:
     """
-    Convert auto_reco DataFrame to OrderIntent objects.
+    Convert recommendations (DataFrame or List[DeltaIntent]) to OrderIntent objects.
     
     Args:
-        df: DataFrame from recommendations_to_dataframe()
-        run: The Run object for this batch
+        data: DataFrame or List of DeltaIntent objects
+        run: Run object or run_id string
         
     Returns:
-        Tuple of (valid intents, list of warning dicts for invalid rows)
+        List of valid OrderIntent objects
     """
-    if df is None or df.empty:
-        return [], []
-    
     intents: List[OrderIntent] = []
-    warnings_list: List[Dict[str, Any]] = []
     
-    for idx, row in df.iterrows():
-        # Validate row first
-        row_warnings = validate_reco_row(row)
+    # Resolve run attributes
+    if isinstance(run, str):
+        run_id = run
+        strategy = "auto_reco"
+        params_json = "{}"
+    else:
+        run_id = run.run_id
+        strategy = run.strategy
+        params_json = run.params_json
         
-        if row_warnings:
-            warnings_list.append({
-                "index": idx,
-                "contract": _extract_contract(row),
-                "warnings": row_warnings,
-            })
-            continue
-        
+    # Validating Input
+    if not isinstance(data, list):
+         raise TypeError(f"build_intents_from_reco expects List[DeltaIntent], got {type(data)}")
+
+    for item in data:
+        # We assume item is DeltaIntent or compatible object
         try:
-            intent = _build_single_intent(row, run)
+            intent = _build_intent_from_delta(item, run_id, strategy, params_json)
             if intent:
                 intents.append(intent)
         except Exception as e:
-            warnings_list.append({
-                "index": idx,
-                "contract": _extract_contract(row),
-                "warnings": [f"Build error: {str(e)}"],
-            })
-            logger.warning(f"Failed to build intent for row {idx}: {e}")
-    
-    return intents, warnings_list
+            logger.error(f"Failed to build intent for item: {e}")
+            
+    return intents
 
 
-def _extract_contract(row: pd.Series) -> str:
-    """Extract contract identifier from row."""
-    slug = str(row.get("slug", "") or "")
-    expiry_key = str(row.get("expiry_key", "") or "")
-    strike = row.get("strike", "")
-    
-    if slug:
-        return f"{slug}_{expiry_key}_{strike}"
-    return f"{expiry_key}_{strike}"
+def _create_dummy_run(run_id: str) -> Run:
+    """Create dummy Run object for compatibility."""
+    return Run(
+        run_id=run_id,
+        created_at=utc_now_iso(),
+        strategy="auto_reco",
+        params_json="{}",
+        notes="dummy"
+    )
 
 
-def _build_single_intent(row: pd.Series, run: Run) -> Optional[OrderIntent]:
-    """Build a single OrderIntent from a DataFrame row."""
-    # Extract fields with fallbacks for column name variations
-    entry_price = row.get("entry_price")
-    if entry_price is None or pd.isna(entry_price):
-        entry_price = row.get("limit_price")
+def _build_intent_from_delta(
+    delta: Any, # DeltaIntent
+    run_id: str,
+    strategy: str,
+    params_json: str
+) -> Optional[OrderIntent]:
+    """Build OrderIntent from DeltaIntent."""
+    # Validate
+    if delta.action not in ["BUY", "SELL"]:
+        return None
+        
+    # Invariants
+    if delta.amount_usd < 0:
+         logger.warning(f"Skipping intent with negative amount: {delta.amount_usd}")
+         return None
+         
+    if delta.action in ["BUY", "SELL"] and getattr(delta, "price_mode", None) not in ["TAKER_ASK", "TAKER_BID"]:
+        # We allow it, but log a warning as this is unusual for an actionable intent
+        logger.warning(f"Intent {delta.slug} has actionable side {delta.action} but price_mode={getattr(delta, 'price_mode', 'None')}")
+
+    contract = f"{delta.slug}_{delta.expiry_key}_{delta.strike}"
+    expiry = delta.expiry_key
+    outcome = "YES" if delta.side.upper() == "YES" else "NO" 
     
-    stake = row.get("suggested_stake")
-    if stake is None or pd.isna(stake):
-        stake = row.get("stake_dollars")
-    
-    # Compute contract identifier
-    contract = _extract_contract(row)
-    expiry = str(row.get("expiry_key", "") or "")
-    
-    # Side -> outcome
-    side = str(row.get("side", "YES")).upper()
-    outcome = side if side in ("YES", "NO") else "YES"
-    
-    # Action is BUY for MVP
-    action = "BUY"
-    
-    # Compute shares and notional (rounds DOWN)
-    limit_price = float(entry_price)
-    stake_usd = float(stake)
+    intent_key = getattr(delta, "intent_key", None) or getattr(delta, "key", contract) or contract
+
+    # Price and Size
+    # For execution, limit_price_hint is our provisional limit
+    limit_price = delta.limit_price_hint
+    if not limit_price or limit_price <= 0:
+        limit_price = delta.market_price # Fallback
+        
+    if not limit_price or limit_price <= 0:
+        return None
+        
+    stake_usd = delta.amount_usd
     
     size_shares, notional_usd = compute_shares_and_notional(stake_usd, limit_price)
     
-    # Skip if shares round to 0
     if size_shares <= 0:
-        logger.warning(f"Skipping {contract}: shares round to 0")
         return None
-    
-    # Generate deterministic intent_id
-    intent_id = compute_intent_id(
-        run.run_id, contract, expiry, outcome, action, limit_price, size_shares
-    )
-    
-    # Extract optional numeric fields
-    model_prob = _safe_float(row.get("model_prob"))
-    market_prob = _safe_float(row.get("market_price"))
-    edge = _safe_float(row.get("edge"))
-    ev = _safe_float(row.get("expected_value_dollars")) or _safe_float(row.get("ev_dollars"))
-    
-    # Store original row for debugging
-    raw_reco_json = row.to_json()
+        
+    # Deterministic ID (from Logical Key)
+    intent_id = compute_intent_id(run_id, intent_key)
     
     return OrderIntent(
         intent_id=intent_id,
-        run_id=run.run_id,
+        run_id=run_id,
+        intent_key=intent_key,
         created_at=utc_now_iso(),
         contract=contract,
         expiry=expiry,
         outcome=outcome,
-        action=action,
+        action=delta.action,
         limit_price=limit_price,
         stake_usd=stake_usd,
         size_shares=size_shares,
         notional_usd=notional_usd,
-        strategy=run.strategy,
-        params_json=run.params_json,
-        model_prob=model_prob,
-        market_prob=market_prob,
-        edge=edge,
-        ev=ev,
+        strategy=strategy,
+        params_json=params_json,
+        model_prob=delta.model_prob,
+        market_prob=delta.market_price,
+        edge=delta.effective_edge,
+        ev=delta.expected_value_dollars,
         status=IntentStatus.DRAFT,
-        raw_reco_json=raw_reco_json,
+        raw_reco_json=json.dumps(asdict(delta)) if hasattr(delta, "__dataclass_fields__") else "{}"
     )
+
+# Legacy helpers _extract_contract and _build_single_intent have been removed.
 
 
 def _safe_float(value) -> Optional[float]:
@@ -324,13 +326,18 @@ def save_intents(intents: List[OrderIntent]) -> int:
     """
     Save intents to database with upsert logic.
     
-    Uses INSERT OR IGNORE to handle duplicates (idempotent).
+    Uses ON CONFLICT(intent_id) to update existing drafts if parameters change.
+    Only updates DRAFT intents; if an intent is already approved/submitted,
+    this creates a potential conflict if the intent_id is the same.
+    
+    However, since intent_id includes run_id, and run_id is unique per run,
+    we are only upserting within the CURRENT run context.
     
     Args:
         intents: List of OrderIntent objects
         
     Returns:
-        Number of intents actually inserted (not duplicates)
+        Number of intents upserted
     """
     if not intents:
         return 0
@@ -338,18 +345,49 @@ def save_intents(intents: List[OrderIntent]) -> int:
     conn = get_connection()
     try:
         cursor = conn.cursor()
+        
+        # Guard: Check for attempts to overwrite non-DRAFT intents
+        intent_ids = [i.intent_id for i in intents]
+        placeholders = ",".join("?" * len(intent_ids))
+        cursor.execute(f"SELECT intent_id, status FROM intents WHERE intent_id IN ({placeholders})", intent_ids)
+        existing = {row[0]: row[1] for row in cursor.fetchall()}
+        
+        filtered_intents = []
+        for intent in intents:
+            current_status = existing.get(intent.intent_id)
+            if current_status and current_status != IntentStatus.DRAFT:
+                logger.warning(f"Skipping upsert for {intent.intent_id} (Status: {current_status}), preserves economics.")
+                continue
+            filtered_intents.append(intent)
+            
         inserted = 0
         
-        for intent in intents:
+        for intent in filtered_intents:
+            # We use upsert logic. 
+            # Note: We only update if status is DRAFT to avoid overwriting approved/submitted orders
+            # (though normally we shouldn't be re-generating for the same run if already approved)
             cursor.execute(
                 """
-                INSERT OR IGNORE INTO intents (
-                    intent_id, run_id, created_at, strategy, params_json,
+                INSERT INTO intents (
+                    intent_id, run_id, intent_key, created_at, strategy, params_json,
                     contract, expiry, outcome, action, limit_price,
                     stake_usd, size_shares, notional_usd, model_prob, market_prob,
                     edge, ev, status, approved_at, approved_snapshot_json,
                     submitted_at, notes, raw_reco_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(intent_id) DO UPDATE SET
+                    intent_key=excluded.intent_key,
+                    limit_price=excluded.limit_price,
+                    stake_usd=excluded.stake_usd,
+                    size_shares=excluded.size_shares,
+                    notional_usd=excluded.notional_usd,
+                    model_prob=excluded.model_prob,
+                    market_prob=excluded.market_prob,
+                    edge=excluded.edge,
+                    ev=excluded.ev,
+                    raw_reco_json=excluded.raw_reco_json,
+                    notes=excluded.notes
+                WHERE status = 'DRAFT'
                 """,
                 intent.to_insert_tuple(),
             )
@@ -357,7 +395,7 @@ def save_intents(intents: List[OrderIntent]) -> int:
                 inserted += 1
         
         conn.commit()
-        logger.info(f"Saved {inserted} intents (of {len(intents)} total)")
+        logger.info(f"Saved/Upserted {inserted} intents (of {len(intents)} total)")
         return inserted
     finally:
         conn.close()

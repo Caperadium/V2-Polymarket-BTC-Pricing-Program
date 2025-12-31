@@ -57,6 +57,13 @@ class OpenPosition:
     expiry_key: str = ""
     moneyness: float = np.nan
     momentum_6hr: float = np.nan
+    edge: float = np.nan
+    position_key: str = ""  # Unique key for position lookup (slug|expiry|strike|side)
+
+
+def _generate_position_key(slug: str, expiry_key: str, strike: float, side: str) -> str:
+    """Generate a unique key for position lookup."""
+    return f"{slug}|{expiry_key}|{strike}|{side.upper()}"
 
 
 def _positions_to_df(open_positions: List[OpenPosition]) -> pd.DataFrame:
@@ -355,6 +362,7 @@ class BacktestEngine:
                 "market_price": pos.market_price,
                 "moneyness": pos.moneyness,
                 "momentum_6hr": pos.momentum_6hr,
+                "edge": pos.edge,
                 "btc_price_at_expiry": btc_price if btc_price is not None else np.nan,
                 "outcome_yes": outcome_yes,
                 "payout": payout,
@@ -519,6 +527,10 @@ class BacktestEngine:
         params["max_moneyness"] = self.strategy_params.get("max_moneyness", None)
         params["min_moneyness"] = self.strategy_params.get("min_moneyness", None)
         
+        # Position size caps (critical for realistic backtesting)
+        params["max_add_per_cycle_usd"] = self.strategy_params.get("max_add_per_cycle_usd", 50.0)
+        params["max_reduce_per_cycle_usd"] = self.strategy_params.get("max_reduce_per_cycle_usd", 1000.0)
+        
         # Call auto_reco with current open positions
         reco_list = recommend_trades(
             df=batch_df,
@@ -535,6 +547,85 @@ class BacktestEngine:
         
         # Execute each trade
         for _, trade in reco_df.iterrows():
+            action = str(trade.get("action", "BUY")).upper()
+            side = str(trade.get("side", "")).upper()
+            slug = str(trade.get("slug", ""))
+            expiry_key_str = str(trade.get("expiry_key", ""))
+            strike = float(trade.get("strike", np.nan))
+            
+            # Generate position key for lookup
+            pos_key = _generate_position_key(slug, expiry_key_str, strike, side)
+            
+            # =====================================================================
+            # SELL / EXIT Path - Close existing position at current market price
+            # =====================================================================
+            if action == "SELL":
+                # Find matching open position
+                matching_pos = None
+                matching_idx = None
+                for idx, pos in enumerate(self._open_positions):
+                    if pos.position_key == pos_key:
+                        matching_pos = pos
+                        matching_idx = idx
+                        break
+                
+                if matching_pos is None:
+                    # No matching position to sell - skip
+                    continue
+                
+                # Get exit price from trade recommendation
+                exit_price = float(trade.get("market_price", 0.0))
+                if exit_price <= 0:
+                    continue
+                
+                # Calculate PnL
+                # Proceeds = exit_price * shares
+                # PnL = Proceeds - Stake (what we originally paid)
+                proceeds = exit_price * matching_pos.size_shares
+                pnl = proceeds - matching_pos.stake
+                
+                # Return proceeds to bankroll
+                self._running_bankroll += proceeds
+                
+                # Log the exit trade
+                self._closed_trades.append({
+                    "pricing_date": matching_pos.pricing_date,  # Original entry time
+                    "expiry_date": matching_pos.expiry_date,
+                    "slug": matching_pos.slug,
+                    "strike": matching_pos.strike,
+                    "side": matching_pos.side,
+                    "entry_price": matching_pos.entry_price,
+                    "stake": matching_pos.stake,
+                    "size_shares": matching_pos.size_shares,
+                    "model_prob": matching_pos.model_prob,
+                    "market_price": matching_pos.market_price,
+                    "moneyness": matching_pos.moneyness,
+                    "momentum_6hr": matching_pos.momentum_6hr,
+                    "edge": matching_pos.edge,
+                    "btc_price_at_expiry": np.nan,  # N/A for early exit
+                    "outcome_yes": np.nan,  # N/A for early exit
+                    "payout": proceeds,
+                    "pnl": pnl,
+                    "settled": True,
+                    "settlement_date": current_time,
+                    "settlement_type": "early_exit",
+                    "exit_price": exit_price,
+                    "bankroll_after": self._running_bankroll,
+                    "kelly_applied": matching_pos.kelly_applied,
+                    "trade_id": matching_pos.trade_id,
+                })
+                
+                # Remove from open positions
+                self._open_positions.pop(matching_idx)
+                continue
+            
+            # =====================================================================
+            # BUY Path - Open new position
+            # =====================================================================
+            if action != "BUY":
+                # Skip HOLD or other actions
+                continue
+
             stake = float(
                 trade.get("suggested_stake", 
                     trade.get("stake_dollars", 
@@ -543,17 +634,40 @@ class BacktestEngine:
                 )
             )
             
+            # CRITICAL: Enforce hard cap on stake to prevent unrealistic compounding
+            max_stake = self.strategy_params.get("max_add_per_cycle_usd", 50.0)
+            stake = min(stake, max_stake)
+            
             if stake <= 0 or stake > self._running_bankroll:
                 continue
             
             price_yes = float(trade["market_price"])
-            side = str(trade["side"]).upper()
             
-            # Calculate shares: stake / entry_price
+            # Enforce price range filter - skip trades outside min/max price
+            min_price = self.strategy_params.get("min_price", 0.03)
+            max_price = self.strategy_params.get("max_price", 0.95)
+            # Correctly handle YES/NO prices
+            # market_price from auto_reco IS the entry price (1-q for NO trades)
+            # We must trust it as execution price, but store the normalized YES price for analytics
+            
+            raw_execution_price = price_yes  # This is what we pay
+            
             if side == "YES":
-                entry_price = price_yes
+                if raw_execution_price < min_price or raw_execution_price > max_price:
+                    continue
+                entry_price = raw_execution_price
+                stored_market_price = raw_execution_price  # Store YES price (q)
             else:
-                entry_price = max(1.0 - price_yes, 1e-6)
+                # SIDE == NO
+                # raw_execution_price is (1 - q)
+                # We need to verify it meets min/max checks
+                if raw_execution_price < min_price or raw_execution_price > max_price:
+                    continue
+                    
+                entry_price = raw_execution_price
+                # For analytics, we want to store the implied YES price (q)
+                # q = 1.0 - entry_price
+                stored_market_price = 1.0 - entry_price
             
             size_shares = stake / entry_price
             
@@ -563,7 +677,7 @@ class BacktestEngine:
             # Parse expiry date
             raw_expiry = trade.get("expiry_date")
             if pd.isna(raw_expiry) or raw_expiry is None or str(raw_expiry) in ("", "NaT", "nan"):
-                expiry_str = str(trade.get("expiry_key", ""))
+                expiry_str = expiry_key_str
             else:
                 expiry_str = str(raw_expiry)
             
@@ -571,38 +685,38 @@ class BacktestEngine:
                 expiry_ts = pd.to_datetime(expiry_str)
             except Exception:
                 expiry_ts = pd.NaT
-
-            expiry_key_str = str(trade.get("expiry_key", ""))
             
             # Compute moneyness and momentum for this trade
             trade_moneyness = np.nan
             momentum_6hr = np.nan
             snapshot_spot_at_trade = self._get_btc_price_at(current_time)
             if snapshot_spot_at_trade is not None and snapshot_spot_at_trade > 0:
-                if not np.isnan(float(trade.get("strike", np.nan))):
-                    trade_moneyness = (float(trade.get("strike")) - snapshot_spot_at_trade) / snapshot_spot_at_trade
+                if not np.isnan(strike):
+                    trade_moneyness = (strike - snapshot_spot_at_trade) / snapshot_spot_at_trade
                 time_6h_ago = current_time - pd.Timedelta(hours=6)
                 spot_6h_ago = self._get_btc_price_at(time_6h_ago)
                 if spot_6h_ago is not None and spot_6h_ago > 0:
                     momentum_6hr = float(np.log(snapshot_spot_at_trade / spot_6h_ago))
             
-            # Create position with moneyness and momentum
+            # Create position with moneyness, momentum, and position_key
             position = OpenPosition(
                 pricing_date=current_time,
                 expiry_date=expiry_ts,
-                slug=str(trade.get("slug", "")),
-                strike=float(trade.get("strike", np.nan)),
+                slug=slug,
+                strike=strike,
                 side=side,
                 entry_price=entry_price,
                 stake=stake,
                 size_shares=size_shares,
                 model_prob=float(trade.get("model_prob", np.nan)),
-                market_price=price_yes,
+                market_price=stored_market_price,
                 trade_id=f"T{self._trade_counter}",
                 kelly_applied=float(trade.get("kelly_fraction_applied", np.nan)),
                 expiry_key=expiry_key_str,
                 moneyness=trade_moneyness,
                 momentum_6hr=momentum_6hr,
+                edge=float(trade.get("effective_edge", np.nan)),
+                position_key=pos_key,
             )
             self._trade_counter += 1
             self._open_positions.append(position)
@@ -618,9 +732,10 @@ class BacktestEngine:
                 "stake": stake,
                 "size_shares": size_shares,
                 "model_prob": position.model_prob,
-                "market_price": price_yes,
+                "market_price": position.market_price,
                 "moneyness": position.moneyness,
                 "momentum_6hr": position.momentum_6hr,
+                "edge": position.edge,
                 "btc_price_at_expiry": np.nan,
                 "outcome_yes": np.nan,
                 "payout": np.nan,

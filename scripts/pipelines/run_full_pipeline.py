@@ -24,6 +24,113 @@ from typing import List, Dict, Any, Optional
 logger = logging.getLogger(__name__)
 
 
+def _enrich_with_order_book(df: "pd.DataFrame", log_fn=None) -> "pd.DataFrame":
+    """
+    Enrich batch DataFrame with live order book prices from CLOB API.
+    
+    Fetches best ask/bid prices for YES and NO outcomes based on 
+    clob_token_ids stored in the batch data.
+    """
+    import json
+    import requests
+    import pandas as pd
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    
+    CLOB_API_BASE = "https://clob.polymarket.com"
+    
+    def log(msg: str):
+        if log_fn:
+            log_fn(msg)
+        else:
+            logger.info(msg)
+    
+    def fetch_book(token_id: str, timeout: float = 5.0) -> Optional[Dict]:
+        """Fetch order book from CLOB API."""
+        try:
+            response = requests.get(
+                f"{CLOB_API_BASE}/book",
+                params={"token_id": token_id},
+                timeout=timeout,
+            )
+            response.raise_for_status()
+            book = response.json()
+            
+            bids = book.get("bids", [])
+            asks = book.get("asks", [])
+            
+            # Sort to get best prices
+            # Best bid = highest price, Best ask = lowest price
+            best_bid = max((float(b["price"]) for b in bids), default=None)
+            best_ask = min((float(a["price"]) for a in asks), default=None)
+            
+            return {"best_bid": best_bid, "best_ask": best_ask}
+        except Exception as e:
+            logger.debug(f"Order book fetch failed for {token_id[:16]}...: {e}")
+            return None
+    
+    # Initialize columns
+    df["yes_ask_price"] = None
+    df["yes_bid_price"] = None
+    df["no_ask_price"] = None
+    df["no_bid_price"] = None
+    
+    # Build list of unique token IDs to fetch
+    token_to_rows = {}  # token_id -> list of (row_idx, outcome_type)
+    
+    for idx, row in df.iterrows():
+        clob_ids_raw = row.get("clob_token_ids", "[]")
+        outcomes_raw = row.get("outcomes", "[]")
+        
+        try:
+            clob_ids = json.loads(clob_ids_raw) if isinstance(clob_ids_raw, str) else clob_ids_raw
+            outcomes = json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else outcomes_raw
+        except:
+            continue
+        
+        if not clob_ids or not outcomes:
+            continue
+        
+        # Map outcomes to token IDs
+        for i, outcome in enumerate(outcomes):
+            if i < len(clob_ids):
+                token_id = clob_ids[i]
+                outcome_upper = str(outcome).upper()
+                if token_id not in token_to_rows:
+                    token_to_rows[token_id] = []
+                token_to_rows[token_id].append((idx, outcome_upper))
+    
+    log(f"  Fetching order books for {len(token_to_rows)} unique tokens...")
+    
+    # Fetch in parallel
+    results = {}
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        futures = {executor.submit(fetch_book, tid): tid for tid in token_to_rows.keys()}
+        for future in as_completed(futures):
+            tid = futures[future]
+            try:
+                results[tid] = future.result()
+            except Exception:
+                results[tid] = None
+    
+    # Apply results to DataFrame
+    success_count = 0
+    for token_id, book_data in results.items():
+        if book_data is None:
+            continue
+        
+        for row_idx, outcome_type in token_to_rows[token_id]:
+            if outcome_type == "YES":
+                df.at[row_idx, "yes_ask_price"] = book_data.get("best_ask")
+                df.at[row_idx, "yes_bid_price"] = book_data.get("best_bid")
+            elif outcome_type == "NO":
+                df.at[row_idx, "no_ask_price"] = book_data.get("best_ask")
+                df.at[row_idx, "no_bid_price"] = book_data.get("best_bid")
+            success_count += 1
+    
+    log(f"  Updated {success_count} rows with order book prices")
+    return df
+
+
 def run_pipeline_programmatic(
     expiry_dates: List[date],
     num_sims: int = 10000,
@@ -162,7 +269,11 @@ def run_pipeline_programmatic(
                             contracts_by_date[date_key]['contracts'].append({
                                 'strike': strike,
                                 'poly_price': poly_price,
-                                'title': title
+                                'title': title,
+                                # CLOB order book fields
+                                'condition_id': market.get('conditionId'),
+                                'clob_token_ids': market.get('clobTokenIds', '[]'),
+                                'outcomes': outcomes,
                             })
                 
                 # Simulate and price
@@ -198,6 +309,10 @@ def run_pipeline_programmatic(
                             'T_days': days_to_expiry,
                             'date': now_utc,
                             'expiry_date': expiry_utc,
+                            # CLOB order book fields
+                            'condition_id': c.get('condition_id'),
+                            'clob_token_ids': c.get('clob_token_ids', '[]'),
+                            'outcomes': json.dumps(c.get('outcomes', [])),
                         })
                     
                     result["processed"].append(date_key)
@@ -237,6 +352,17 @@ def run_pipeline_programmatic(
                 log(f"✅ Fitted results saved to {fitted_output_dir}")
             except Exception as e:
                 log(f"⚠️ Curve fitting failed: {e}")
+            
+            # Step 5: Enrich with live order book prices
+            try:
+                batch_csv_path = f"{fitted_output_dir}/batch_with_fits.csv"
+                if Path(batch_csv_path).exists():
+                    log("Fetching live order book prices...")
+                    enriched_df = _enrich_with_order_book(pd.read_csv(batch_csv_path), log)
+                    enriched_df.to_csv(batch_csv_path, index=False)
+                    log(f"✅ Enriched batch with order book prices")
+            except Exception as e:
+                log(f"⚠️ Order book enrichment failed: {e}")
             
             result["output_dir"] = fitted_output_dir
             result["ok"] = True
