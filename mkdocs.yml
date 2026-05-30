@@ -31,9 +31,13 @@ nav:
     - Architecture: concepts/architecture.md
     - Pricing Engine: concepts/pricing-engine.md
     - Probability Fitting: concepts/probability-fitting.md
+    - Strategy Pipeline: concepts/strategy-pipeline.md
     - Kelly Sizing: concepts/kelly-sizing.md
     - Vol Gate: concepts/vol-gate.md
     - Risk Controls: concepts/risk-controls.md
+    - Backtesting Methodology: concepts/backtesting-methodology.md
+    - Signal Diagnostics: concepts/signal-diagnostics.md
+    - Execution Layer: concepts/execution-layer.md
   - Guides:
     - Full Pipeline: guides/full-pipeline.md
     - Batch Pricing: guides/batch-pricing.md
@@ -41,6 +45,8 @@ nav:
     - Polymarket Console: guides/polymarket-console.md
     - Backtesting: guides/backtesting.md
     - Parameter Sweeps: guides/parameter-sweeps.md
+    - Signal Diagnostics: guides/signal-diagnostics.md
+    - Troubleshooting: guides/troubleshooting.md
   - API Reference:
     - Core:
       - BTC Pricing: api-reference/core/btc-pricing-engine.md
@@ -48,17 +54,32 @@ nav:
       - Data Fetcher: api-reference/core/data-fetcher.md
       - Positions: api-reference/core/positions.md
       - auto_reco: api-reference/core/auto-reco.md
+      - Common Types: api-reference/core/common.md
       - vol_gate: api-reference/core/vol-gate.md
+      - Signal Diagnostics: api-reference/core/signal-diagnostics.md
+      - Sweep Config: api-reference/core/sweep-config.md
     - Polymarket:
+      - Models: api-reference/polymarket/models.md
       - Provider: api-reference/polymarket/provider.md
-      - Execution: api-reference/polymarket/execution-gateway.md
-      - Intents: api-reference/polymarket/intent-builder.md
+      - Execution Gateway: api-reference/polymarket/execution-gateway.md
+      - Intent Builder: api-reference/polymarket/intent-builder.md
+      - Accounting: api-reference/polymarket/accounting.md
+      - Database: api-reference/polymarket/db.md
+      - Ingestion: api-reference/polymarket/ingest.md
+      - Metrics: api-reference/polymarket/metrics.md
+      - Reconciliation: api-reference/polymarket/reconcile.md
     - Pipelines:
       - Full Pipeline: api-reference/pipelines/run-full-pipeline.md
       - Batch Pricing: api-reference/pipelines/batch-pricing-runner.md
+    - Backtesting:
+      - Backtest Engine: api-reference/backtesting/backtest-engine.md
+      - Prob Backrunner: api-reference/backtesting/prob-backrunner.md
+      - Monte Carlo Sim: api-reference/backtesting/montecarlo-sim.md
   - Development:
     - Contributing: development/contributing.md
     - Testing: development/testing.md
     - Changelog: development/changelog.md
   - Appendix:
     - Glossary: appendix/glossary.md
+    - Data Schema: appendix/data-schema.md
+    - FAQ: appendix/faq.md
