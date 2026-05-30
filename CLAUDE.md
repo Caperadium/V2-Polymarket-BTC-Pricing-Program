@@ -116,11 +116,9 @@ mkdocs serve
 ### Core Pricing Engine (`core/pricing/btc_pricing_engine.py`)
 
 GARCH(1,1) + Student-t + Kou Double Exponential Jump Diffusion Monte Carlo simulator. The high-level entry point is `calculate_probabilities()` which accepts strikes and days-to-expiry, returns `{strike: probability}` dict. Key design decisions:
-- **Momentum injection**: When `drift_window` is set, EMA drift replaces structural mean — with global gating (not per-path) to avoid selection bias
-- **Dynamic per-path drift clamping**: Drift clamped to ±0.25 × path-specific sigma_day
+- **Structural mean drift**: Uses long-term fitted GARCH mean (mu) with per-path clamping to ±0.25 × path-specific sigma_day
 - **Multi-jump aggregation**: Poisson compound jumps per day, Gamma-distributed magnitudes
-- **Variance blending**: Optional RV blending via `rv_intraday` + `rv_blend_weight`
-- **Jump drift correction**: Subtracted from structural mu, NOT applied to momentum mu
+- **Jump drift correction**: Expected jump drift subtracted from mean to maintain risk-neutrality
 
 ### Column Name Precedence Conventions
 
@@ -252,3 +250,34 @@ parameter_sweeps/
 - **CSV-based state**: No database for positions or batch data; everything is CSV files on disk (except Polymarket execution state which uses SQLite)
 - **Idempotent backtest steps**: Backtest runner skips already-processed timestamps
 - **Vol gate as standalone module**: Volatility risk can be computed independently and tested in isolation, then plugged into the strategy pipeline
+
+## Change Logging & Documentation
+After completing a task, do the following:
+
+1. Append a single entry to `CHANGES.md` per logical task (not per file). Describe the intent and scope of the change, including which files were affected if relevant. Use present tense.
+
+2. Check whether any of the following need updating and update them if so:
+   - `CLAUDE.md` — architecture notes, file structure, conventions, anything describing how the project works
+   - Anything in the DOCS folder — comprehensive MKdocs files with ALL information about the project
+
+   Only update sections the change actually affects. Do not rewrite accurate sections.
+
+## Pushing to GitHub
+When I say "push" or "commit":
+1. Read `CHANGES.md` and draft a commit message from it
+2. Show me the message for approval
+3. Commit and push
+4. Clear `CHANGES.md`
+
+## Never Do Without Asking
+Before taking any of the following actions, stop and explicitly ask for confirmation:
+
+- Refactoring code that wasn't part of the requested task
+- Installing new dependencies
+- Deleting or renaming files
+- Changing function signatures, interfaces, or APIs
+- Modifying configuration files (e.g. package.json, .env, docker, CI/CD)
+- Making changes outside the files/scope I specified
+- Resolving ambiguity by assumption — if the task is unclear, ask first
+
+When in doubt about whether something falls outside the requested scope, ask.

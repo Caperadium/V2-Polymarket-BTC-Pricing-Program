@@ -34,7 +34,6 @@ If GARCH fitting fails with non-convergence:
 
 1. Ensure at least **100 days** of daily BTC data
 2. Check for data gaps — `data_fetcher.py` downloads 5 years
-3. Try omitting `drift_window` to use structural mean instead of momentum
 
 ## Stale Data Blocks
 
