@@ -136,6 +136,8 @@ def run_pipeline_programmatic(
     num_sims: int = 10000,
     skip_data_fetch: bool = False,
     min_volume: float = 0.0,
+    recalibrate_jumps: bool = False,
+    advanced_features: bool = True,
 ) -> Dict[str, Any]:
     """
     Run the pricing pipeline programmatically (no CLI/argparse).
@@ -163,6 +165,7 @@ def run_pipeline_programmatic(
         "failed": [],
         "output_dir": None,
         "logs": [],
+        "error": None,
     }
     
     def log(msg: str):
@@ -200,13 +203,26 @@ def run_pipeline_programmatic(
         import scripts.pipelines.batch_pricing_runner as batch_pricing_runner
         
         # Load data once
-        log("Loading BTC data and fitting GARCH model...")
-        daily_csv = "DATA/btc_daily.csv"
-        intraday_csv = "DATA/btc_intraday_1m.csv"
-        
-        daily_returns, S0 = load_and_prep_data(daily_csv, intraday_csv)
-        garch_params = fit_garch_model(daily_returns)
+        log("Loading BTC data and fitting GARCH model (hourly)...")
+        # Resolve paths relative to project root (Streamlit may run from different CWD)
+        _project_root = Path(__file__).resolve().parents[2]
+        hourly_csv = str(_project_root / "DATA" / "btc_hourly.csv")
+        intraday_csv = str(_project_root / "DATA" / "btc_intraday_1m.csv")
+
+        hourly_returns, S0 = load_and_prep_data(hourly_csv, intraday_csv)
+        garch_params = fit_garch_model(hourly_returns)
         log(f"✅ Model fitted. S0=${S0:.2f}")
+
+        # Optionally calibrate jump parameters from data
+        calibrated_jumps = None
+        if recalibrate_jumps:
+            from core.pricing.btc_pricing_engine import load_calibrated_jumps
+            cal = load_calibrated_jumps(
+                hourly_csv=hourly_csv, force_recalibrate=True,
+            )
+            if cal.get("fit_converged"):
+                calibrated_jumps = cal
+                log("Using data-calibrated jump parameters")
         
         now_utc = datetime.now(timezone.utc)
         
@@ -275,38 +291,42 @@ def run_pipeline_programmatic(
                                 'clob_token_ids': market.get('clobTokenIds', '[]'),
                                 'outcomes': outcomes,
                             })
-                
+
                 # Simulate and price
                 for date_key, data in contracts_by_date.items():
                     expiry_utc = data['expiry_utc']
                     contracts = data['contracts']
-                    
+
                     delta = expiry_utc - now_utc
-                    days_to_expiry = delta.total_seconds() / (24 * 3600)
-                    
-                    if days_to_expiry <= 0:
+                    hours_to_expiry = delta.total_seconds() / 3600
+
+                    if hours_to_expiry <= 0:
                         result["failed"].append({"date": date_key, "error": "Already expired"})
                         continue
-                    
-                    paths = simulate_paths(S0, garch_params, jump_params=None, 
-                                          days_to_expiry=days_to_expiry, n_sims=num_sims)
-                    
+
+                    paths = simulate_paths(S0, garch_params, jump_params=calibrated_jumps,
+                                          hours_to_expiry=hours_to_expiry, n_sims=num_sims,
+                                          use_naive_prior=True,
+                                          use_svcj=advanced_features,
+                                          use_skewed_t=advanced_features,
+                                          use_figarch=advanced_features)
+
                     import pytz
                     import re
                     for c in contracts:
                         model_prob = get_contract_probability(paths, c['strike'])
-                        
+
                         et_tz = pytz.timezone('US/Eastern')
                         expiry_et = expiry_utc.astimezone(et_tz)
-                        
+
                         slug = re.sub(r'[^a-z0-9\\-]', '', c['title'].lower().replace(' ', '-').replace('$', '').replace(',', ''))
-                        
+
                         all_result_rows.append({
                             'slug': slug,
                             'strike': c['strike'],
                             'market_price': c['poly_price'],
                             'p_real_mc': model_prob,
-                            'T_days': days_to_expiry,
+                            'T_days': hours_to_expiry / 24.0,  # backward compat
                             'date': now_utc,
                             'expiry_date': expiry_utc,
                             # CLOB order book fields
@@ -327,10 +347,12 @@ def run_pipeline_programmatic(
         # Step 4: Save results
         if all_result_rows:
             import pandas as pd
-            
+
             timestamp_str = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H-%M-%S_UTC")
-            run_dir = f"batch_results/{timestamp_str}"
-            fitted_output_dir = f"fitted_batch_results/{timestamp_str}"
+            # Resolve output paths relative to project root
+            _proj_root = Path(__file__).resolve().parents[2]
+            run_dir = str(_proj_root / "batch_results" / timestamp_str)
+            fitted_output_dir = str(_proj_root / "fitted_batch_results" / timestamp_str)
             
             os.makedirs(run_dir, exist_ok=True)
             os.makedirs(fitted_output_dir, exist_ok=True)
@@ -374,7 +396,22 @@ def run_pipeline_programmatic(
         log(f"❌ Pipeline error: {e}")
         import traceback
         log(traceback.format_exc())
-        
+        result["error"] = str(e)
+
+    # Build diagnostic error message when ok is False
+    if not result["ok"] and not result.get("error"):
+        parts = []
+        if result["failed"]:
+            failed_dates = [f"{f['date']}: {f['error']}" for f in result["failed"]]
+            parts.append(f"Failed dates: {'; '.join(failed_dates)}")
+        if result["logs"]:
+            # Include last 5 log lines as context
+            recent = result["logs"][-5:]
+            parts.append(f"Last logs: {' | '.join(recent)}")
+        if not parts:
+            parts.append("No contracts found (check slug patterns, API availability, or volume filters)")
+        result["error"] = "\n".join(parts)
+
     return result
 
 
@@ -431,13 +468,13 @@ def run_step(name: str, cmd: list) -> bool:
     print(f"{'='*60}")
     print(f"Command: {' '.join(cmd)}\n")
     
-    result = subprocess.run(cmd, cwd=Path(__file__).parent)
+    result = subprocess.run(cmd, cwd=Path(__file__).parent.parent.parent)
     
     if result.returncode != 0:
-        print(f"\n❌ {name} failed with exit code {result.returncode}")
+        print(f"\n[X] {name} failed with exit code {result.returncode}")
         return False
     
-    print(f"\n✅ {name} completed successfully")
+    print(f"\n[OK] {name} completed successfully")
     return True
 
 
@@ -461,11 +498,21 @@ Examples:
                         help="Number of Monte Carlo paths to simulate (default: 10000)")
     parser.add_argument("--min-volume", type=float, default=0.0,
                         help="Minimum volume to process a market (default: 0)")
-    
+
+    # Jump calibration
+    parser.add_argument("--recalibrate-jumps", action="store_true",
+                        help="Calibrate jump parameters from BTC data instead of hardcoded defaults")
+    parser.add_argument("--advanced-features", action="store_true", default=True,
+                        dest="advanced_features",
+                        help="Enable SVCJ+skewed-t+FIGARCH+regime+XGBoost (default: on)")
+    parser.add_argument("--no-advanced-features", action="store_false",
+                        dest="advanced_features",
+                        help="Disable all advanced features (plain GARCH+t+Kou baseline)")
+
     # fit_probability_curves arguments
     parser.add_argument("--use-rn-prob", action="store_true",
                         help="If set, fit neutral curve to risk_neutral_prob instead of market_price")
-    
+
     # Pipeline control
     parser.add_argument("--skip-data-fetch", action="store_true",
                         help="Skip the data fetching step (use existing data)")
@@ -490,6 +537,10 @@ Examples:
         "--num-sims", str(args.num_sims),
         "--min-volume", str(args.min_volume),
     ]
+    if args.recalibrate_jumps:
+        batch_cmd.append("--recalibrate-jumps")
+    if not args.advanced_features:
+        batch_cmd.append("--no-advanced-features")
     if not run_step("Running Batch Pricing", batch_cmd):
         sys.exit(1)
     

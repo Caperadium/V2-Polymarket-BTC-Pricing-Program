@@ -18,7 +18,7 @@ Any Polymarket binary contract with a numeric strike price resolvable to a BTC p
 
 ### How accurate are the probabilities?
 
-The pricing engine uses GARCH + jump diffusion Monte Carlo — a standard quantitative finance approach. Calibration via logit-shift and signal diagnostics (Spearman, AUC) measure real-world performance. Results vary by market conditions.
+The pricing engine uses GARCH + jump diffusion Monte Carlo — a standard quantitative finance approach. Signal diagnostics (Spearman, AUC) measure real-world performance. Results vary by market conditions.
 
 ### Why use GARCH instead of Black-Scholes?
 

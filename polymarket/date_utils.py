@@ -125,7 +125,7 @@ def _create_group(dates: List[date]) -> Dict:
         "year": dates[0].year,
         "start_date": min(dates),
         "end_date": max(dates),
-        "slug_pattern": f"bitcoin-above-on-{month_name}-{{}}",
+        "slug_pattern": f"bitcoin-above-on-{month_name}-{{}}-{dates[0].year}",
     }
 
 

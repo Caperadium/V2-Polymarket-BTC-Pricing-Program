@@ -20,6 +20,7 @@ Dependencies: pandas, numpy, scipy
 """
 
 import argparse
+import logging
 import subprocess
 import sys
 import re
@@ -31,19 +32,104 @@ from typing import Optional, Tuple
 
 import numpy as np
 import pandas as pd
-from scipy.optimize import curve_fit
-from scipy.special import expit
+from scipy.optimize import curve_fit, minimize_scalar
+from scipy.special import expit, logit
+
+logger = logging.getLogger(__name__)
 
 try:
     from zoneinfo import ZoneInfo
 except ImportError:  # pragma: no cover - Python <3.9 fallback
     ZoneInfo = None
 
-# ---------- Global Calibration ----------
-# Logit shift calibration: p_cal = sigmoid(logit(p) + B)
-# B=0.0 preserves original; B<0 shifts probabilities downward uniformly
-# This avoids inflating low p's (unlike symmetric shrink-to-0.5)
-PROB_LOGIT_SHIFT_B = -0.7
+def calibrate_logit_shift(
+    p_model: np.ndarray,
+    outcomes: np.ndarray,
+) -> dict:
+    """
+    Calibrate the logit shift parameter B via MLE on binary outcomes.
+
+    Model: p_cal = sigmoid(logit(p_model) + B)
+    Likelihood: Π p_cal_i^y_i × (1-p_cal_i)^(1-y_i)
+
+    This is Platt scaling with a single shift parameter (no slope).
+    Estimates B via MLE and reports a 95% likelihood-ratio confidence interval.
+
+    Args:
+        p_model: Array of model probabilities (values in (0,1)).
+        outcomes: Array of binary outcomes (0 or 1), same length as p_model.
+
+    Returns:
+        Dict with keys: B_fitted, B_ci_lower, B_ci_upper, n_obs, converged.
+        Returns None if insufficient data (need at least 10 observations with
+        both positive and negative outcomes).
+    """
+    p_model = np.asarray(p_model, dtype=float)
+    outcomes = np.asarray(outcomes, dtype=float)
+
+    mask = np.isfinite(p_model) & np.isfinite(outcomes)
+    p_model = p_model[mask]
+    outcomes = outcomes[mask]
+
+    n = len(p_model)
+    n_pos = int(np.sum(outcomes))
+    n_neg = n - n_pos
+
+    if n < 10 or n_pos < 2 or n_neg < 2:
+        logger.warning(
+            "Insufficient outcome data for logit shift calibration "
+            "(need ≥10 obs, ≥2 positive, ≥2 negative). Got n=%d, pos=%d.",
+            n, n_pos,
+        )
+        return None
+
+    eps = 1e-12
+    p_clipped = np.clip(p_model, eps, 1 - eps)
+    x = logit(p_clipped)  # offset (known, not fitted)
+
+    # Negative log-likelihood: -Σ [y × log(p_cal) + (1-y) × log(1-p_cal)]
+    def neg_loglik(B: float) -> float:
+        p_cal = expit(x + B)
+        p_cal = np.clip(p_cal, eps, 1 - eps)
+        return -np.sum(outcomes * np.log(p_cal) + (1 - outcomes) * np.log(1 - p_cal))
+
+    result = minimize_scalar(neg_loglik, bounds=(-3.0, 3.0), method="bounded")
+    B_fitted = result.x
+    converged = result.success
+    ll_fitted = -result.fun
+
+    # 95% CI via likelihood ratio: find B where 2×(ll_fitted - ll(B)) = 3.841 (χ²₁,0.05)
+    chi2_crit = 3.841
+
+    def _find_bound(lower: bool) -> float:
+        """Find B where LR stat hits chi2_crit. Search outward from fitted B."""
+        step = 0.5 if lower else -0.5
+        B = B_fitted + step
+        for _ in range(50):
+            ll = -neg_loglik(B)
+            if 2 * (ll_fitted - ll) >= chi2_crit:
+                return B
+            B += step
+            if abs(B) > 5.0:
+                break
+        return B  # Bound not found within search range
+
+    B_ci_lower = _find_bound(lower=True)
+    B_ci_upper = _find_bound(lower=False)
+
+    logger.info(
+        "Logit shift calibrated: B=%.4f [95%% CI: %.4f, %.4f] from %d observations.",
+        B_fitted, B_ci_lower, B_ci_upper, n,
+    )
+
+    return {
+        "B_fitted": B_fitted,
+        "B_ci_lower": B_ci_lower,
+        "B_ci_upper": B_ci_upper,
+        "n_obs": n,
+        "converged": converged,
+    }
+
 
 # ---------- Logistic model helpers ----------
 
@@ -313,16 +399,6 @@ def process_batch(
             "rn_b": getattr(rn_fit, "b", np.nan),
             "rn_fit_ok": bool(rn_fit and rn_fit.success),
         })
-
-    # Apply logit shift calibration: p_cal = sigmoid(logit(p) + BIAS_SHIFT_B)
-    # This pushes probabilities uniformly downward without inflating low p's
-    eps = 1e-6
-    p_fit = df["p_model_fit"].values
-    p_clipped = np.clip(p_fit, eps, 1 - eps)
-    logit_p = np.log(p_clipped / (1 - p_clipped))
-    logit_cal = logit_p + PROB_LOGIT_SHIFT_B
-    p_cal = 1 / (1 + np.exp(-logit_cal))
-    df["p_model_cal"] = np.clip(p_cal, eps, 1 - eps)
 
     if "T_bucket" in df.columns:
         df = df.drop(columns=["T_bucket"])

@@ -19,8 +19,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib import error, parse, request
 
-DATA_DIR = Path(__file__).resolve().parent / "DATA"
+DATA_DIR = Path(__file__).resolve().parent.parent.parent / "DATA"
 DAILY_PATH = DATA_DIR / "btc_daily.csv"
+HOURLY_PATH = DATA_DIR / "btc_hourly.csv"
 INTRADAY_PATH = DATA_DIR / "btc_intraday_1m.csv"
 
 BINANCE_URL = "https://api.binance.com/api/v3/klines"
@@ -90,6 +91,51 @@ def fetch_daily(days=1825, symbol="BTCUSDT", interval="1d", throttle=0.5):
         writer.writerow(["date", "close"])
         writer.writerows(rows)
     print(f"Saved {len(rows)} daily rows to {DAILY_PATH} (Binance, {fetches} calls)")
+
+
+def fetch_hourly(days=1825, symbol="BTCUSDT", interval="1h", throttle=0.5):
+    """Fetch hourly closes using Binance klines. Output is date,close (two columns)."""
+    limit = 1000
+    interval_ms = 60 * 60 * 1000  # 1 hour
+    end = int(time.time() * 1000)
+    start = end - days * 24 * 60 * 60 * 1000
+    rows = []
+    fetches = 0
+    while start < end:
+        window_end = min(start + limit * interval_ms, end)
+        params = {
+            "symbol": symbol,
+            "interval": interval,
+            "limit": limit,
+            "startTime": start,
+            "endTime": window_end - 1,
+        }
+        url = f"{BINANCE_URL}?{parse.urlencode(params)}"
+        klines = _read_json(url)
+        if not isinstance(klines, list) or not klines:
+            break
+        progressed = False
+        for k in klines:
+            open_time = int(k[0])
+            close_price = float(k[4])
+            if not math.isfinite(close_price) or close_price <= 0:
+                continue
+            dt = datetime.fromtimestamp(open_time / 1000, tz=timezone.utc)
+            rows.append((dt.strftime("%Y-%m-%d %H:%M:%S"), f"{close_price:.8f}"))
+            progressed = True
+        fetches += 1
+        start = int(klines[-1][0]) + interval_ms
+        if not progressed or start >= end:
+            break
+        time.sleep(throttle)
+    if not rows:
+        raise RuntimeError("Binance hourly fetch returned no data")
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    with HOURLY_PATH.open("w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["date", "close"])
+        writer.writerows(rows)
+    print(f"Saved {len(rows)} hourly rows to {HOURLY_PATH} (Binance, {fetches} calls)")
 
 
 def fetch_intraday(days=90, symbol="BTCUSDT", interval="1m", throttle=0.5):
@@ -273,6 +319,14 @@ def main():
                 skip_daily = True
         if not skip_daily:
             fetch_daily()
+        skip_hourly = False
+        if HOURLY_PATH.exists():
+            last_modified = datetime.fromtimestamp(HOURLY_PATH.stat().st_mtime, tz=timezone.utc)
+            if last_modified.date() == datetime.now(timezone.utc).date():
+                print(f"Hourly data already up-to-date (last modified {last_modified.isoformat()}); skipping hourly fetch.")
+                skip_hourly = True
+        if not skip_hourly:
+            fetch_hourly()
         fetch_intraday()
         print("Data refresh complete.")
     except Exception as exc:

@@ -24,7 +24,7 @@ def debug_reco():
     df = pd.DataFrame([{
         "slug": "test-slug",
         "market_price": 0.08,  # q
-        "p_model_cal": 0.0821,  # p
+        "p_model_fit": 0.0821,  # p
         "expiry_date": "2025-01-01",
         "strike": 100000.0,
         "side": "NO",

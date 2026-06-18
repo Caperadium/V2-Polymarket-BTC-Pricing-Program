@@ -1,10 +1,10 @@
 # Signal Diagnostics
 
-`core.strategy.signal_diagnostics`
+`core.backtesting.diagnostics`
 
 Spearman correlation and AUC analysis between model edge and realized outcomes.
 
-::: core.strategy.signal_diagnostics
+::: core.backtesting.diagnostics
     options:
       show_root_heading: true
       show_source: true

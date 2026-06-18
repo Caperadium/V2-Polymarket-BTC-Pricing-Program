@@ -41,7 +41,7 @@ python scripts/backtesting/prob_backrunner_engine.py --skip-data-fetch --limit 1
 The engine replays trading decisions chronologically through the generated batches:
 
 ```python
-from scripts.backtesting.backtest_engine import BacktestEngine
+from core.backtesting.backtest_engine import BacktestEngine
 
 engine = BacktestEngine(
     market_data_batches=batches,
@@ -125,3 +125,13 @@ python scripts/backtesting/backtest_montecarlo_sim.py --all_trades
 - **Net PnL** (equity curve): Includes unrealized PnL from open positions.
 
 If these differ significantly, you have open positions at the end of the backtest period.
+
+## Basel VaR Validation
+
+Separate from trade-level backtesting, `core/validation/basel_backtest.py` validates the pricing model itself:
+
+- Rolling VaR backtests at h ∈ {1, 7, 14, 30} day horizons
+- 95%, 97.5%, and 99% confidence levels
+- Kupiec POF traffic light classification + Acerbi-Szekely expected shortfall
+
+Detailed coverage in [Basel Validation](basel-validation.md).

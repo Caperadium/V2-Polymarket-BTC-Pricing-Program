@@ -1,4 +1,4 @@
-﻿"""
+"""
 pages/polymarket_console.py
 
 Streamlit page for the Polymarket Trade Console.
@@ -16,29 +16,27 @@ import json
 import logging
 import sys
 import uuid
+import math
+import concurrent.futures
 from pathlib import Path
 from datetime import datetime, timezone
-from typing import List
+from typing import List, Dict, Any, Optional
 
 import pandas as pd
 import streamlit as st
-from dataclasses import asdict
 
+# Add parent directory to path for imports
 # Add project root to path for imports
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-# Core Imports
-from core.strategy.auto_reco import (
-    recommend_trades,
-    load_latest_fitted_batch
-)
-from core.strategy.common import (
-    RebalanceConfig,
-    DeltaIntent
-)
-from polymarket.db import init_db
+from core.strategy.auto_reco import recommend_trades, recommendations_to_dataframe, load_latest_fitted_batch, RebalanceConfig, DeltaIntent
+from polymarket.db import init_db, get_connection
 from polymarket.models import (
+    OrderIntent,
+    AccountState,
     IntentStatus,
+    SubmissionStatus,
+    utc_now_iso,
 )
 from polymarket.intent_builder import (
     create_run,
@@ -46,21 +44,23 @@ from polymarket.intent_builder import (
     save_intents,
     get_intents_by_status,
     update_intent_status,
+    check_duplicate_intents,
+    clear_draft_intents,
 )
 from polymarket.accounting import (
     FakePolymarketProvider,
     fetch_account_state,
     save_account_state,
     get_latest_account_state,
+    create_approval_snapshot,
 )
+from polymarket.execution_gateway import (
+    submit_approved_batch,
+    get_open_submissions,
+)
+from polymarket.reconcile import reconcile_submissions, get_reconciliation_summary
 from polymarket.ingest import sync_polymarket_ledger, get_last_sync_time, get_closed_positions_count
 from polymarket.metrics import get_drawdown_warnings
-
-from polymarket.date_utils import compute_expiry_dates
-from scripts.pipelines.run_full_pipeline import run_pipeline_programmatic
-
-# Constants
-MIN_EDGE_ABSOLUTE_SORT = True
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -72,16 +72,18 @@ init_db()
 # Page config
 st.set_page_config(
     page_title="Polymarket Trade Console",
-    page_icon="📊",
+    page_icon="    ",
     layout="wide",
 )
 
-st.title("📊 Polymarket Trade Console")
+st.title("     Polymarket Trade Console")
 
 # Initialize provider - use real provider in read_only mode for metrics
 from polymarket.provider_polymarket import (
     RealPolymarketProvider,
     check_provider_config,
+    snap_to_tick,
+    get_executable_price,
 )
 
 @st.cache_resource
@@ -108,7 +110,7 @@ col1, col2, col3, col4, col5 = st.columns(5)
 if "account_state" not in st.session_state:
     st.session_state.account_state = get_latest_account_state()
 
-if col5.button("🔄 Refresh Balance"):
+if col5.button("     Refresh Balance"):
     with st.spinner("Fetching account state..."):
         state = fetch_account_state(provider)
         save_account_state(state)
@@ -132,12 +134,12 @@ st.divider()
 # Polymarket Sync Section
 # -----------------------------------------------------------------------------
 
-st.header("📡 Polymarket Sync")
+st.header("     Polymarket Sync")
 
 sync_col1, sync_col2 = st.columns([1, 3])
 
 with sync_col1:
-    sync_clicked = st.button("🔄 Sync Last 30 Days", type="primary", width='stretch')
+    sync_clicked = st.button("     Sync Last 30 Days", type="primary", use_container_width=True)
 
 with sync_col2:
     last_sync = get_last_sync_time()
@@ -145,9 +147,9 @@ with sync_col2:
         age_minutes = (datetime.now(timezone.utc) - last_sync).total_seconds() / 60
         sync_status = f"Last sync: {last_sync.strftime('%Y-%m-%d %H:%M UTC')} ({int(age_minutes)} min ago)"
         if age_minutes > 60:
-            st.warning(f"⚠️ {sync_status} - Data may be stale")
+            st.warning(f"       {sync_status} - Data may be stale")
         else:
-            st.success(f"✓ {sync_status}")
+            st.success(f"    {sync_status}")
     else:
         st.info("No sync data. Click 'Sync' to fetch from Polymarket API.")
 
@@ -158,7 +160,7 @@ if sync_clicked:
             if result["success"]:
                 cp = result["closed_positions"]
                 st.success(
-                    f"✅ Sync complete! "
+                    f"    Sync complete! "
                     f"Fetched: {cp['closed_positions_fetched']}, "
                     f"Inserted: {cp['closed_positions_inserted']}, "
                     f"Updated: {cp['closed_positions_updated']}"
@@ -176,7 +178,7 @@ st.divider()
 # Metrics Section
 # -----------------------------------------------------------------------------
 
-st.header("📊 Metrics")
+st.header("     Metrics")
 
 # Get bankroll from account state or use default
 metrics_bankroll = state.collateral_balance if state else 500.0
@@ -186,7 +188,7 @@ metrics = get_drawdown_warnings(bankroll=metrics_bankroll, days=30)
 
 if metrics.has_data:
     mcol1, mcol2, mcol3, mcol4 = st.columns(4)
-    
+
     # Yesterday Realized PnL
     yesterday_delta = f"{metrics.yesterday_pnl:+.2f}" if metrics.yesterday_pnl != 0 else "0.00"
     mcol1.metric(
@@ -195,47 +197,47 @@ if metrics.has_data:
         delta=yesterday_delta,
         delta_color="normal",
     )
-    
+
     # Daily Loss %
     daily_loss_display = f"{metrics.yesterday_loss_pct:.1%}" if metrics.yesterday_pnl < 0 else "0.0%"
     mcol2.metric(
         "Yesterday Loss %",
         daily_loss_display,
-        delta="⚠️ Limit exceeded" if metrics.daily_loss_warn else None,
+        delta="       Limit exceeded" if metrics.daily_loss_warn else None,
         delta_color="inverse" if metrics.daily_loss_warn else "off",
     )
-    
+
     # Rolling 7D Max Drawdown
     mcol3.metric(
         "7D Max Drawdown",
         f"{metrics.rolling_mdd:.1%}",
-        delta="⚠️ Threshold exceeded" if metrics.rolling_mdd_warn else None,
+        delta="       Threshold exceeded" if metrics.rolling_mdd_warn else None,
         delta_color="inverse" if metrics.rolling_mdd_warn else "off",
     )
-    
+
     # Total Realized PnL
     mcol4.metric(
         "Total Realized PnL",
         f"${metrics.total_realized_pnl:.2f}",
     )
-    
+
     # Warnings
     if metrics.daily_loss_warn:
-        st.warning(f"⚠️ **Daily Loss Limit Alert**: Yesterday's loss ({metrics.yesterday_loss_pct:.1%}) exceeded the 4% limit.")
-    
+        st.warning(f"       **Daily Loss Limit Alert**: Yesterday's loss ({metrics.yesterday_loss_pct:.1%}) exceeded the 4% limit.")
+
     if metrics.rolling_mdd_warn:
-        st.warning(f"⚠️ **Rolling Drawdown Alert**: 7-day max drawdown ({metrics.rolling_mdd:.1%}) exceeded the 10% threshold.")
-    
+        st.warning(f"       **Rolling Drawdown Alert**: 7-day max drawdown ({metrics.rolling_mdd:.1%}) exceeded the 10% threshold.")
+
     if metrics.data_stale:
-        st.warning("⚠️ **Data Freshness**: Last sync was over 60 minutes ago. Consider syncing for latest data.")
-    
+        st.warning("       **Data Freshness**: Last sync was over 60 minutes ago. Consider syncing for latest data.")
+
     # Optional: Show equity curve
-    with st.expander("📈 Equity Curve & Daily PnL"):
+    with st.expander("     Equity Curve & Daily PnL"):
         if metrics.equity_curve is not None and not metrics.equity_curve.empty:
             st.line_chart(metrics.equity_curve.set_index("date")["equity"])
         else:
             st.info("No equity data available.")
-        
+
         if metrics.daily_pnl_df is not None and not metrics.daily_pnl_df.empty:
             st.bar_chart(metrics.daily_pnl_df.set_index("date")["realized_pnl"])
 
@@ -246,120 +248,292 @@ else:
 st.divider()
 
 # -----------------------------------------------------------------------------
-# Strategy Settings (Sidebar)
+# Parameters Section
 # -----------------------------------------------------------------------------
 
-st.sidebar.header("Strategy Settings")
+st.header("Generation Parameters")
 
-# Core Settings
-st.sidebar.subheader("Position Sizing")
+with st.expander("Auto-Reco Parameters", expanded=True):
+    # Row 1: Core settings
+    st.subheader("Core Settings")
+    param_row1_col1, param_row1_col2, param_row1_col3, param_row1_col4 = st.columns(4)
 
-# Default bankroll to available collateral from account state if available
-default_bankroll = state.available_collateral if state and state.available_collateral > 0 else 500.0
-bankroll = st.sidebar.number_input(
-    "Bankroll ($)", 
-    100.0, 100000.0, 
-    value=default_bankroll, 
-    step=50.0,
-    help="Defaults to your available USDC from Polymarket wallet (refresh balance to update)"
-)
-kelly_fraction = st.sidebar.slider("Kelly Fraction", 0.05, 0.50, 0.15, 0.01)
-min_edge = st.sidebar.number_input("Min Edge", 0.0, 0.5, 0.0, 0.005)
-max_bets_per_expiry = st.sidebar.number_input("Max Bets/Expiry", 1, 10, 6)
+    with param_row1_col1:
+        bankroll = st.number_input(
+            "Bankroll ($)",
+            min_value=100.0,
+            max_value=100000.0,
+            value=500.0,
+            step=50.0,
+            help="Total bankroll for position sizing",
+        )
 
-# Capital Limits (New)
-st.sidebar.subheader("Capital Limits")
-max_capital_per_expiry_frac = st.sidebar.slider("Max Capital/Expiry (frac)", 0.05, 1.0, 0.15, 0.05)
-max_capital_total_frac = st.sidebar.slider("Max Capital Total (frac)", 0.05, 1.0, 0.40, 0.05)
+    with param_row1_col2:
+        kelly_fraction = st.slider(
+            "Kelly Fraction",
+            min_value=0.05,
+            max_value=0.30,
+            value=0.15,
+            step=0.01,
+            help="Fractional Kelly multiplier",
+        )
 
-max_add_per_cycle_usd = st.sidebar.number_input("Max Add per Cycle ($)", 0.0, 10000.0, 200.0, step=50.0)
-max_reduce_per_cycle_usd = st.sidebar.number_input("Max Reduce per Cycle ($)", 0.0, 10000.0, 200.0, step=50.0)
+    with param_row1_col3:
+        min_edge = st.number_input(
+            "Min Edge",
+            min_value=0.0,
+            max_value=0.5,
+            value=0.0,
+            step=0.005,
+            help="Minimum edge threshold",
+        )
 
-# Price Filters
-st.sidebar.subheader("Filters")
-min_price = st.sidebar.number_input("Min Price", 0.01, 0.99, 0.03, 0.01)
-max_price = st.sidebar.number_input("Max Price", 0.01, 0.99, 0.95, 0.01)
-min_model_prob = st.sidebar.number_input("Min Model Prob", 0.0, 1.0, 0.0, 0.01)
-max_model_prob = st.sidebar.number_input("Max Model Prob", 0.0, 1.0, 1.0, 0.01)
+    with param_row1_col4:
+        max_bets_per_expiry = st.number_input(
+            "Max Bets per Expiry",
+            min_value=1,
+            max_value=10,
+            value=6,
+            step=1,
+        )
 
-# Advanced Toggles (New)
-st.sidebar.subheader("Risk Controls")
-use_prob_threshold = st.sidebar.checkbox("Use Prob Thresholds", value=False)
-prob_threshold_yes = st.sidebar.number_input("Trade YES >=", 0.0, 1.0, 0.8, disabled=not use_prob_threshold)
-prob_threshold_no = st.sidebar.number_input("Trade NO <=", 0.0, 1.0, 0.3, disabled=not use_prob_threshold)
+    # Row 2: Capital allocation
+    st.subheader("Capital Allocation")
+    param_row2_col1, param_row2_col2, param_row2_col3 = st.columns(3)
 
-disable_staleness = st.sidebar.checkbox("Disable Staleness Checks", value=False)
-cap_breach_delever = st.sidebar.checkbox("De-lever on Cap Breach", value=False)
-risk_off_targets_to_zero = st.sidebar.checkbox("Risk Off (Targets -> 0)", value=False)
-if risk_off_targets_to_zero:
-    st.sidebar.warning("⚠️ RISK OFF: All targets forced to zero. Exits only.")
+    with param_row2_col1:
+        max_capital_per_expiry_frac = st.slider(
+            "Max Capital per Expiry (frac)",
+            min_value=0.05,
+            max_value=1.0,
+            value=0.15,
+            step=0.05,
+            help="Maximum fraction of bankroll per expiry",
+        )
 
-use_stability_penalty = st.sidebar.checkbox("Use Stability Penalty", value=False)
-use_spread_gate = st.sidebar.checkbox("Spread-Aware Gate", value=True)
-spread_gate_buffer = st.sidebar.number_input("Gate Buffer", -0.5, 0.5, 0.01, disabled=not use_spread_gate)
+    with param_row2_col2:
+        max_capital_total_frac = st.slider(
+            "Max Capital Total (frac)",
+            min_value=0.05,
+            max_value=1.0,
+            value=0.40,
+            help="Maximum total fraction of bankroll to deploy",
+        )
 
-# Legacy/Misc
-with st.sidebar.expander("Legacy / Misc"):
-    min_trade_pct = st.slider("Min Stake (% Bankroll)", 1, 10, 1)
-    min_trade_usd = (min_trade_pct / 100.0) * bankroll
-    st.caption(f"Min Trade: ${min_trade_usd:.2f}")
-    
-    use_fixed_stake = st.checkbox("Use Fixed Stake", value=True)
-    fixed_stake_amount = st.number_input("Fixed Stake ($)", 1.0, 1000.0, 10.0, disabled=not use_fixed_stake)
-    
-    use_max_dte = st.checkbox("Limit Max DTE", value=False)
-    max_dte_value = st.number_input("Max DTE", 1.0, 30.0, 2.0, disabled=not use_max_dte)
-    
-    use_moneyness_filter = st.checkbox("Limit Moneyness", value=False)
-    min_moneyness = st.number_input("Min Moneyness", 0.0, 0.5, 0.0, disabled=not use_moneyness_filter)
-    max_moneyness = st.number_input("Max Moneyness", 0.0, 0.5, 0.05, disabled=not use_moneyness_filter)
+    # Row 3: Price filters
+    st.subheader("Price & Probability Filters")
+    param_row3_col1, param_row3_col2, param_row3_col3, param_row3_col4 = st.columns(4)
 
+    with param_row3_col1:
+        min_price = st.number_input(
+            "Min Price",
+            min_value=0.01,
+            max_value=0.99,
+            value=0.03,
+            step=0.01,
+        )
 
-# Construct Configuration Object
-# Note: This is re-created on every rerun based on sidebar state
-reco_config = RebalanceConfig(
-    # Core
-    bankroll=bankroll,
-    kelly_fraction=kelly_fraction,
-    min_edge_entry=min_edge,
-    
-    # Capital Limits
-    max_capital_total_frac=max_capital_total_frac,
-    max_capital_per_expiry_frac=max_capital_per_expiry_frac,
-    max_add_per_cycle_usd=max_add_per_cycle_usd,
-    max_reduce_per_cycle_usd=max_reduce_per_cycle_usd,
-    
-    # Filters
-    min_price=min_price,
-    max_price=max_price,
-    min_model_prob=min_model_prob,
-    max_model_prob=max_model_prob,
-    min_moneyness=min_moneyness if use_moneyness_filter else None,
-    max_moneyness=max_moneyness if use_moneyness_filter else None,
-    max_dte=max_dte_value if use_max_dte else None,
-    
-    # Features
-    use_stability_penalty=use_stability_penalty,
-    disable_staleness=disable_staleness,
-    cap_breach_delever=cap_breach_delever,
-    risk_off_targets_to_zero=risk_off_targets_to_zero,
-    
-    # Advanced / Legacy
-    min_trade_usd=min_trade_usd,
-    use_fixed_stake=use_fixed_stake,
-    fixed_stake_amount=fixed_stake_amount,
-)
+    with param_row3_col2:
+        max_price = st.number_input(
+            "Max Price",
+            min_value=0.01,
+            max_value=0.99,
+            value=0.95,
+            step=0.01,
+        )
 
-# Extra params for recommend_trades
-reco_extra_params = {
-    # max_bets_per_expiry is in config
-    # use_max_dte & max_dte are in config
-    # use_prob_threshold & thresholds are in config
-    # use_moneyness_filter & moneyness are in config
-    "use_spread_gate": use_spread_gate,
-    "spread_gate_buffer": spread_gate_buffer,
-}
+    with param_row3_col3:
+        min_model_prob = st.number_input(
+            "Min Model Prob",
+            min_value=0.0,
+            max_value=1.0,
+            value=0.0,
+            step=0.01,
+        )
 
+    with param_row3_col4:
+        max_model_prob = st.number_input(
+            "Max Model Prob",
+            min_value=0.0,
+            max_value=1.0,
+            value=1.0,
+            step=0.01,
+        )
+
+    # Row 4: Advanced settings
+    st.subheader("Advanced Settings")
+
+    use_advanced_features = st.checkbox(
+        "Advanced Features",
+        value=True,
+        help="Enable SVCJ jumps, skewed-t noise, and FIGARCH long-memory variance. "
+             "When disabled, uses plain GARCH(1,1)+t with hardcoded Kou jumps (μ=0). "
+             "Turn off for faster/stable baseline; turn on for production edge.",
+    )
+    if use_advanced_features:
+        st.caption("SVCJ · Skewed-t · FIGARCH — all active")
+    else:
+        st.caption("Plain GARCH(1,1)+t baseline only")
+    st.caption("─" * 20)
+
+    param_row4_col1, param_row4_col2, param_row4_col3 = st.columns(3)
+
+    with param_row4_col1:
+        use_stability_penalty = st.checkbox("Use Stability Penalty", value=False)
+
+    with param_row4_col2:
+        min_trade_pct = st.slider(
+            "Min Stake (% of bankroll)",
+            min_value=1,
+            max_value=10,
+            value=1,
+            step=1,
+        )
+        min_trade_usd = (min_trade_pct / 100.0) * bankroll
+        st.caption(f"= ${min_trade_usd:.2f}")
+
+    with param_row4_col3:
+        use_fixed_stake = st.checkbox("Use Fixed Stake (not Kelly)", value=True)
+        fixed_stake_amount = st.number_input(
+            "Fixed Stake Amount ($)",
+            min_value=1.0,
+            value=10.0,
+            step=1.0,
+            disabled=not use_fixed_stake,
+            help="When enabled, all trades use this fixed dollar amount instead of Kelly sizing.",
+        )
+
+    # Row 5: DTE and Probability Threshold filters
+    st.subheader("Optional Filters")
+    param_row5_col1, param_row5_col2, param_row5_col3, param_row5_col4 = st.columns(4)
+
+    with param_row5_col1:
+        use_max_dte = st.checkbox("Limit Max Days to Expiry", value=False)
+        max_dte_value = st.number_input(
+            "Max DTE (days)",
+            min_value=1.0,
+            value=2.0,
+            step=1.0,
+            disabled=not use_max_dte,
+            help="Only recommend trades on contracts expiring within this many days.",
+        )
+
+    with param_row5_col2:
+        use_prob_threshold = st.checkbox("Use Probability Thresholds", value=True)
+        prob_threshold_yes = st.number_input(
+            "Trade YES Above or Equal To",
+            min_value=0.0,
+            max_value=1.0,
+            value=0.8,
+            step=0.05,
+            disabled=not use_prob_threshold,
+            help="Trade YES when model probability >= this value.",
+        )
+        prob_threshold_no = st.number_input(
+            "Trade NO Below or Equal To",
+            min_value=0.0,
+            max_value=1.0,
+            value=0.3,
+            step=0.05,
+            disabled=not use_prob_threshold,
+            help="Trade NO when model probability <= this value.",
+        )
+
+    with param_row5_col3:
+        use_moneyness_filter = st.checkbox("Limit Moneyness", value=False)
+        min_moneyness = st.number_input(
+            "Min Moneyness",
+            min_value=0.0,
+            max_value=0.5,
+            value=0.0,
+            step=0.01,
+            format="%.2f",
+            disabled=not use_moneyness_filter,
+        )
+        max_moneyness = st.number_input(
+            "Max Moneyness",
+            min_value=0.0,
+            max_value=0.5,
+            value=0.05,
+            step=0.01,
+            format="%.2f",
+            disabled=not use_moneyness_filter,
+        )
+
+    with param_row5_col4:
+        use_spread_gate = st.checkbox("Spread-Aware Gate", value=True)
+        spread_gate_buffer = st.number_input(
+            "Gate Buffer",
+            min_value=-0.5,
+            max_value=0.5,
+            value=0.01,
+            disabled=not use_spread_gate,
+        )
+
+    # Row 6: Risk controls
+    st.subheader("Risk Controls")
+    param_row6_col1, param_row6_col2, param_row6_col3, param_row6_col4 = st.columns(4)
+
+    with param_row6_col1:
+        max_add_per_cycle_usd = st.number_input(
+            "Max Add per Cycle ($)",
+            min_value=0.0,
+            max_value=10000.0,
+            value=200.0,
+            step=50.0,
+        )
+
+    with param_row6_col2:
+        max_reduce_per_cycle_usd = st.number_input(
+            "Max Reduce per Cycle ($)",
+            min_value=0.0,
+            max_value=10000.0,
+            value=200.0,
+            step=50.0,
+        )
+
+    with param_row6_col3:
+        disable_staleness = st.checkbox("Disable Staleness Checks", value=False)
+        cap_breach_delever = st.checkbox("De-lever on Cap Breach", value=False)
+
+    with param_row6_col4:
+        risk_off_targets_to_zero = st.checkbox("Risk Off (Targets -> 0)", value=False)
+        if risk_off_targets_to_zero:
+            st.warning("RISK OFF: All targets forced to zero. Exits only.")
+
+    # Construct Configuration Object
+    reco_config = RebalanceConfig(
+        bankroll=bankroll,
+        kelly_fraction=kelly_fraction,
+        min_edge_entry=min_edge,
+        max_capital_total_frac=max_capital_total_frac,
+        max_capital_per_expiry_frac=max_capital_per_expiry_frac,
+        max_add_per_cycle_usd=max_add_per_cycle_usd,
+        max_reduce_per_cycle_usd=max_reduce_per_cycle_usd,
+        min_price=min_price,
+        max_price=max_price,
+        min_model_prob=min_model_prob,
+        max_model_prob=max_model_prob,
+        use_stability_penalty=use_stability_penalty,
+        disable_staleness=disable_staleness,
+        cap_breach_delever=cap_breach_delever,
+        risk_off_targets_to_zero=risk_off_targets_to_zero,
+        min_trade_usd=min_trade_usd,
+        use_fixed_stake=use_fixed_stake,
+        fixed_stake_amount=fixed_stake_amount,
+        max_bets_per_expiry=max_bets_per_expiry,
+        max_dte=max_dte_value if use_max_dte else None,
+        use_prob_threshold=use_prob_threshold,
+        prob_threshold_yes=prob_threshold_yes,
+        prob_threshold_no=prob_threshold_no,
+        min_moneyness=min_moneyness if use_moneyness_filter else None,
+        max_moneyness=max_moneyness if use_moneyness_filter else None,
+    )
+
+    reco_extra_params = {
+        "use_spread_gate": use_spread_gate,
+        "spread_gate_buffer": spread_gate_buffer,
+    }
 
 st.divider()
 
@@ -367,7 +541,12 @@ st.divider()
 # Execution Workflow (State Machine)
 # -----------------------------------------------------------------------------
 
-st.header("🚀 Execution Control")
+# Imports for execution
+from dataclasses import asdict
+from polymarket.date_utils import compute_expiry_dates, group_dates_by_month, format_date_range_summary
+from scripts.pipelines.run_full_pipeline import run_pipeline_programmatic, verify_pipeline_output
+
+st.header("     Execution Control")
 
 # 1. Initialize State
 if "program_phase" not in st.session_state:
@@ -387,17 +566,19 @@ col_run, col_reset, col_status = st.columns([1, 1, 3])
 with col_run:
     # Disable if not IDLE
     disable_run = st.session_state.program_phase != "IDLE"
-    if st.button("▶️ Run Program", type="primary", disabled=disable_run, width="stretch"):
+    if st.button("       Run Program", type="primary", disabled=disable_run, use_container_width=True):
         # State Clear
         st.session_state.program_phase = "PIPELINE"
         st.session_state.program_error = None
         st.session_state.delta_df = None
         st.session_state.program_run_id = str(uuid.uuid4())
+        # Create the run record in DB (idempotent — FK required by intents table)
+        create_run(run_id=st.session_state.program_run_id)
         # Note: We do NOT clear pipeline_output to allow introspection, but it will be overwritten on success
         st.rerun()
 
 with col_reset:
-    if st.button("🔄 Reset State", type="secondary", width="stretch"):
+    if st.button("     Reset State", type="secondary", use_container_width=True):
         st.session_state.program_phase = "IDLE"
         st.session_state.program_error = None
         st.rerun()
@@ -405,11 +586,11 @@ with col_reset:
 with col_status:
     # Phase Display
     phase_map = {
-        "IDLE": "IDLE",
-        "PIPELINE": "RUNNING PIPELINE...",
-        "RECO": "GENERATING RECOS...",
-        "DONE": "[DONE] Ready to Review",
-        "ERROR": "[ERROR]"
+        "IDLE": "    IDLE",
+        "PIPELINE": "    RUNNING PIPELINE...",
+        "RECO": "     GENERATING RECOS...",
+        "DONE": "    DONE (Ready to Review)",
+        "ERROR": "    ERROR"
     }
     current_phase = st.session_state.program_phase
     st.markdown(f"**Status:** {phase_map.get(current_phase, current_phase)}")
@@ -425,15 +606,24 @@ if st.session_state.program_phase == "PIPELINE":
     try:
         with st.spinner("Step 1/2: Validating inputs & Pricing contracts..."):
             expiry_dates = compute_expiry_dates()
-            result = run_pipeline_programmatic(expiry_dates, num_sims=10000)
-            
+            result = run_pipeline_programmatic(expiry_dates, num_sims=10000, advanced_features=use_advanced_features)
+
             if result.get("ok"):
                 st.session_state.pipeline_output = result
                 st.session_state.program_phase = "RECO"
                 st.rerun()
             else:
-                raise Exception(f"Pipeline Failed: {result.get('error')}")
-                
+                error_msg = result.get("error") or "Unknown error (no error key in result)"
+                failed_str = ""
+                if result.get("failed"):
+                    failed_str = "\nFailed dates:\n" + "\n".join(
+                        f"  {d.get('date', '?')}: {d.get('error', '?')}" for d in result["failed"]
+                    )
+                log_str = ""
+                if result.get("logs"):
+                    log_str = "\nLast 10 logs:\n  " + "\n  ".join(result["logs"][-10:])
+                raise Exception(f"Pipeline Failed: {error_msg}{failed_str}{log_str}")
+
     except Exception as e:
         import traceback
         st.session_state.program_error = f"Pipeline Error: {str(e)}\n{traceback.format_exc()}"
@@ -447,68 +637,56 @@ elif st.session_state.program_phase == "RECO":
             # 1. Load Data
             if not st.session_state.pipeline_output:
                  raise Exception("No pipeline output found.")
-            
+
             output_dir = st.session_state.pipeline_output.get("output_dir")
             batch_path = Path(output_dir) / "batch_with_fits.csv"
             if not batch_path.exists():
                 raise Exception(f"Batch file not found at {batch_path}")
-            
+
             batch_df = pd.read_csv(batch_path)
-            
+
             # 2. Generate Deltas (All, including HOLD)
             deltas: List[DeltaIntent] = recommend_trades(
                 df=batch_df,
                 **asdict(reco_config),
                 **reco_extra_params,
-                return_all=True 
+                return_all=True
             )
-            
-            # Sort by absolute effective edge for better visibility
-            deltas.sort(key=lambda x: abs(x.effective_edge), reverse=True)
-            
+
             # 3. Process Deltas & Stable Keys
             enhanced_deltas = []
             valid_actionable_deltas = []
-            
+
             for d in deltas:
-                # Generate Stable Key (Logical Identity: Run|Key|Action)
-                # Matches DB intent_id logic to prevent duplicates on retry
-                stable_key = f"{st.session_state.program_run_id}|{d.key}|{d.action}"
-                d.intent_key = stable_key
-                
-                # Use this for display as well
-                display_key = stable_key
-                # pm = d.price_mode or "NONE"
-                # amt_str = f"{d.amount_usd:.2f}"
-                # display_key = f"{st.session_state.program_run_id}|{d.slug}|{d.action}|{pm}|{amt_str}"
-                
+                # Generate Stable Key: {run_id}|{key}|{action}|{price_mode}|{amount:.2f}
+                pm = d.price_mode or "NONE"
+                amt_str = f"{d.amount_usd:.2f}"
+                stable_key = f"{st.session_state.program_run_id}|{d.key}|{d.action}|{pm}|{amt_str}"
+
                 # Assign to dict for DF
                 d_dict = asdict(d)
-                d_dict["display_key"] = display_key
+                d_dict["intent_key"] = stable_key
                 d_dict["run_id"] = st.session_state.program_run_id
                 enhanced_deltas.append(d_dict)
-                
+
                 # 4. Filter for Execution (BUY/SELL only)
                 if d.action in ["BUY", "SELL"]:
                     valid_actionable_deltas.append(d)
 
             # 5. Convert to DF for Display
             st.session_state.delta_df = pd.DataFrame(enhanced_deltas)
-            
+
             # 6. Build & Save Executable Intents
             if valid_actionable_deltas:
                 # build_intents_from_reco returns List[OrderIntent]
-                exec_intents = build_intents_from_reco(valid_actionable_deltas, st.session_state.program_run_id) 
-                
+                # expects (data: List[DeltaIntent], run: Union[Run, str])
+                exec_intents = build_intents_from_reco(valid_actionable_deltas, st.session_state.program_run_id)
+
                 # Upsert / Save
-                # Create Run Record first to satisfy FK
-                create_run(
-                    strategy="dashboard_console",
-                    params=asdict(reco_config),
-                    run_id=st.session_state.program_run_id
-                )
-                
-                # NOTE: run_id is already in exec_intents.
+                # We save group_id = run_id to filter later
+                for ei in exec_intents:
+                    ei.group_id = st.session_state.program_run_id
+
                 save_intents(exec_intents)
 
             st.session_state.program_phase = "DONE"
@@ -523,73 +701,66 @@ elif st.session_state.program_phase == "RECO":
 # --- PHASE: DONE ---
 elif st.session_state.program_phase == "DONE":
     # 1. Display Informational Deltas
-    st.subheader("📊 Recommendation Results")
-    
-    if st.session_state.delta_df is not None:
+    st.subheader("     Recommendation Results")
+
+    if st.session_state.delta_df is not None and not st.session_state.delta_df.empty:
         ddf = st.session_state.delta_df.copy()
-        
-        # Check for fallback prices in ACTIONABLE trades
-        actionable_fallback = ddf[
-            (ddf["action"].isin(["BUY", "SELL"])) & 
-            (ddf.get("is_fallback_price", False) == True)
-        ]
-        
-        if not actionable_fallback.empty:
-            count = len(actionable_fallback)
-            st.warning(
-                f"⚠️ **Warning**: {count} recommended trade(s) are using fallback market prices "
-                "(Ask/Bid price unavailable in batch data). Execution edge may differ from model edge."
-            )
-        
-        # Display Tabs
-        tab_buy, tab_sell, tab_hold = st.tabs(["BUY Actions", "SELL Actions", "HOLD / Skips"])
-        
-        # Columns to hide from display
-        hide_cols = [
-            "key", "condition_id", "rn_prob", "pricing_date", "stability_penalty", 
-            "stale_mult", "question", "price_mode", "batch_age_hours", 
-            "expiry_group_risk", "expiry_shape_label", "direction", 
-            "display_key", "run_id", "intent_key",
-            "kelly_fraction_full", "kelly_fraction_effective",
-            "expiry_key"
-        ]
-        
-        with tab_buy:
-            buys = ddf[ddf["action"] == "BUY"].drop(columns=[c for c in hide_cols if c in ddf.columns], errors="ignore")
-            st.dataframe(buys, width="stretch")
-            st.caption(f"Count: {len(buys)}")
-            
-        with tab_sell:
-            sells = ddf[ddf["action"] == "SELL"].drop(columns=[c for c in hide_cols if c in ddf.columns], errors="ignore")
-            st.dataframe(sells, width="stretch")
-            st.caption(f"Count: {len(sells)}")
-            
-        with tab_hold:
-            # Hide additional columns for HOLD tab
-            hide_cols_hold = hide_cols + ["amount_usd", "signed_delta_usd", "target_usd"]
-            holds = ddf[ddf["action"] == "HOLD"].drop(columns=[c for c in hide_cols_hold if c in ddf.columns], errors="ignore")
-            st.dataframe(holds, width="stretch")
-            st.caption(f"Count: {len(holds)}")
-    
+
+        # Guard: DataFrame must have 'action' column
+        if "action" not in ddf.columns:
+            st.warning("No action column in delta results — no recommendations generated.")
+        else:
+            # Display Tabs
+            tab_buy, tab_sell, tab_hold = st.tabs(["BUY Actions", "SELL Actions", "HOLD / Skips"])
+
+            # Columns to hide from display
+            hide_cols = [
+                "key", "condition_id", "rn_prob", "pricing_date", "stability_penalty",
+                "stale_mult", "question", "price_mode", "batch_age_hours",
+                "expiry_group_risk", "expiry_shape_label", "direction",
+                "display_key", "run_id", "intent_key",
+                "kelly_fraction_full", "kelly_fraction_effective"
+            ]
+
+            with tab_buy:
+                buys = ddf[ddf["action"] == "BUY"].drop(columns=[c for c in hide_cols if c in ddf.columns], errors="ignore")
+                st.dataframe(buys, use_container_width=True)
+                st.caption(f"Count: {len(buys)}")
+
+            with tab_sell:
+                sells = ddf[ddf["action"] == "SELL"].drop(columns=[c for c in hide_cols if c in ddf.columns], errors="ignore")
+                st.dataframe(sells, use_container_width=True)
+                st.caption(f"Count: {len(sells)}")
+
+            with tab_hold:
+                # Hide additional columns for HOLD tab
+                hide_cols_hold = hide_cols + ["amount_usd", "signed_delta_usd", "target_usd"]
+                holds = ddf[ddf["action"] == "HOLD"].drop(columns=[c for c in hide_cols_hold if c in ddf.columns], errors="ignore")
+                st.dataframe(holds, use_container_width=True)
+                st.caption(f"Count: {len(holds)}")
+
+    elif st.session_state.delta_df is not None and st.session_state.delta_df.empty:
+        st.info("No recommendations generated — check edge thresholds, filters, or batch data.")
+
     st.divider()
-    
+
     # 2. Draft Orders Management (DB Backed)
-    st.subheader("📝 Draft Orders (Execution)")
-    
+    st.subheader("     Draft Orders (Execution)")
+
     all_drafts = get_intents_by_status(IntentStatus.DRAFT)
-    # Filter by run_id
-    run_drafts = [i for i in all_drafts if i.run_id == st.session_state.program_run_id]
-    
+    # Filter by run_id (stored in group_id)
+    run_drafts = [i for i in all_drafts if i.group_id == st.session_state.program_run_id]
+
     if not run_drafts:
         st.info("No executable orders generated for this run.")
     else:
         st.write(f"Found {len(run_drafts)} draft orders.")
-        
+
         # Interactive Table for Approval
         draft_data = []
         for i in run_drafts:
             draft_data.append({
-                "Select": False, 
+                "Select": False,
                 "ID": i.intent_id,
                 "Action": i.action,
                 "Contract": i.contract,
@@ -597,23 +768,22 @@ elif st.session_state.program_phase == "DONE":
                 "Shares": i.size_shares,
                 "Value ($)": i.notional_usd,
                 "Prob": i.model_prob,
-                "LogKey": i.intent_key  # Useful for debugging
             })
-        
+
         draft_df = pd.DataFrame(draft_data)
         draft_df["Select"] = True # Default select all
-        
+
         edited_df = st.data_editor(
             draft_df,
             hide_index=True,
             column_config={"Select": st.column_config.CheckboxColumn(required=True)},
-            disabled=["ID", "Action", "Contract", "Price", "Shares", "Value ($)", "Prob", "LogKey"],
+            disabled=["ID", "Action", "Contract", "Price", "Shares", "Value ($)", "Prob"],
             key=f"editor_{st.session_state.program_run_id}"
         )
-        
+
         # Process actions
         selected_ids = edited_df[edited_df["Select"]]["ID"].tolist()
-        
+
         if st.button(f"Mark Selected as APPROVED ({len(selected_ids)})"):
             for iid in selected_ids:
                 update_intent_status(iid, IntentStatus.APPROVED)
@@ -622,26 +792,24 @@ elif st.session_state.program_phase == "DONE":
 
     # Submit Section (Loads APPROVED)
     approved_intents = get_intents_by_status(IntentStatus.APPROVED)
-    run_approved = [i for i in approved_intents if i.run_id == st.session_state.program_run_id]
-    
+    run_approved = [i for i in approved_intents if i.group_id == st.session_state.program_run_id]
+
     if run_approved:
         st.divider()
-        st.subheader(f"🚀 Ready to Submit ({len(run_approved)})")
-        
-        st.dataframe(pd.DataFrame([asdict(i) for i in run_approved]), width="stretch")
-        
-        if st.button("🚀 SUBMIT TO MARKET", type="primary"):
+        st.subheader(f"     Ready to Submit ({len(run_approved)})")
+
+        st.dataframe(pd.DataFrame([asdict(i) for i in run_approved]), use_container_width=True)
+
+        if st.button("     SUBMIT TO MARKET", type="primary"):
              with st.spinner("Resolving Live Prices & Submitting..."):
                  from polymarket.provider_polymarket import RealPolymarketProvider
                  import os
-                 from polymarket.execution_gateway import submit_approved_batch
-
                  pkey = os.getenv("POLYMARKET_PRIVATE_KEY")
                  if not pkey:
                      st.error("No Private Key found!")
                  else:
                     trade_provider = RealPolymarketProvider(mode="trading")
-                    
+
                     # --- Price Resolution Logic ---
                     unique_keys = set((i.contract, i.outcome) for i in run_approved)
                     c_map = {}
@@ -649,15 +817,157 @@ elif st.session_state.program_phase == "DONE":
                          # Resolving token might be slow, consider caching or parallel if needed
                          # But for submission, we do it live
                         c_map[(c,o)] = trade_provider.fetch_clob_token_id(c, o)
-                        
-                    # Submit batch
-                    submit_approved_batch(run_approved, trade_provider, c_map)
-                    
-                    st.success("Batch submission complete! Check status in DB or below.")
-                    st.rerun()
+
+                    tids = list(val for val in c_map.values() if val)
+                    live_books = trade_provider.fetch_live_prices_with_depth(tids, order_dollars=10)
+
+                    final_batch = []
+                    blocked = []
+
+                    for intent in run_approved:
+                        tid = c_map.get((intent.contract, intent.outcome))
+                        book = live_books.get(tid)
+
+                        if not book:
+                            blocked.append(intent.contract)
+                            continue
+
+                        # TAKER Logic
+                        if intent.action == "BUY":
+                            ask = float(book.get("ask") or 0)
+                            # Slippage check: price must be reasonable relative to provisional limit
+                            # If provisional was 0.50 and ask is 0.52, maybe OK.
+                            # If provisional was 0.50 and ask is 0.80, maybe NO?
+                            # For now, we trust the live price if it meets min_price checks?
+                            # Rebalance config had min/max price.
+                            # But we want to ensure we don't buy way worse than we thought.
+                            # Let's verify ask < intent.limit_price + 0.05 (5 cents slippage?)
+                            # intent.limit_price from RECO was likely a batch update.
+                            # Let's update limit to ask.
+                            if ask > 0 and ask < (intent.limit_price or 0.99) + 0.05:
+                                intent.limit_price = ask
+                                final_batch.append(intent)
+                            else:
+                                blocked.append(f"{intent.contract} (Ask {ask} > Limit {intent.limit_price} + 5c)")
+                        elif intent.action == "SELL":
+                            bid = float(book.get("bid") or 0)
+                            if bid > 0 and bid > (intent.limit_price or 0.01) - 0.05:
+                                intent.limit_price = bid
+                                final_batch.append(intent)
+                            else:
+                                blocked.append(f"{intent.contract} (Bid {bid} < Limit {intent.limit_price} - 5c)")
+
+                    if blocked:
+                         st.warning(f"Skipped {len(blocked)} orders due to price/liquidity: {blocked}")
+
+                    if final_batch:
+                         # Need current account state for collateral check
+                         acct = fetch_account_state(provider)
+                         results = submit_approved_batch(final_batch, acct, trade_provider)
+                         success_count = sum(1 for r in results if r["success"])
+                         st.success(f"Submitted {success_count}/{len(final_batch)} orders!")
+                         st.rerun()
 
 # --- PHASE: ERROR ---
 elif st.session_state.program_phase == "ERROR":
-    st.error("❌ An error occurred during the program run.")
-    if st.session_state.program_error:
-        st.code(st.session_state.program_error, language="text")
+    st.error("    An error occurred")
+    st.error(st.session_state.program_error)
+
+    if st.session_state.pipeline_output:
+        if st.button("     Retry Recommendation (Reuse Pipeline Data)"):
+            st.session_state.program_phase = "RECO"
+            st.session_state.program_error = None
+            st.rerun()
+
+st.divider()
+
+# -----------------------------------------------------------------------------
+# Order History
+# -----------------------------------------------------------------------------
+
+st.header("Order History")
+
+# Status filter
+history_status = st.selectbox(
+    "Filter by status",
+    options=["All", "SUBMITTED", "FILLED", "PARTIAL", "FAILED", "CANCELLED"],
+    index=0,
+)
+
+# Fetch intents
+conn = get_connection()
+try:
+    cursor = conn.cursor()
+    if history_status == "All":
+        cursor.execute(
+            """
+            SELECT * FROM intents
+            WHERE status NOT IN ('DRAFT', 'APPROVED')
+            ORDER BY created_at DESC
+            LIMIT 100
+            """
+        )
+    else:
+        cursor.execute(
+            """
+            SELECT * FROM intents
+            WHERE status = ?
+            ORDER BY created_at DESC
+            LIMIT 100
+            """,
+            (history_status,),
+        )
+    rows = cursor.fetchall()
+finally:
+    conn.close()
+
+if rows:
+    history_data = []
+    for row in rows:
+        intent = OrderIntent.from_row(row)
+        history_data.append({
+            "contract": intent.contract,
+            "outcome": intent.outcome,
+            "price": f"${intent.limit_price:.4f}",
+            "shares": f"{intent.size_shares:.2f}",
+            "notional": f"${intent.notional_usd:.2f}",
+            "status": intent.status,
+            "submitted_at": intent.submitted_at[:19] if intent.submitted_at else "N/A",
+            "notes": intent.notes[:50] + "..." if intent.notes and len(intent.notes) > 50 else (intent.notes or ""),
+        })
+
+    history_df = pd.DataFrame(history_data)
+    st.dataframe(history_df, use_container_width=True, hide_index=True)
+else:
+    st.info("No order history yet.")
+
+# Reconciliation summary
+with st.expander("Submission Status Summary"):
+    summary = get_reconciliation_summary()
+    if summary:
+        for status, count in summary.items():
+            st.write(f"    {status}: {count}")
+    else:
+        st.write("No submissions yet.")
+
+    if st.button("Run Reconciliation"):
+        with st.spinner("Querying Polymarket CLOB API for order statuses..."):
+            result = reconcile_submissions(provider)
+        st.success(
+            f"    Reconciled {result.get('open', 0)} orders: "
+            f"**{result.get('filled', 0)} filled**, "
+            f"{result.get('cancelled', 0)} cancelled, "
+            f"{result.get('still_open', 0)} still open"
+        )
+        if result.get('errors', 0) > 0:
+            st.warning(f"       {result.get('errors')} errors encountered")
+        st.rerun()
+
+st.divider()
+
+# -----------------------------------------------------------------------------
+# Footer
+# -----------------------------------------------------------------------------
+
+st.caption("Polymarket Trade Console MVP - Using fake provider for testing")
+

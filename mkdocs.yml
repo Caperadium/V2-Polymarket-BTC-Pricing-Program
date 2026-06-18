@@ -30,7 +30,13 @@ nav:
   - Concepts:
     - Architecture: concepts/architecture.md
     - Pricing Engine: concepts/pricing-engine.md
+    - Jump Calibration: concepts/jump-calibration.md
+    - Regime Detection: concepts/regime-detection.md
+    - Directional XGBoost: concepts/directional-xgb.md
+    - Basel Validation: concepts/basel-validation.md
+    - Calibration Metrics: concepts/calibration-metrics.md
     - Probability Fitting: concepts/probability-fitting.md
+    - Macro Data: concepts/macro-data.md
     - Strategy Pipeline: concepts/strategy-pipeline.md
     - Kelly Sizing: concepts/kelly-sizing.md
     - Vol Gate: concepts/vol-gate.md
@@ -50,8 +56,14 @@ nav:
   - API Reference:
     - Core:
       - BTC Pricing: api-reference/core/btc-pricing-engine.md
+      - Jump Calibration: api-reference/core/jump-calibration.md
+      - Regime Detector: api-reference/core/regime-detector.md
+      - Directional XGBoost: api-reference/core/directional-xgb.md
+      - Basel Backtest: api-reference/core/basel-backtest.md
+      - Calibration Metrics: api-reference/core/calibration-metrics.md
       - Probability Fitting: api-reference/core/fit-probability.md
       - Data Fetcher: api-reference/core/data-fetcher.md
+      - Macro Fetcher: api-reference/core/macro-fetcher.md
       - Positions: api-reference/core/positions.md
       - auto_reco: api-reference/core/auto-reco.md
       - Common Types: api-reference/core/common.md

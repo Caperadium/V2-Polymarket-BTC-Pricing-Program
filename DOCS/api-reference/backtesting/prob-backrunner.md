@@ -1,10 +1,10 @@
 # Prob Backrunner
 
-`scripts.backtesting.prob_backrunner_engine`
+`core.backtesting.backrunner`
 
 Time-travel orchestrator that re-simulates pricing at each historical timestamp.
 
-::: scripts.backtesting.prob_backrunner_engine
+::: core.backtesting.backrunner
     options:
       show_root_heading: true
       show_source: true

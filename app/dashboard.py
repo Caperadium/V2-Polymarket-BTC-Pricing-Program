@@ -34,10 +34,11 @@ import streamlit as st
 import sys
 
 # Add root directory to sys.path to find 'core' and 'scripts' packages
-sys.path.append(str(Path(__file__).parent.parent))
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.append(str(PROJECT_ROOT))
 
 from core.strategy.auto_reco import LAST_RECO_DEBUG, recommend_trades, recommendations_to_dataframe
-from scripts.backtesting.backtest_engine import run_backtest
+from core.backtesting.backtest_engine import run_backtest
 from core.data.positions import (
     enrich_positions_with_batch,
     load_positions,
@@ -94,7 +95,7 @@ def compute_edge_series(df: pd.DataFrame) -> pd.Series:
     edge_col = get_column(df, ["edge_vs_market_fit", "edge_vs_market", "edge"])
     if edge_col is not None:
         return df[edge_col].astype(float)
-    model_col = get_column(df, ["p_model_cal", "p_model_fit", "p_real_mc"])
+    model_col = get_column(df, ["p_model_fit", "p_real_mc"])
     price_col = get_column(df, ["market_price", "market_pr"])
     if model_col is None or price_col is None:
         return pd.Series(np.nan, index=df.index)
@@ -176,7 +177,7 @@ def render_time_series_line(
         template="plotly_white",
     )
     fig.update_layout(xaxis_title="Pricing date", yaxis_title=yaxis_label)
-    st.plotly_chart(fig, width="stretch")
+    st.plotly_chart(fig, use_container_width=True)
 
 
 
@@ -238,7 +239,8 @@ def compute_realized_pnl_total(positions_df: pd.DataFrame, resolved_df: pd.DataF
         resolved_subset = resolved_df[["position_key", "outcome"]].dropna(subset=["outcome"])
         if not resolved_subset.empty:
             merged = closed_df.merge(resolved_subset, on="position_key", how="left", suffixes=("", "_resolved"))
-            merged["outcome"] = pd.to_numeric(merged["outcome"], errors="coerce")
+            outcome_col = "outcome_resolved" if "outcome_resolved" in merged.columns else "outcome"
+            merged["outcome"] = pd.to_numeric(merged[outcome_col], errors="coerce")
             sides = merged["side"].astype(str).str.upper()
             payouts = np.where(
                 sides == "YES",
@@ -362,7 +364,7 @@ def simulate_bankroll_paths(
     """Monte Carlo bankroll simulator using fractional Kelly YES bets."""
     rng = np.random.default_rng(seed)
 
-    model_col = get_column(df, ["p_model_cal", "p_model_fit", "p_real_mc"])
+    model_col = get_column(df, ["p_model_fit", "p_real_mc"])
     price_col = get_column(df, ["market_price", "market_pr"])
     if model_col is None or price_col is None:
         raise ValueError("Batch file missing model or market price columns.")
@@ -472,88 +474,7 @@ def simulate_bankroll_paths(
 # ---------------------------------------------------------------------------
 
 
-def infer_pricing_date_from_source(source_name: str) -> str:
-    """Infer pricing datetime from folder/filename (full UTC timestamp)."""
-    # Try new format first: 2025-12-20_05-57-14_UTC or batch_20251113_094053
-    new_match = re.search(r"(\d{4}-\d{2}-\d{2})_(\d{2}-\d{2}-\d{2})_UTC", source_name)
-    if new_match:
-        try:
-            date_part = new_match.group(1)
-            time_part = new_match.group(2).replace("-", ":")
-            return f"{date_part} {time_part}+00:00"
-        except ValueError:
-            pass
-    
-    # Try legacy format: batch_20251113_094053
-    legacy_match = re.search(r"batch_(\d{8})_(\d{6})", source_name)
-    if legacy_match:
-        try:
-            date_str = legacy_match.group(1)
-            time_str = legacy_match.group(2)
-            parsed = datetime.strptime(f"{date_str}_{time_str}", "%Y%m%d_%H%M%S")
-            return parsed.strftime("%Y-%m-%d %H:%M:%S+00:00")
-        except ValueError:
-            pass
-    
-    # Fallback: just date patterns
-    patterns = [
-        r"(20\d{2}-\d{2}-\d{2})",
-        r"(20\d{2}\d{2}\d{2})",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, source_name)
-        if match:
-            value = match.group(1)
-            try:
-                parsed = (
-                    datetime.strptime(value, "%Y-%m-%d")
-                    if "-" in value
-                    else datetime.strptime(value, "%Y%m%d")
-                )
-                return parsed.strftime("%Y-%m-%d %H:%M:%S+00:00")
-            except ValueError:
-                continue
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S+00:00")
-
-
-def prepare_batch_df(df: pd.DataFrame, source_name: str) -> pd.DataFrame:
-    """
-    Normalize a single batch dataframe (pricing_date, types).
-    
-    Handles two formats:
-    - New format: Has 'model_probability' column (from prob_backrunner_engine)
-    - Old format: Has 'p_model_fit' or 'p_real_mc' columns (from fit_probability_curves)
-    
-    IMPORTANT: pricing_date is derived from batch_timestamp in the CSV,
-    which is the source of truth for when the pricing was performed.
-    """
-    df = df.copy()
-    
-    # --- Detect and normalize NEW format (from prob_backrunner_engine) ---
-    if "model_probability" in df.columns:
-        # Map new column names to expected names
-        rename_map = {
-            "model_probability": "p_model_fit",  # Model probability
-        }
-        # Only rename columns that exist
-        for old_col, new_col in rename_map.items():
-            if old_col in df.columns and new_col not in df.columns:
-                df = df.rename(columns={old_col: new_col})
-        
-        # Ensure 'date' -> 'pricing_date' if present (but will be overwritten below)
-        if "date" in df.columns and "pricing_date" not in df.columns:
-            df = df.rename(columns={"date": "pricing_date"})
-    
-    # --- Use batch_timestamp as pricing_date (source of truth) ---
-    if "batch_timestamp" in df.columns:
-        # batch_timestamp is the exact time when pricing was performed
-        df["pricing_date"] = pd.to_datetime(df["batch_timestamp"], errors="coerce", utc=True)
-    else:
-        # Fallback: use folder name timestamp
-        df["pricing_date"] = infer_pricing_date_from_source(source_name)
-    
-    df["source_name"] = source_name
-    return df
+from core.backtesting.batch_loader import prepare_batch_df, scan_batch_files, scan_flat_batch_files
 
 
 def load_batch_datasets(
@@ -595,84 +516,6 @@ def safe_to_datetime(series: pd.Series) -> pd.Series:
     """Convert a column to datetime, returning NaT on failure."""
     return pd.to_datetime(series, errors="coerce")
 
-
-
-def scan_batch_files(
-    root_dir: str,
-    start_date: datetime.date,
-    end_date: datetime.date,
-    filename: str = "batch_with_fits.csv",
-) -> List[str]:
-    """
-    Scan root_dir for batch folders within the date range (LOCAL TIME) and return paths.
-    
-    Logic:
-    1. Parse folder timestamps in various formats as UTC.
-    2. Convert to local system time.
-    3. Compare local date with start_date/end_date.
-    
-    Supports folder formats:
-    - batch_YYYYMMDD_HHMMSS (legacy)
-    - YYYY-MM-DD_HH-MM-SS_UTC (current)
-    """
-    valid_paths = []
-    if not os.path.exists(root_dir):
-        return []
-
-    # Iterate over all subdirectories in root_dir
-    for entry in os.scandir(root_dir):
-        if not entry.is_dir():
-            continue
-        
-        folder_date = None
-        
-        # Try new format first: 2025-12-20_05-57-14_UTC
-        new_match = re.search(r"(\d{4}-\d{2}-\d{2})_(\d{2}-\d{2}-\d{2})_UTC", entry.name)
-        if new_match:
-            try:
-                date_part = new_match.group(1)
-                time_part = new_match.group(2).replace("-", ":")
-                dt_str = f"{date_part}T{time_part}+00:00"
-                dt_utc = datetime.fromisoformat(dt_str)
-                dt_local = dt_utc.astimezone(None)
-                folder_date = dt_local.date()
-            except ValueError:
-                pass
-        
-        # Try legacy format: batch_20251114_073254
-        if folder_date is None:
-            legacy_match = re.search(r"batch_(\d{8}_\d{6})", entry.name)
-            if legacy_match:
-                try:
-                    dt_utc = datetime.strptime(legacy_match.group(1), "%Y%m%d_%H%M%S").replace(tzinfo=timezone.utc)
-                    dt_local = dt_utc.astimezone(None)
-                    folder_date = dt_local.date()
-                except ValueError:
-                    pass
-        
-        # Fallback: Try to extract just a date (YYYY-MM-DD or YYYYMMDD)
-        if folder_date is None:
-            iso_date_match = re.search(r"(\d{4}-\d{2}-\d{2})", entry.name)
-            if iso_date_match:
-                try:
-                    folder_date = datetime.strptime(iso_date_match.group(1), "%Y-%m-%d").date()
-                except ValueError:
-                    pass
-        
-        if folder_date is None:
-            simple_match = re.search(r"(\d{8})", entry.name)
-            if simple_match:
-                try:
-                    folder_date = datetime.strptime(simple_match.group(1), "%Y%m%d").date()
-                except ValueError:
-                    continue
-
-        if folder_date and start_date <= folder_date <= end_date:
-            target_file = os.path.join(entry.path, filename)
-            if os.path.exists(target_file):
-                valid_paths.append(target_file)
-    
-    return sorted(valid_paths)
 
 
 def ingest_csv(path: str, uploaded_file):
@@ -719,7 +562,7 @@ def make_prob_plot(g: pd.DataFrame, expiry_label: str) -> go.Figure:
             )
         )
 
-    model_col = get_column(g, ["p_model_cal", "p_model_fit", "p_real_mc_fit"])
+    model_col = get_column(g, ["p_model_fit", "p_real_mc_fit"])
     if model_col:
         fig.add_trace(
             go.Scatter(
@@ -816,25 +659,54 @@ batch_paths = st.session_state["batch_paths"]
 
 # --- Auto-Load Section ---
 st.sidebar.subheader("Auto-Load Batches")
-auto_load_root = st.sidebar.text_input("Root Directory", "")
 
+BATCH_SOURCE_OPTIONS = {
+    "Live batches (fitted_batch_results)": "fitted_batch_results",
+    "Backtest fitted (backtested_probabilities/fitted)": "backtested_probabilities/fitted",
+    "Backtest unfitted (backtested_probabilities/unfitted)": "backtested_probabilities/unfitted",
+    "Custom path...": "__custom__",
+}
+source_label = st.sidebar.selectbox(
+    "Batch Source",
+    list(BATCH_SOURCE_OPTIONS.keys()),
+    index=0,
+    key="dashboard_batch_source",
+    help="Select where to look for batch CSV files"
+)
+if BATCH_SOURCE_OPTIONS[source_label] == "__custom__":
+    auto_load_root = st.sidebar.text_input("Root Directory", "fitted_batch_results")
+else:
+    auto_load_root = BATCH_SOURCE_OPTIONS[source_label]
+
+use_date_filter = st.sidebar.checkbox("Filter by date range", value=False, key="dashboard_date_filter")
 col1, col2 = st.sidebar.columns(2)
 with col1:
     today = datetime.now().date()
-    default_start = today - timedelta(days=7)
+    default_start = today - timedelta(days=90)
     start_date = st.date_input("From", default_start)
 with col2:
     end_date = st.date_input("To", today)
 
+if not use_date_filter:
+    # Disable date range visually (use wide range for scan)
+    actual_start = datetime(2020, 1, 1).date()
+    actual_end = datetime(2030, 12, 31).date()
+else:
+    actual_start = start_date
+    actual_end = end_date
+
 if st.sidebar.button("Load from Date Range"):
-    found_paths = scan_batch_files(auto_load_root, start_date, end_date)
+    found_paths = scan_batch_files(auto_load_root, actual_start, actual_end)
     if found_paths:
         st.session_state["batch_paths"] = found_paths
-        # Update local ref immediately for this run
-        batch_paths = found_paths 
+        batch_paths = found_paths
         st.sidebar.success(f"Loaded {len(found_paths)} files.")
     else:
-        st.sidebar.warning("No files found in that range.")
+        st.sidebar.warning(
+            f"No files found in `{auto_load_root}`"
+            + (f" from {actual_start} to {actual_end}" if use_date_filter else " (all dates)")
+            + ". Try switching Batch Source or enabling date filter."
+        )
 
 if batch_paths:
     with st.sidebar.expander("View Loaded Files"):
@@ -962,6 +834,27 @@ diag_upload = st.sidebar.file_uploader(
     key="vol_diag_upload",
     help="Attach volatility_diagnostics to power sigma / IV ratios in the Stability tab.",
 )
+
+st.sidebar.subheader("Generation Parameters")
+use_advanced_features = st.sidebar.checkbox(
+    "Advanced Features",
+    value=True,
+    help="Enable SVCJ jumps, skewed-t noise, FIGARCH long-memory variance, regime-switching "
+         "jump calibration, and directional XGBoost. When disabled, uses plain GARCH(1,1)+t "
+         "with hardcoded Kou jumps (µ=0). Turn off for faster/stable baseline; turn on for "
+         "production edge.",
+)
+st.sidebar.caption("─ Generation flags ─")
+adv_use_svcj = st.sidebar.checkbox("SVCJ", value=use_advanced_features, disabled=True,
+    help="Stochastic volatility co-jumps (Eraker 2004)")
+adv_use_skewed_t = st.sidebar.checkbox("Skewed-t", value=use_advanced_features, disabled=True,
+    help="Hansen (1994) skewed-t innovations")
+adv_use_figarch = st.sidebar.checkbox("FIGARCH", value=use_advanced_features, disabled=True,
+    help="Fractionally integrated GARCH long-memory variance")
+adv_use_regime = st.sidebar.checkbox("Regime switching", value=use_advanced_features, disabled=True,
+    help="3-state HMM per-regime jump calibration")
+adv_use_xgb = st.sidebar.checkbox("Directional XGBoost", value=use_advanced_features, disabled=True,
+    help="XGBoost P(up) modifier from macro + BTC features")
 
 st.sidebar.subheader("Strategy Settings")
 auto_reco_enabled = True  # Always enabled
@@ -1137,21 +1030,21 @@ with tabs[0]:
         else:
             col1, col2 = st.columns(2)
             with col1:
-                st.plotly_chart(make_prob_plot(df_exp, selected_expiry), width="stretch")
+                st.plotly_chart(make_prob_plot(df_exp, selected_expiry), use_container_width=True)
             with col2:
-                st.plotly_chart(make_edge_plot(df_exp, auto_reco_min_edge), width="stretch")
+                st.plotly_chart(make_edge_plot(df_exp, auto_reco_min_edge), use_container_width=True)
 
             st.subheader("Trades (filtered)")
             trades = df_exp[df_exp["edge_calc"] >= auto_reco_min_edge].copy().sort_values("edge_calc", ascending=False)
             price_col = get_column(df_exp, ["market_price", "market_pr"])
-            model_col = get_column(df_exp, ["p_model_cal", "p_model_fit", "p_real_mc"])
+            model_col = get_column(df_exp, ["p_model_fit", "p_real_mc"])
             show_cols = ["strike"]
             if price_col:
                 show_cols.append(price_col)
             if model_col:
                 show_cols.append(model_col)
             show_cols.append("edge_calc")
-            st.dataframe(trades[show_cols].rename(columns={"edge_calc": "edge"}), width="stretch")
+            st.dataframe(trades[show_cols].rename(columns={"edge_calc": "edge"}), use_container_width=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1184,7 +1077,7 @@ with tabs[1]:
                 df_contract = df_exp_all[df_exp_all["strike"].astype(float) == float(selected_strike)]
             df_contract = df_contract.sort_values("pricing_date")
             dt_series = safe_to_datetime(df_contract["pricing_date"])
-            model_col = get_column(df_contract, ["p_model_cal", "p_model_fit", "p_real_mc"])
+            model_col = get_column(df_contract, ["p_model_fit", "p_real_mc"])
             fig = go.Figure()
             if model_col:
                 fig.add_trace(
@@ -1222,7 +1115,7 @@ with tabs[1]:
                 template="plotly_white",
                 title="Probability drift over time",
             )
-            st.plotly_chart(fig, width="stretch")
+            st.plotly_chart(fig, use_container_width=True)
     else:
         st.info("Load multiple batch files/dates to enable multi-day stability charts.")
 
@@ -1252,7 +1145,7 @@ with tabs[1]:
             if not selected_expiries:
                 st.warning("Select at least one expiry to overlay.")
             else:
-                model_col = get_column(df_cross, ["p_model_cal", "p_model_fit", "p_real_mc"])
+                model_col = get_column(df_cross, ["p_model_fit", "p_real_mc"])
                 if model_col is None:
                     st.info("Model column missing for this pricing date.")
                 else:
@@ -1280,7 +1173,7 @@ with tabs[1]:
                         template="plotly_white",
                         title="Model probability vs strike (selected pricing dates)",
                     )
-                    st.plotly_chart(fig_overlay, width="stretch")
+                    st.plotly_chart(fig_overlay, use_container_width=True)
 
     # 3) Logistic fit vs raw MC
     st.subheader("Logistic fit vs raw MC")
@@ -1289,7 +1182,7 @@ with tabs[1]:
     exp_fit_opts = sorted(df_fit_root["expiry_key"].unique())
     fit_expiry = st.selectbox("Expiry (fit)", exp_fit_opts, key="fit_expiry")
     df_fit = df_fit_root[df_fit_root["expiry_key"] == fit_expiry].sort_values("strike")
-    model_col = get_column(df_fit, ["p_model_cal", "p_model_fit"])
+    model_col = get_column(df_fit, ["p_model_fit"])
     if df_fit.empty or model_col is None or "p_real_mc" not in df_fit.columns:
         st.info("No logistic fit column (p_model_fit) found — run curve fitting first.")
     else:
@@ -1316,7 +1209,7 @@ with tabs[1]:
             title="Raw MC vs logistic fit",
             template="plotly_white",
         )
-        st.plotly_chart(fig_fit, width="stretch")
+        st.plotly_chart(fig_fit, use_container_width=True)
 
         vals = df_fit[model_col].astype(float).values
         mono_violations = int(np.sum(np.diff(vals) > 1e-6))
@@ -1334,7 +1227,7 @@ with tabs[1]:
     rn_exp_opts = sorted(df_rn_root["expiry_key"].unique())
     rn_expiry = st.selectbox("Expiry (RN)", rn_exp_opts, key="rn_expiry")
     df_rn = df_rn_root[df_rn_root["expiry_key"] == rn_expiry].sort_values("strike")
-    model_col = get_column(df_rn, ["p_model_cal", "p_model_fit", "p_real_mc"])
+    model_col = get_column(df_rn, ["p_model_fit", "p_real_mc"])
     rn_col = get_column(df_rn, ["risk_neutral_prob_fit", "risk_neutral_prob"])
     price_col = get_column(df_rn, ["market_price", "market_pr"])
     if df_rn.empty or model_col is None or rn_col is None or price_col is None:
@@ -1361,7 +1254,7 @@ with tabs[1]:
             title="RN vs Model vs Market",
             template="plotly_white",
         )
-        st.plotly_chart(fig_triangle, width="stretch")
+        st.plotly_chart(fig_triangle, use_container_width=True)
 
         diff_stats = {
             "|Model - RN| mean": np.nanmean(np.abs(df_rn[model_col] - df_rn[rn_col])),
@@ -1386,7 +1279,7 @@ with tabs[1]:
             title="Edge distribution",
         )
         fig_hist.update_layout(xaxis_title="Edge", yaxis_title="Count")
-        st.plotly_chart(fig_hist, width="stretch")
+        st.plotly_chart(fig_hist, use_container_width=True)
         edges = current_df["edge_calc"].dropna()
         if not edges.empty:
             out_of_band = float(((edges < -0.20) | (edges > 0.20)).mean())
@@ -1398,7 +1291,7 @@ with tabs[1]:
     # 6) Monotonicity summary (current date)
     st.subheader("Model Curve Quality")
     st.caption("Checks if model probabilities decrease smoothly as strike prices increase (expected behavior)")
-    model_col = get_column(current_df, ["p_model_cal", "p_model_fit", "p_real_mc"])
+    model_col = get_column(current_df, ["p_model_fit", "p_real_mc"])
     if model_col is None:
         st.info("Model column missing for curve quality check.")
     else:
@@ -1469,7 +1362,7 @@ with tabs[1]:
                     ]
                     if c in ratio_df.columns
                 ]
-                st.dataframe(ratio_df[display_cols], width='stretch')
+                st.dataframe(ratio_df[display_cols], use_container_width=True)
             else:
                 st.info("No sigma/IV data found for the selected expiry; upload matching volatility_diagnostics.csv.")
 
@@ -1495,11 +1388,11 @@ with tabs[2]:
                     title="Regime probabilities",
                     template="plotly_white",
                 )
-                st.plotly_chart(prob_fig, width="stretch")
+                st.plotly_chart(prob_fig, use_container_width=True)
             metric_cols = [c for c in ["var_scale", "tail_scale", "jump_lambda", "jump_sigma"] if c in agg.columns]
             if metric_cols:
                 st.subheader("Per-regime metrics")
-                st.dataframe(agg[["regime"] + metric_cols], width="stretch")
+                st.dataframe(agg[["regime"] + metric_cols], use_container_width=True)
             else:
                 st.info("No variance/tail columns found in regime CSV.")
 
@@ -1527,7 +1420,7 @@ with tabs[2]:
                             title="Mean (model − outcome) per regime",
                             template="plotly_white",
                         )
-                        st.plotly_chart(fig_bias, width="stretch")
+                        st.plotly_chart(fig_bias, use_container_width=True)
                     with col_brier:
                         fig_brier = px.bar(
                             reg_bias_df,
@@ -1536,7 +1429,7 @@ with tabs[2]:
                             title="Brier score per regime",
                             template="plotly_white",
                         )
-                        st.plotly_chart(fig_brier, width="stretch")
+                        st.plotly_chart(fig_brier, use_container_width=True)
                 else:
                     st.info("No regime calibration rows to display.")
         else:
@@ -1646,7 +1539,7 @@ with tabs[3]:
                     barmode="group",
                     template="plotly_white",
                 )
-                st.plotly_chart(fig_rel, width="stretch")
+                st.plotly_chart(fig_rel, use_container_width=True)
 
                 scores = {
                     "Model": brier_score(df_res["p_model_fit_at_trade"], df_res["outcome"]),
@@ -1674,7 +1567,7 @@ with tabs[3]:
                 display_df = df_res[display_cols]
                 if "recorded_at" in display_df.columns:
                     display_df = display_df.sort_values("recorded_at", ascending=False)
-                st.dataframe(display_df, width="stretch", height=350)
+                st.dataframe(display_df, use_container_width=True, height=350)
 
 
 # ---------------------------------------------------------------------------
@@ -1775,7 +1668,7 @@ with tabs[4]:
                 "expiry_group_risk": "Expiry Risk",
                 "notes": "Notes",
             }
-            st.dataframe(table.rename(columns=rename_map), width="stretch")
+            st.dataframe(table.rename(columns=rename_map), use_container_width=True)
 
             chart_df = reco_df.copy()
             chart_df["label"] = chart_df["slug"].fillna(chart_df["question"]).astype(str)
@@ -1788,10 +1681,10 @@ with tabs[4]:
                 template="plotly_white",
             )
             fig_reco.update_layout(xaxis_title="Contract", yaxis_title="Expected Value ($)")
-            st.plotly_chart(fig_reco, width="stretch")
+            st.plotly_chart(fig_reco, use_container_width=True)
 
             st.markdown("### Simulate Today's Recommended Portfolio")
-            prob_col = get_column(reco_df, ["model_prob", "p_model_cal", "p_model_fit", "p_real_mc"])
+            prob_col = get_column(reco_df, ["model_prob", "p_model_fit", "p_real_mc"])
             price_col = get_column(reco_df, ["market_price", "market_pr"])
             side_col = get_column(reco_df, ["side", "polymarket_outcome"])
             stake_col = get_column(reco_df, ["suggested_stake", "stake_dollars", "stake_usd", "raw_stake"])
@@ -1843,7 +1736,7 @@ with tabs[4]:
                             title="Distribution of Final Bankroll (Today's Portfolio)",
                             labels={"value": "Final bankroll"},
                         )
-                        st.plotly_chart(fig_hist_final, width="stretch")
+                        st.plotly_chart(fig_hist_final, use_container_width=True)
 
                         fig_hist_pnl = px.histogram(
                             total_pnl_sim,
@@ -1851,7 +1744,7 @@ with tabs[4]:
                             title="Distribution of PnL (Today's Portfolio)",
                             labels={"value": "PnL ($)"},
                         )
-                        st.plotly_chart(fig_hist_pnl, width="stretch")
+                        st.plotly_chart(fig_hist_pnl, use_container_width=True)
                     except ValueError as sim_err:
                         st.warning(str(sim_err))
 
@@ -1876,7 +1769,7 @@ with tabs[4]:
                     "kelly_eff",
                 ]
                 available = [c for c in diag_cols if c in debug_df.columns]
-                st.dataframe(debug_df[available], width="stretch")
+                st.dataframe(debug_df[available], use_container_width=True)
             else:
                 st.write("No candidate diagnostics available.")
 
@@ -1889,6 +1782,18 @@ with tabs[6]:
     if batch_all_df.empty:
         st.info("Load batch CSVs to enable backtesting.")
     else:
+        st.caption(
+            "Backtests replay pre-priced batch data. SVCJ, Skewed-t, and FIGARCH "
+            "are baked into probabilities at pricing time. This indicator shows "
+            "the feature set used; change via sidebar toggle and re-generate batches."
+        )
+        bt_advanced_features = st.checkbox(
+            "Advanced Features (SVCJ + Skewed-t + FIGARCH)",
+            value=use_advanced_features,
+            disabled=True,
+            help="Matches sidebar Advanced Features toggle. "
+                 "Re-generate batches with updated setting to affect backtest results.",
+        )
         initial_bankroll_bt = st.number_input(
             "Initial bankroll ($)",
             min_value=0.0,
@@ -1994,7 +1899,7 @@ with tabs[6]:
             else:
                 st.caption("'Market Price' shows the price paid for the specific contract side (YES or NO).")
                 st.metric("Settled trades", len(trades_view))
-                st.dataframe(trades_view, width="stretch", height=350)
+                st.dataframe(trades_view, use_container_width=True, height=350)
                 # Equity curve from settled trades only: initial bankroll + cumulative settled PnL
                 if "pricing_date" in trades_view.columns and "pnl" in trades_view.columns:
                     settled_eq = trades_view.sort_values("pricing_date")[["pricing_date", "pnl"]].copy()
@@ -2006,7 +1911,7 @@ with tabs[6]:
                         title="Equity curve (settled trades only)",
                         template="plotly_white",
                     )
-                    st.plotly_chart(eq_fig_settled, width="stretch")
+                    st.plotly_chart(eq_fig_settled, use_container_width=True)
                 
                 # Trades by Expiry
                 st.subheader("Trades by Expiry")
@@ -2031,7 +1936,7 @@ with tabs[6]:
                         expiry_counts = pd.merge(expiry_counts, expiry_pnl, on=group_col)
                     
                     expiry_counts = expiry_counts.sort_values(group_col)
-                    st.dataframe(expiry_counts, width="stretch")
+                    st.dataframe(expiry_counts, use_container_width=True)
                 else:
                     st.info("No expiry date column found to aggregate trades.")
 
@@ -2052,7 +1957,7 @@ with tabs[6]:
                             template="plotly_white",
                         )
                         fig_moneyness.update_layout(bargap=0.1)
-                        st.plotly_chart(fig_moneyness, width="stretch")
+                        st.plotly_chart(fig_moneyness, use_container_width=True)
 
                 # Spearman correlation: trade direction vs momentum_6hr
                 momentum_col = get_column(trades_view, ["momentum_6hr"])
@@ -2103,7 +2008,7 @@ with tabs[6]:
                             )
 
                 # Brier scores on settled trades
-                prob_col = get_column(trades_view, ["p_model_cal", "p_model_fit", "model_prob"])
+                prob_col = get_column(trades_view, ["p_model_fit", "model_prob"])
                 market_col = get_column(trades_view, ["market_price"])
                 outcome_col = get_column(trades_view, ["outcome_yes"])
                 if prob_col and outcome_col:
@@ -2185,7 +2090,7 @@ with tabs[6]:
                         display_agg.columns = ["Model Prob Bin", "# Trades", "Avg Model Prob", "Win Rate", "Avg Edge", "Total Staked ($)", "Total PnL ($)", "Return (%)"]
                         st.subheader("PnL by Model Probability Bin")
                         st.caption("Shows performance breakdown by what the model predicted at time of entry")
-                        st.dataframe(display_agg, width="stretch", hide_index=True)
+                        st.dataframe(display_agg, use_container_width=True, hide_index=True)
                         fig_pnl = px.bar(
                             agg,
                             x="prob_bin",
@@ -2194,7 +2099,7 @@ with tabs[6]:
                             labels={"prob_bin": "Model Probability Bin", "return_on_stake": "Return (%)"},
                             template="plotly_white",
                         )
-                        st.plotly_chart(fig_pnl, width="stretch")
+                        st.plotly_chart(fig_pnl, use_container_width=True)
                     # Reliability diagram (settled trades)
                     if mask.any():
                         bins = np.linspace(0, 1, 11)
@@ -2227,7 +2132,7 @@ with tabs[6]:
                             barmode="group",
                             template="plotly_white",
                         )
-                        st.plotly_chart(fig_rel_bt, width="stretch")
+                        st.plotly_chart(fig_rel_bt, use_container_width=True)
                 
                 # --- Calibration by Model Probability Bin (All Priced Contracts) ---
                 all_priced_bt = st.session_state.get("bt_all_priced")
@@ -2289,7 +2194,7 @@ with tabs[6]:
                             
                             st.subheader("Calibration by Model Probability Bin (All Priced Contracts)")
                             st.caption(f"Shows calibration metrics for ALL {len(ap)} evaluated contracts (not just traded). Calibration Error = Realized YES Rate - Avg Model Prob.")
-                            st.dataframe(display_calib, width="stretch", hide_index=True)
+                            st.dataframe(display_calib, use_container_width=True, hide_index=True)
                             
                             # Bar chart for calibration error
                             fig_calib = px.bar(
@@ -2304,7 +2209,7 @@ with tabs[6]:
                                 color_continuous_midpoint=0,
                             )
                             fig_calib.update_layout(coloraxis_showscale=False)
-                            st.plotly_chart(fig_calib, width="stretch")
+                            st.plotly_chart(fig_calib, use_container_width=True)
                             
                 # ---------------------------------------------------------------
                 # RESIDUAL (MOMENTUM-NEUTRAL) SIGNAL METRICS
@@ -2326,7 +2231,7 @@ with tabs[6]:
                 
                 # Select columns with preference order
                 prob_col_residual = _get_col(all_priced_bt, [
-                    "p_model_cal", "p_model_fit", "p_real_mc", 
+                    "p_model_fit", "p_real_mc",
                     "model_probability", "model_prob_used"
                 ])
                 market_col_residual = _get_col(all_priced_bt, [
@@ -2340,7 +2245,7 @@ with tabs[6]:
                 # Check required columns exist
                 missing_cols = []
                 if prob_col_residual is None:
-                    missing_cols.append("probability (p_model_cal/p_model_fit/...)")
+                    missing_cols.append("probability (p_model_fit/p_real_mc/...)")
                 if market_col_residual is None:
                     missing_cols.append("market YES price (market_yes_price/market_price/...)")
                 if spot_col is None:
@@ -2365,7 +2270,7 @@ with tabs[6]:
                     resid_df["_outcome"] = pd.to_numeric(resid_df[outcome_col_residual], errors="coerce")
                     
                     # Filter to DTE <= 2 (or respect max_dte UI control)
-                    dte_filter_val = max_dte_value if (use_max_dte and 'max_dte_value' in dir()) else 2
+                    dte_filter_val = max_dte_value if use_max_dte else 2
                     dte_filter_val = min(dte_filter_val, 2)  # Cap at 2 for this analysis
                     if dte_col is not None:
                         resid_df["_dte"] = pd.to_numeric(resid_df[dte_col], errors="coerce")
@@ -2528,7 +2433,7 @@ with tabs[6]:
                                     ]
                                 }
                                 results_table = pd.DataFrame(results_data)
-                                st.dataframe(results_table, width="stretch", hide_index=True)
+                                st.dataframe(results_table, use_container_width=True, hide_index=True)
                                 
                                 # Residual lift table (preferred)
                                 st.markdown("**Residual lift by decile (diagnostic):**")
@@ -2544,7 +2449,7 @@ with tabs[6]:
                                             "realized_yes_rate": "Realized YES Rate",
                                             "mean_momentum": "Mean Momentum (6h)",
                                         }),
-                                        width="stretch",
+                                        use_container_width=True,
                                         hide_index=True
                                     )
                                     if top_bottom_lift is not None:
@@ -2555,7 +2460,7 @@ with tabs[6]:
                                 if raw_auc > 0.85:
                                     st.warning(
                                         "Raw AUC is extremely high for a real market. This often indicates leakage or label contamination. "
-                                        "Verify snapshot_time/expiry_time alignment and confirm p_model_cal is not trained on the same outcomes."
+                                        "Verify snapshot_time/expiry_time alignment and confirm p_model_fit (logistic curve) is not fitted on the same outcomes used for evaluation."
                                     )
                                 if top_bottom_lift is not None:
                                     if top_bottom_lift > 0.05:
@@ -2593,7 +2498,7 @@ with tabs[6]:
                     
         elif equity_bt is not None and isinstance(equity_bt, pd.DataFrame) and not equity_bt.empty:
             eq_fig = px.line(equity_bt, x="pricing_date", y="bankroll", title="Equity curve", template="plotly_white")
-            st.plotly_chart(eq_fig, width="stretch")
+            st.plotly_chart(eq_fig, use_container_width=True)
 
 # ---------------------------------------------------------------------------
 # Positions tab
@@ -2655,7 +2560,7 @@ with tabs[5]:
                     template="plotly_white",
                 )
                 fig_pos.update_layout(xaxis_title="Expiry", yaxis_title="Market Value ($)")
-                st.plotly_chart(fig_pos, width="stretch")
+                st.plotly_chart(fig_pos, use_container_width=True)
 
             display_cols = [
                 "slug",
@@ -2690,7 +2595,7 @@ with tabs[5]:
                 "model_prob_latest": "Model Prob (Now)",
                 "notes": "Notes",
             }
-            st.dataframe(pos_df[available_cols].rename(columns=positions_rename), width="stretch")
+            st.dataframe(pos_df[available_cols].rename(columns=positions_rename), use_container_width=True)
             # Highlight any rows that failed to enrich so users can diagnose missing keys.
             if "current_price" in pos_df.columns and "model_prob_latest" in pos_df.columns:
                 missing_mask = pos_df["current_price"].isna() | pos_df["model_prob_latest"].isna()
@@ -2707,7 +2612,7 @@ with tabs[5]:
                         "current_price",
                         "model_prob_latest",
                     ]
-                    st.dataframe(pos_df.loc[missing_mask, [c for c in debug_cols if c in pos_df.columns]], width="stretch")
+                    st.dataframe(pos_df.loc[missing_mask, [c for c in debug_cols if c in pos_df.columns]], use_container_width=True)
 
         current_bankroll = bankroll_sidebar + realized_pnl_total + current_unreal_component
         if bankroll_sidebar > 0:
@@ -2748,7 +2653,7 @@ with tabs[7]:
             if daily_overview.empty:
                 st.info("No stability summary rows available after grouping.")
             else:
-                st.dataframe(daily_overview, width="stretch")
+                st.dataframe(daily_overview, use_container_width=True)
                 daily_metrics = [
                     ("avg_stability_score", "Average stability score over time", "Score (0-100)", "Stability score not available in summary."),
                     (
@@ -2838,7 +2743,7 @@ with tabs[7]:
                                 yaxis_title="Edge",
                                 template="plotly_white",
                             )
-                            st.plotly_chart(fig_edge, width="stretch")
+                            st.plotly_chart(fig_edge, use_container_width=True)
 
                     stats_table = summarize_expiry_metrics(
                         exp_df,
@@ -2851,7 +2756,7 @@ with tabs[7]:
                         ],
                     )
                     if not stats_table.empty:
-                        st.dataframe(stats_table, width="stretch")
+                        st.dataframe(stats_table, use_container_width=True)
                     else:
                         st.info("No numeric metrics available for the selected expiry.")
             else:
@@ -2859,7 +2764,7 @@ with tabs[7]:
 
         st.subheader("Cross-day drift summary")
         if drift_available:
-            st.dataframe(stability_drift_df, width="stretch")
+            st.dataframe(stability_drift_df, use_container_width=True)
             if "avg_drift_model_per_day" in stability_drift_df.columns:
                 fig_drift_model = px.bar(
                     stability_drift_df,
@@ -2868,7 +2773,7 @@ with tabs[7]:
                     title="Average model drift per day",
                     template="plotly_white",
                 )
-                st.plotly_chart(fig_drift_model, width="stretch")
+                st.plotly_chart(fig_drift_model, use_container_width=True)
             if "avg_drift_edge_per_day" in stability_drift_df.columns:
                 fig_drift_edge = px.bar(
                     stability_drift_df,
@@ -2877,7 +2782,7 @@ with tabs[7]:
                     title="Average edge drift per day",
                     template="plotly_white",
                 )
-                st.plotly_chart(fig_drift_edge, width="stretch")
+                st.plotly_chart(fig_drift_edge, use_container_width=True)
         else:
             st.info("Drift summary CSV not loaded; skipping cross-day drift plots.")
 
@@ -2921,7 +2826,7 @@ with tabs[7]:
                     ]
                     if col in bad_rows.columns
                 ]
-                st.dataframe(bad_rows[cols], width="stretch")
+                st.dataframe(bad_rows[cols], use_container_width=True)
                 st.caption(
                     f"Flagged rows where stability_score<{stability_threshold}, "
                     f"monotonic_violation_rate>{violation_threshold}, "
@@ -2957,4 +2862,4 @@ with tabs[7]:
                         yaxis_title="Expiry",
                         template="plotly_white",
                     )
-                    st.plotly_chart(heat_fig, width="stretch")
+                    st.plotly_chart(heat_fig, use_container_width=True)

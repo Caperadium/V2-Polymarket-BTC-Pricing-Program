@@ -121,6 +121,14 @@ def main():
     parser.add_argument("--day-range", nargs=2, type=int, required=True, help="Start and End day (inclusive)")
     parser.add_argument("--num-sims", type=int, default=10000, help="Number of Monte Carlo paths to simulate (default: 10000)")
     parser.add_argument("--min-volume", type=float, default=0.0, help="Minimum volume to process a market (default: 0)")
+    parser.add_argument("--recalibrate-jumps", action="store_true",
+                        help="Calibrate jump parameters from BTC data instead of using hardcoded defaults")
+    parser.add_argument("--advanced-features", action="store_true", default=True,
+                        dest="advanced_features",
+                        help="Enable SVCJ+skewed-t+FIGARCH+regime+XGBoost (default: on)")
+    parser.add_argument("--no-advanced-features", action="store_false",
+                        dest="advanced_features",
+                        help="Disable all advanced features (plain GARCH+t+Kou baseline)")
 
     args = parser.parse_args()
     
@@ -131,18 +139,28 @@ def main():
 
     # 1. Load Data & Fit Model Once
     logger.info("Initializing Pricing Engine...")
-    daily_csv = "DATA/btc_daily.csv"
+    hourly_csv = "DATA/btc_hourly.csv"
     intraday_csv = "DATA/btc_intraday_1m.csv"
-    
+
     try:
-        daily_returns, S0 = load_and_prep_data(daily_csv, intraday_csv)
+        hourly_returns, S0 = load_and_prep_data(hourly_csv, intraday_csv)
     except Exception as e:
         logger.error(f"Error loading data: {e}")
         return
 
     logger.info(f"Data Loaded. S0: {S0}. Fitting GARCH...")
-    garch_params = fit_garch_model(daily_returns)
+    garch_params = fit_garch_model(hourly_returns)
     logger.info(f"Model Fitted: {garch_params}")
+
+    # Optionally calibrate jump parameters from data
+    calibrated_jumps = None
+    if args.recalibrate_jumps:
+        from core.pricing.btc_pricing_engine import load_calibrated_jumps, build_regime_jump_params
+        calibrated_jumps = load_calibrated_jumps(
+            hourly_csv=hourly_csv, force_recalibrate=True,
+        )
+        if calibrated_jumps.get("fit_converged"):
+            logger.info("Using data-calibrated jump parameters")
 
     results = []
 
@@ -234,18 +252,23 @@ def main():
         expiry_utc = data['expiry_utc']
         contracts = data['contracts']
         
-        # Calculate time to expiry
+        # Calculate time to expiry (hours for hourly GARCH simulation)
         delta = expiry_utc - now_utc
-        days_to_expiry = delta.total_seconds() / (24 * 3600)
-        
-        if days_to_expiry <= 0:
+        hours_to_expiry = delta.total_seconds() / 3600
+
+        if hours_to_expiry <= 0:
             logger.warning(f"Expired contracts for {date_key}, skipping.")
             continue
-            
-        logger.info(f"Simulating for {date_key} (T={days_to_expiry:.4f} days)...")
-        
+
+        logger.info(f"Simulating for {date_key} (T={hours_to_expiry:.1f}h)...")
+
         # Simulate Paths
-        paths = simulate_paths(S0, garch_params, jump_params=None, days_to_expiry=days_to_expiry, n_sims=num_sims)
+        paths = simulate_paths(S0, garch_params, jump_params=calibrated_jumps,
+                               hours_to_expiry=hours_to_expiry, n_sims=num_sims,
+                               use_naive_prior=True,
+                               use_svcj=args.advanced_features,
+                               use_skewed_t=args.advanced_features,
+                               use_figarch=args.advanced_features)
         
         # Grade each contract
         for c in contracts:
@@ -262,7 +285,7 @@ def main():
             expiry_et_str = expiry_et.strftime("%b %d %H:%M ET")
             
             # Generate slug from title (lowercase, replace spaces with hyphens)
-            slug = re.sub(r'[^a-z0-9\\-]', '', title.lower().replace(' ', '-').replace('$', '').replace(',', ''))
+            slug = re.sub(r'[^a-z0-9\\-]', '', c['title'].lower().replace(' ', '-').replace('$', '').replace(',', ''))
             
             result_rows.append({
                 # Match prob_backrunner_engine.py output format for compatibility
@@ -270,7 +293,7 @@ def main():
                 'strike': strike,
                 'market_price': poly_price,
                 'p_real_mc': model_prob,  # Use same column name as backrunner
-                'T_days': days_to_expiry,  # Float days to expiry
+                'T_days': hours_to_expiry / 24.0,  # Float days to expiry (backward compat)
                 'date': now_utc,  # Pricing date (when we ran the pricing)
                 'expiry_date': expiry_utc,  # UTC timestamp of expiry
                 # CLOB order book fields (for live price fetching)

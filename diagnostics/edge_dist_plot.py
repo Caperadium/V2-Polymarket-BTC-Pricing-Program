@@ -2,9 +2,8 @@
 Edge Distribution Plot Generator
 
 Analyzes edge distributions across all batch_with_fits.csv files.
-Computes edge = probability - market_yes_price for three probability estimates:
+Computes edge = probability - market_yes_price for two probability estimates:
   - p_model_fit: Fitted logistic model probability
-  - p_model_cal: Calibrated model probability
   - p_real_mc: Raw Monte Carlo probability
 
 Usage:
@@ -67,7 +66,6 @@ def compute_edges(df: pd.DataFrame) -> pd.DataFrame:
     edges = pd.DataFrame()
     prob_columns = {
         "p_model_fit": "Model Fit",
-        "p_model_cal": "Model Calibrated", 
         "p_real_mc": "Raw MC",
     }
     

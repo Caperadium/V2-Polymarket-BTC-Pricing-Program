@@ -53,7 +53,7 @@ python core/strategy/signal_diagnostics.py path/to/all_priced.csv
 ### Programmatic
 
 ```python
-from core.strategy.signal_diagnostics import run_diagnostics
+from core.backtesting.diagnostics import run_diagnostics
 
 run_diagnostics("path/to/all_priced.csv")
 ```

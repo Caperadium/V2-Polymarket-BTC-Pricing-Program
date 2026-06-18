@@ -10,7 +10,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parents[1]))
 
 from unittest.mock import MagicMock, patch
-from scripts.backtesting.backtest_engine import BacktestEngine
+from core.backtesting.backtest_engine import BacktestEngine
 
 # Mock data
 @pytest.fixture
@@ -74,8 +74,8 @@ def test_execute_trades_no_side_inversion():
     # OR just patch internal `_execute_trades` logic? No, we want to test `_execute_trades`.
     # `_execute_trades` calls `recommend_trades`.
     
-    with patch("scripts.backtesting.backtest_engine.recommend_trades") as mock_reco_func, \
-         patch("scripts.backtesting.backtest_engine.recommendations_to_dataframe") as mock_to_df:
+    with patch("core.backtesting.backtest_engine.recommend_trades") as mock_reco_func, \
+         patch("core.backtesting.backtest_engine.recommendations_to_dataframe") as mock_to_df:
              
         mock_to_df.return_value = mock_reco
         
@@ -125,8 +125,8 @@ def test_execute_trades_yes_side_normal():
         "strike": 100000.0,
     }])
     
-    with patch("scripts.backtesting.backtest_engine.recommend_trades"), \
-         patch("scripts.backtesting.backtest_engine.recommendations_to_dataframe") as mock_to_df:
+    with patch("core.backtesting.backtest_engine.recommend_trades"), \
+         patch("core.backtesting.backtest_engine.recommendations_to_dataframe") as mock_to_df:
         
         mock_to_df.return_value = mock_reco
         engine._execute_trades(pd.DataFrame(), pd.Timestamp("2024-12-30", tz="UTC"))

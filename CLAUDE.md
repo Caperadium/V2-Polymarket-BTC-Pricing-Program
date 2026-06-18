@@ -8,8 +8,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 # Run full live pipeline (fetch data → price markets → fit curves)
 python scripts/pipelines/run_full_pipeline.py --slug-pattern "bitcoin-above-on-december-{}" --day-range 1 31
 
-# Run backtest engine across historical market data
+# Fetch/refresh BTC price data (run BEFORE backtesting)
+python core/data/data_fetcher.py
+
+# Run historical backrunner (time-travel MC pricing)
+python core/backtesting/backrunner.py --limit 10
+
+# Run backrunner via old path (deprecation shim — forwards to core.backtesting)
 python scripts/backtesting/prob_backrunner_engine.py --skip-data-fetch --limit 10
+
+# Run full backtesting pipeline (fetch → backrun → fit → backtest → diagnostics)
+python -c "from core.backtesting import BacktestingOrchestrator; o = BacktestingOrchestrator(); print(o.run_full())"
 
 # CLI trade recommendation from latest fitted batch
 python core/strategy/auto_reco.py --bankroll 1000 --min-edge 0.06 --kelly-fraction 0.15
@@ -25,16 +34,14 @@ streamlit run app/dashboard.py
 streamlit run app/pages/polymarket_console.py
 
 # Signal diagnostics (Spearman + AUC between edge and outcomes)
-python core/strategy/signal_diagnostics.py path/to/all_priced.csv
+python core/backtesting/diagnostics.py path/to/all_priced.csv
+python core/strategy/signal_diagnostics.py path/to/all_priced.csv  # deprecation shim
 
 # Edge distribution plots
 python diagnostics/edge_dist_plot.py
 
 # Run pricing engine validation tests
 python core/pricing/btc_pricing_engine.py
-
-# Fetch/refresh BTC price data
-python core/data/data_fetcher.py
 
 # Vol gate (standalone risk signal)
 python core/strategy/vol_gate.py --file DATA/btc_intraday_1m.csv
@@ -55,9 +62,17 @@ mkdocs serve
 │   ├── dashboard.py              #   Main 8-tab monitoring dashboard
 │   └── pages/
 │       ├── backtesting.py        #   Backtesting page
-│       ├── polymarket_console.py #   Trade execution operator console
-│       └── polymarket_console_fixed.py
+│       └── polymarket_console.py #   Trade execution operator console
 ├── core/                         # Domain logic (no scripts/pipelines)
+│   ├── backtesting/              #   Unified backtesting module
+│   │   ├── __init__.py           #     Public API exports
+│   │   ├── contract_store.py     #     CSV store for historical Polymarket prices
+│   │   ├── polymarket_fetcher.py #     Gamma + CLOB API data fetching
+│   │   ├── batch_loader.py       #     Batch CSV normalization & scanning
+│   │   ├── backrunner.py         #     Time-travel MC pricing engine
+│   │   ├── backtest_engine.py    #     Chronological backtest simulation
+│   │   ├── diagnostics.py        #     Spearman/AUC/DTE signal diagnostics
+│   │   └── orchestrator.py       #     Full pipeline: fetch → backrun → fit → backtest
 │   ├── data/
 │   │   ├── data_fetcher.py       #   Binance BTC data download
 │   │   └── positions.py          #   CSV-based position ledger
@@ -69,12 +84,12 @@ mkdocs serve
 │       ├── BH_auto_reco.py       #   Previous auto_reco (pre-refactor backup)
 │       ├── common.py             #   Shared types, constants (TargetPosition, TargetRole)
 │       ├── vol_gate.py           #   BTC volatility risk gate
-│       └── signal_diagnostics.py #   Spearman/AUC analysis
+│       └── signal_diagnostics.py #   Deprecation shim → core.backtesting.diagnostics
 ├── scripts/                      # Executable scripts & pipelines
 │   ├── backtesting/
-│   │   ├── backtest_engine.py    #   Chronological simulation engine
+│   │   ├── backtest_engine.py    #   Deprecation shim → core.backtesting.backtest_engine
 │   │   ├── backtest_montecarlo_sim.py # Shuffle tests (expiry-only & decile-conditioned)
-│   │   └── prob_backrunner_engine.py  # Time-travel backtest orchestrator
+│   │   └── prob_backrunner_engine.py  # Deprecation shim → core.backtesting.backrunner
 │   ├── pipelines/
 │   │   ├── run_full_pipeline.py  #   Full pipeline: fetch → price → fit
 │   │   └── batch_pricing_runner.py   # Live Polymarket batch pricing
@@ -123,7 +138,7 @@ GARCH(1,1) + Student-t + Kou Double Exponential Jump Diffusion Monte Carlo simul
 ### Column Name Precedence Conventions
 
 The codebase uses flexible column detection with `_pick_column()` / `get_column()` fallback chains. Critical conventions:
-- **Model probability**: `p_model_cal` > `p_model_fit` > `p_real_mc` > `model_probability`
+- **Model probability**: `p_model_fit` > `p_real_mc` > `model_probability`
 - **Market price**: `market_price` > `market_pr` > `Polymarket_Price`
 - **Expiry**: `expiry_key` (derived from `expiry_date` string), `T_days` as float
 - **Edge**: computed as `model_prob - market_price` (YES edge) or `market_price - model_prob` (NO edge)
@@ -133,9 +148,27 @@ The codebase uses flexible column detection with `_pick_column()` / `get_column(
 
 Two output paths produce batch CSVs in the same format (`slug, strike, market_price, p_real_mc, T_days, date, expiry_date`):
 1. **Live mode**: `scripts/pipelines/batch_pricing_runner.py` → `batch_results/<timestamp_UTC>/batch_results.csv` → `fitted_batch_results/<timestamp_UTC>/batch_with_fits.csv`
-2. **Backtest mode**: `scripts/backtesting/prob_backrunner_engine.py` → `backtested_probabilities/unfitted/batch_<YYYYMMDD_HHMMSS>.csv` → `backtested_probabilities/fitted/batch_<YYYYMMDD_HHMMSS>/batch_with_fits.csv`
+2. **Backtest mode**: `core/backtesting/backrunner.py` → `backtested_probabilities/unfitted/batch_<YYYYMMDD_HHMMSS>.csv` → `backtested_probabilities/fitted/batch_<YYYYMMDD_HHMMSS>/batch_with_fits.csv`
 
-The backtest mode does "time-travel" — at each timestamp it truncates BTC data to what was available then, runs fresh MC simulations, and saves results. `fit_probability_curves.py` runs logistic curve fitting on both paths (called internally by both runners).
+The backtest mode does "time-travel" — at each timestamp it truncates BTC data to what was available then, runs fresh MC simulations, and saves results. Market contract prices are aligned to midnight UTC to match CLOB daily candle timestamps. `fit_probability_curves.py` runs logistic curve fitting on both paths (called internally by both runners).
+
+### Unified Backtesting Module (`core/backtesting/`)
+
+Consolidates previously scattered backtesting logic into a single module. The orchestrator chains: fetch historical prices → time-travel MC pricing → curve fitting → backtest simulation → signal diagnostics.
+
+**Components**:
+
+- `ContractPriceStore` — Disk-backed CSV store for historical Polymarket contract prices (7-column schema: `slug, clobTokenId, date, price, resolution, strike, expiry_date`). Deduplication on `(clobTokenId, date)` composite key.
+- `polymarket_fetcher.py` — Fetches closed `bitcoin-above` markets from Gamma API (`/markets?closed=true`) and daily price candles from CLOB API (`/prices-history`). Handles stale-data refresh (re-fetches unresolved contracts with >1 day gap) and rate limiting (200ms delay, exponential backoff on 429).
+- `batch_loader.py` — Canonical batch CSV normalization (`model_probability → p_model_fit`, timestamp parsing). Extracted from duplicated dashboard copies.
+- `BackrunnerEngine` — Time-travel MC pricing loop. At each historical timestamp, truncates BTC data, runs `calculate_probabilities()` for active contracts, writes batch CSVs to `unfitted_dir`. Disk-native streaming (no in-memory accumulation). Idempotent (skips existing files).
+- `BacktestEngine` — Chronological backtest: sorts batches → settles expired positions → executes trades via `recommend_trades()`. Tracks all priced contracts for shuffle tests. Moved from `scripts/backtesting/`.
+- `SignalDiagnostics` — Spearman/AUC between edge and outcome, with DTE and moneyness breakdowns. Returns structured dict for dashboard consumption. Absorbed from `core/strategy/signal_diagnostics.py`.
+- `BacktestingOrchestrator` — Single entry point chaining all stages. `run_full()` returns dict: `{new_records, unfitted_dir, fitted_dir, trades_df, equity_df, all_priced_df, diagnostics}`.
+
+**Deprecation shims**: Old files (`scripts/backtesting/prob_backrunner_engine.py`, `scripts/backtesting/backtest_engine.py`, `core/strategy/signal_diagnostics.py`) emit `DeprecationWarning` and forward to the new module. Parameter sweep imports updated to use `core.backtesting.*` paths.
+
+**Historical contract prices**: Fetched from Polymarket APIs (not manually built CSV). Store at `DATA/historical_contract_prices.csv`. BTC data fetch (`data_fetcher.py`) must be run manually — no longer auto-triggered by backrunner.
 
 ### Strategy Layer (`core/strategy/auto_reco.py`)
 
@@ -182,7 +215,7 @@ Integrated into `auto_reco.py` Stage 3 as final risk gate.
 
 `SweepConfig` dataclass is the single source of truth for all 24 strategy parameters. Used by both `app/dashboard.py` sidebar and `scripts/utilities/parameter_sweep.py`. Parameters include: edge thresholds, Kelly fraction, bet limits, price/probability filters, DTE/moneyness filters, probability threshold mode, stability penalty, fixed stake, correlation penalty. Located at repo root for shared import convenience.
 
-### Backtesting (`scripts/backtesting/backtest_engine.py`)
+### Backtesting (`core/backtesting/backtest_engine.py`, was `scripts/backtesting/backtest_engine.py`)
 
 `BacktestEngine` class runs chronological simulation:
 1. Sort batches by timestamp
@@ -223,7 +256,8 @@ CSV-based (not SQLite) position ledger. Key functions:
 ### Key Data Files
 
 - `DATA/btc_daily.csv`, `DATA/btc_intraday_1m.csv` — fetched by `data_fetcher.py`
-- `old_market_prices.csv` — historical Polymarket prices for backtesting
+- `DATA/historical_contract_prices.csv` — Polymarket contract prices (fetched by `polymarket_fetcher.py`, stored by `ContractPriceStore`)
+- `old_market_prices.csv` — historical Polymarket prices for backtesting (legacy, being replaced by `historical_contract_prices.csv`)
 - `positions.csv` — live trading position ledger
 - `resolved_markets.csv` — logged outcomes for calibration
 
@@ -250,6 +284,7 @@ parameter_sweeps/
 - **CSV-based state**: No database for positions or batch data; everything is CSV files on disk (except Polymarket execution state which uses SQLite)
 - **Idempotent backtest steps**: Backtest runner skips already-processed timestamps
 - **Vol gate as standalone module**: Volatility risk can be computed independently and tested in isolation, then plugged into the strategy pipeline
+- **Deprecation shims**: Old module paths preserved as forwarding imports with `DeprecationWarning` to avoid breaking imports during migration
 
 ## Change Logging & Documentation
 After completing a task, do the following:

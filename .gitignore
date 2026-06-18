@@ -52,5 +52,8 @@ Thumbs.db
 # Jupyter
 .ipynb_checkpoints/
 
+# Journal articles (large PDFs, not part of source)
+Journal Articles/
+
 # Logs
 *.log

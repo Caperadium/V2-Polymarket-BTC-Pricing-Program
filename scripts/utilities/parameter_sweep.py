@@ -57,8 +57,8 @@ from sweep_config import (
     parse_parameter_value,
     validate_parameter_name,
 )
-from backtest_engine import BacktestEngine
-from backtest_montecarlo_sim import run_shuffle_test, get_summary_stats, run_decile_conditioned_shuffle_test
+from core.backtesting.backtest_engine import BacktestEngine
+from scripts.backtesting.backtest_montecarlo_sim import run_shuffle_test, get_summary_stats, run_decile_conditioned_shuffle_test
 
 
 # Configure logging - suppress INFO to keep output clean
@@ -392,7 +392,7 @@ def run_single_sweep(
         
         # Reset threshold debug accumulator for this run
         try:
-            from auto_reco import reset_threshold_debug
+            from core.strategy.auto_reco import reset_threshold_debug
             reset_threshold_debug()
         except Exception:
             pass
@@ -420,7 +420,7 @@ def run_single_sweep(
         
         # Log probability threshold debug info if available
         try:
-            from auto_reco import LAST_RECO_THRESHOLD_DEBUG
+            from core.strategy.auto_reco import LAST_RECO_THRESHOLD_DEBUG
             if LAST_RECO_THRESHOLD_DEBUG is not None:
                 log(f"Prob threshold debug: YES(passed_prob_no_edge={LAST_RECO_THRESHOLD_DEBUG.get('yes_passed_prob_no_edge', 0)}, "
                     f"passed_all={LAST_RECO_THRESHOLD_DEBUG.get('yes_passed_all', 0)}), "

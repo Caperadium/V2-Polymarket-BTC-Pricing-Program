@@ -2,15 +2,14 @@
 
 `core/pricing/fit_probability_curves.py`
 
-After the pricing engine simulates raw probabilities per contract, logistic curves are fitted to smooth the probability-vs-strike relationship and enable calibration.
+After the pricing engine simulates raw probabilities per contract, logistic curves are fitted to smooth the probability-vs-strike relationship and provide a clean probability surface.
 
 ## Why Curve Fitting?
 
 Raw Monte Carlo probabilities contain simulation noise. Fitting a logistic curve per expiry:
 
 1. **Smooths noise** — enforces monotonicity (higher strike → lower probability)
-2. **Enables calibration** — systematic bias can be corrected via logit shift
-3. **Extracts structure** — curve parameters (slope `a`, midpoint `b`) reveal market shape
+2. **Extracts structure** — curve parameters (slope `a`, midpoint `b`) reveal market shape
 
 ## Logistic Model
 
@@ -41,16 +40,6 @@ The gap between these curves is the **edge**:
 edge_vs_market_fit = p_model_fit - market_price
 ```
 
-## Logit-Shift Calibration
-
-After fitting, a global calibration shift is applied:
-
-$$p_{cal} = \sigma\left(\text{logit}(p_{fit}) + B\right)$$
-
-With a fixed shift $B = -0.7$ (`PROB_LOGIT_SHIFT_B`).
-
-This **uniformly pushes probabilities downward** without inflating low probabilities (unlike symmetric shrink-to-0.5). The shift is applied in logit space to preserve monotonicity.
-
 ## Column Output
 
 The processed CSV adds these columns:
@@ -59,7 +48,6 @@ The processed CSV adds these columns:
 |--------|-------------|
 | `p_model_fit` | Logistic-smoothed model probability |
 | `p_rn_fit` | Logistic-smoothed risk-neutral probability |
-| `p_model_cal` | Calibrated model probability (logit-shifted) |
 | `edge_vs_market_fit` | Fitted model prob − market price |
 | `edge_vs_rn_fit` | Fitted model prob − fitted RN prob |
 
@@ -78,8 +66,7 @@ process_batch(
 1. Group contracts by expiry date (or `T_days` if no date column)
 2. For each group, fit two logistic curves via `scipy.optimize.curve_fit`
 3. Evaluate fitted curves at original strikes
-4. Apply logit-shift calibration
-5. Save augmented contract CSV + per-expiry curve params CSV
+4. Save augmented contract CSV + per-expiry curve params CSV
 
 ## Curve Params Output
 

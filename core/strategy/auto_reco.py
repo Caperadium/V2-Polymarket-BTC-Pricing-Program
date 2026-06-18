@@ -412,7 +412,7 @@ def build_targets(
     data["expiry_key"] = _derive_expiry_key(data)
     
     price_col = _pick_column(data, ["market_price", "market_pr", "Polymarket_Price"])
-    model_col = _pick_column(data, ["p_model_cal", "p_model_fit", "p_real_mc", "model_probability", "Model_Prob"])
+    model_col = _pick_column(data, ["p_model_fit", "p_real_mc", "model_probability", "Model_Prob"])
     
     if price_col is None or model_col is None:
         logger.error("Batch file missing market_price or model probability columns")

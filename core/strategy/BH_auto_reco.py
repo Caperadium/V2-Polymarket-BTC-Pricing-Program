@@ -210,7 +210,7 @@ def recommend_trades(
     expiry_series = _derive_expiry_key(data)
     price_col = _pick_column(data, ["market_price", "market_pr", "Polymarket_Price"])
     # Prefer raw Monte Carlo probability, fallback to fitted or calibrated
-    model_col = _pick_column(data, ["p_real_mc", "p_model_fit", "p_model_cal", "model_probability", "Model_Prob"])
+    model_col = _pick_column(data, ["p_real_mc", "p_model_fit", "model_probability", "Model_Prob"])
     # Prefer fitted RN/market curve, fallback to raw RN probability
     rn_col = _pick_column(data, ["p_rn_fit", "risk_neutral_prob_fit", "risk_neutral_prob"])
     pricing_col = _pick_column(data, ["pricing_date", "date", "as_of_date"])

@@ -303,7 +303,7 @@ def _compute_edge_magnitude(
         Series of abs(edge) values, with inf replaced by NaN
     """
     if prob_col is None:
-        prob_col = _find_column(df, ["model_prob_used", "model_prob", "p_model_cal", "p_model_fit"])
+        prob_col = _find_column(df, ["model_prob_used", "model_prob", "p_model_fit"])
     if price_col is None:
         price_col = _find_column(df, ["market_yes_price", "market_price"])
     
@@ -332,7 +332,7 @@ def _compute_edge_magnitude_for_trades(
         Series of abs(edge) values, with inf replaced by NaN
     """
     # Find probability column
-    prob_col = _find_column(df, ["model_prob", "model_prob_used", "p_model_cal", "p_model_fit"])
+    prob_col = _find_column(df, ["model_prob", "model_prob_used", "p_model_fit"])
     # ALWAYS use market_price (the YES price), not entry_price
     price_col = _find_column(df, ["market_price", "market_yes_price"])
     
@@ -429,7 +429,8 @@ def run_decile_conditioned_shuffle_test(
         required_all_cols.append(snapshot_col)
     
     # Add probability and price columns for edge computation
-    prob_col_all = _find_column(all_priced_df, ["model_prob_used", "model_prob", "p_model_cal"])
+    # all_priced_df is unfitted; p_model_fit not expected. Fall through to raw columns.
+    prob_col_all = _find_column(all_priced_df, ["model_prob_used", "model_prob"])
     price_col_all = _find_column(all_priced_df, ["market_yes_price", "market_price"])
     
     if prob_col_all is None or price_col_all is None:
