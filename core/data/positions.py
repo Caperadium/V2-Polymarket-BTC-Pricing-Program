@@ -271,8 +271,12 @@ def enrich_positions_with_batch(
 
 def ensure_position_keys(df: pd.DataFrame) -> pd.DataFrame:
     """Ensure a stable position_key exists for joining across files."""
-    if df is None or df.empty:
-        return df.copy() if df is not None else pd.DataFrame()
+    if df is None:
+        return pd.DataFrame()
+    if df.empty:
+        df = df.copy()
+        df["position_key"] = np.nan
+        return df
 
     def _key(row: pd.Series) -> str:
         slug = str(row.get("slug") or "").strip()
