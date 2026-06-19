@@ -34,18 +34,19 @@ Apply regime-specific scaling to jump parameters for regime-conditional pricing.
 
 ### `skewed_t_rvs(nu, lam, size, rng)`
 
-Generate Hansen (1994) skewed-t random variates. Inverse-transform sampling from standard-t base.
+Generate Hansen (1994) **standardized** skewed-t variates (mean 0, variance 1 by construction) via inverse-CDF sampling: draw U~Uniform(0,1), invert the standardized-t quantile within the left ((1−λ)/2 mass) / right ((1+λ)/2 mass) piece, then map with Hansen's a, b constants. λ<0 ⇒ heavier left tail (negative skew). `skewed_t_scale_factor()` returns 1.0 (the variate is already standardized; no external rescale).
 
-### `_compute_figarch_weights(d, trunc_k=100)`
+### `_compute_figarch_weights(d, beta, trunc_k=1000)`
 
-Compute FIGARCH binomial expansion weights for long-memory variance recursion.
+Compute FIGARCH(1,d,1) infinite-AR weights for the variance recursion. Two-step process: (1) binomial weights λ_k for (1-L)^d via recurrence, (2) convolve with (1-βL)⁻¹ to produce ψ_k filter. Output ψ_0=0, ψ_k = -(λ_k + β·ψ_{k-1}) for k≥1. `fit_garch_model()` applies a Bollerslev-Mikkelsen non-negativity check on the resulting ψ_k and **falls back to GARCH** (warning) if any k≥1 weight is negative — the default Siu d=0.578 estimate fails this, so FIGARCH is effectively off by default.
 
 ## Feature Flags
 
 | Flag | Default | Phase | Description |
 |------|---------|-------|-------------|
 | `use_naive_prior` | `True` | 1.1 | Enforce μ=0 in GARCH |
-| `use_svcj` | `False` | 1.3 | Correlated volatility jumps |
+| `martingale_anchor` | `False` | — | Use exponential-cumulant jump compensator `λ·(E[e^J]−1)` (true risk-neutral martingale). Default False keeps the legacy log-mean compensator `λ·E[J]`; flip only with calibration re-baseline. |
+| `use_svcj` | `False` | 1.3 | Correlated volatility jumps (Eraker 2004: return + variance jump on the same Poisson count `k`) |
 | `use_skewed_t` | `False` | 1.4 | Hansen skewed-t innovations |
 | `use_figarch` | `False` | 2.5 | FIGARCH long-memory variance |
 | `use_regime_switching` | `False` | 1.2 | HMM regime detection |

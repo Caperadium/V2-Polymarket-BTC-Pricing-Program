@@ -499,7 +499,7 @@ def fetch_incremental_prices(
         session = _build_session()
 
     store.load()
-    known_ids: Set[str] = store.get_known_clob_token_ids()
+    known_ids, token_max_dates = store.build_token_index()
     now = datetime.now(timezone.utc)
 
     # --- discover all relevant markets ---
@@ -528,16 +528,20 @@ def fetch_incremental_prices(
         if is_new:
             should_fetch = True
         else:
-            max_stored = store.get_clob_token_max_date(clob_id)
+            max_stored = token_max_dates.get(clob_id)
             close_time = _parse_close_time(market.get("closeTime"))
-            if close_time is None:
-                should_fetch = True  # can't determine; refetch
-            elif max_stored is None:
-                should_fetch = True
-            else:
+            if max_stored is None:
+                should_fetch = True  # known ID but no stored rows — refetch
+            elif close_time is not None:
+                # Normal path: only refetch if contract is still open and data stale
                 gap_days = (now - max_stored).days
-                if max_stored < close_time and gap_days > STALENESS_DAYS:
+                if close_time > now and max_stored < close_time and gap_days > STALENESS_DAYS:
                     should_fetch = True
+            else:
+                # closeTime missing from API metadata — use stored recency only
+                gap_days = (now - max_stored).days
+                if gap_days > STALENESS_DAYS * 2:
+                    should_fetch = True  # data is clearly stale, refetch as safety measure
 
         if not should_fetch:
             if progress_callback:
@@ -654,7 +658,10 @@ def _parse_close_time(raw: Optional[str]) -> Optional[datetime]:
     try:
         # Try ISO-8601
         if "T" in str(raw):
-            return datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+            dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt
         # Unix timestamp (seconds)
         ts = int(raw)
         return datetime.fromtimestamp(ts, tz=timezone.utc)

@@ -3,8 +3,8 @@
 data_fetcher.py
 
 Download BTC historical data for the pricing engine:
-- 5 years of daily closes from CoinGecko
-- ~3 months of 1-minute candles from Binance
+- 5 years of daily closes from Binance
+- ~2 years of 1-minute candles from Binance (730 days)
 
 Outputs are stored under DATA/ and overwrite previous files.
 """
@@ -138,7 +138,7 @@ def fetch_hourly(days=1825, symbol="BTCUSDT", interval="1h", throttle=0.5):
     print(f"Saved {len(rows)} hourly rows to {HOURLY_PATH} (Binance, {fetches} calls)")
 
 
-def fetch_intraday(days=90, symbol="BTCUSDT", interval="1m", throttle=0.5):
+def fetch_intraday(days=730, symbol="BTCUSDT", interval="1m", throttle=0.5):
     """Download high-frequency BTC candles from Binance.
     
     Uses incremental fetching: if data already exists, only fetches new data
@@ -181,6 +181,25 @@ def fetch_intraday(days=90, symbol="BTCUSDT", interval="1m", throttle=0.5):
             last_timestamp_ms = None
     
     # Decide fetch strategy
+    # Earliest-timestamp gate: if the file's first bar is too recent (past
+    # start_cutoff), the incremental path won't backfill the missing range
+    # — force a full re-fetch instead.
+    if existing_rows and last_timestamp_ms and last_timestamp_ms > start_cutoff:
+        try:
+            first_ts_str = existing_rows[0][0]
+            first_dt = datetime.fromisoformat(first_ts_str.replace('Z', '+00:00'))
+            first_ts_ms = int(first_dt.timestamp() * 1000)
+            if first_ts_ms > start_cutoff:
+                print(
+                    f"Earliest intraday timestamp {first_dt.isoformat()} "
+                    f"is after requested start — forcing full re-fetch"
+                )
+                existing_rows = []
+                last_timestamp_ms = None
+        except (ValueError, IndexError):
+            existing_rows = []
+            last_timestamp_ms = None
+
     if last_timestamp_ms and last_timestamp_ms > start_cutoff:
         # Incremental fetch: start from last timestamp + 1 minute
         fetch_start = last_timestamp_ms + interval_ms

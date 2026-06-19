@@ -13,17 +13,28 @@ Key design decisions (preserved from original):
   - All timestamps normalized to UTC
   - Disk-native streaming write (each batch → one CSV, no in-memory accumulation)
 
+Parallelism (v2):
+  - ProcessPoolExecutor with per-worker data loading via initializer
+  - BLAS thread suppression (OMP/MKL/OPENBLAS/NUMEXPR=1) per worker
+  - Deterministic per-timestamp seeds via hashlib.md5
+  - S0 daily-close fallback pre-computed in main process
+  - Progress callback stays in main process via as_completed() loop
+
 Usage:
     python core/backtesting/backrunner.py --limit 10
-    python core/backtesting/backrunner.py --skip-data-fetch --limit 5 --n-sims 5000
+    python core/backtesting/backrunner.py --limit 10 --workers 8
+    python core/backtesting/backrunner.py --serial --limit 5 --n-sims 5000
 """
 
 import argparse
+import hashlib
 import logging
+import os
 import sys
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -33,15 +44,205 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from core.pricing.btc_pricing_engine import calculate_probabilities
-
 logger = logging.getLogger(__name__)
 
-# Directories
-DATA_DIR = Path("DATA")
-OUTPUT_ROOT = Path("backtested_probabilities")
+# Directories — resolved relative to this file so CWD doesn't matter (Streamlit, etc.)
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+DATA_DIR = _PROJECT_ROOT / "DATA"
+OUTPUT_ROOT = _PROJECT_ROOT / "backtested_probabilities"
 UNFITTED_DIR = OUTPUT_ROOT / "unfitted"
 FITTED_DIR = OUTPUT_ROOT / "fitted"
+
+# ---------------------------------------------------------------------------
+# Worker globals — populated by _init_worker() in each spawned process
+# ---------------------------------------------------------------------------
+
+_worker_daily: Optional[pd.DataFrame] = None
+_worker_intraday: Optional[pd.DataFrame] = None
+_worker_hourly: Optional[pd.DataFrame] = None
+
+
+def _init_worker(data_dir: str) -> None:
+    """Worker process initializer: suppress BLAS threads, load BTC data.
+
+    Called once per spawned process BEFORE any work items are dispatched.
+    Sets OMP/MKL/OPENBLAS/NUMEXPR thread count to 1 so N workers don't
+    each spawn M BLAS threads and thrash the CPU.
+
+    Parameters
+    ----------
+    data_dir : str
+        Path to the DATA/ directory containing BTC CSV files.
+    """
+    # ---- BLAS thread suppression (must be set before any numpy compute) ----
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"
+    os.environ["NUMEXPR_NUM_THREADS"] = "1"
+
+    global _worker_daily, _worker_intraday, _worker_hourly
+
+    data_path = Path(data_dir)
+
+    # --- daily ---
+    daily_path = data_path / "btc_daily.csv"
+    daily_df = pd.read_csv(daily_path)
+    daily_col_map = {c.lower(): c for c in daily_df.columns}
+    date_col = daily_col_map.get("date", daily_col_map.get("timestamp"))
+    if date_col is None:
+        raise ValueError("Daily CSV missing 'date' or 'timestamp' column")
+    daily_df["datetime"] = pd.to_datetime(daily_df[date_col], utc=True)
+    _worker_daily = daily_df.set_index("datetime").sort_index()
+
+    # --- intraday ---
+    intraday_path = data_path / "btc_intraday_1m.csv"
+    intraday_df = pd.read_csv(intraday_path)
+    intra_col_map = {c.lower(): c for c in intraday_df.columns}
+    ts_col = intra_col_map.get(
+        "timestamp", intra_col_map.get("date", intra_col_map.get("datetime"))
+    )
+    if ts_col is None:
+        raise ValueError("Intraday CSV missing 'Timestamp' column")
+    intraday_df["datetime"] = pd.to_datetime(intraday_df[ts_col], utc=True)
+    _worker_intraday = intraday_df.set_index("datetime").sort_index()
+
+    # --- hourly ---
+    hourly_path = data_path / "btc_hourly.csv"
+    if hourly_path.exists():
+        hourly_df = pd.read_csv(hourly_path)
+        hourly_col_map = {c.lower(): c for c in hourly_df.columns}
+        h_date_col = hourly_col_map.get("date", hourly_col_map.get("timestamp"))
+        if h_date_col is not None:
+            hourly_df["datetime"] = pd.to_datetime(hourly_df[h_date_col], utc=True)
+            _worker_hourly = hourly_df.set_index("datetime").sort_index()
+
+
+def _process_one(item: Dict[str, Any]) -> Optional[str]:
+    """Process a single timestamp — runs in worker process.
+
+    Parameters
+    ----------
+    item : dict
+        Work item dict with keys: ts_str, ts_iso, ts_date, contracts,
+        s0_from_daily, output_path, seed, n_sims, advanced_features.
+
+    Returns
+    -------
+    str or None
+        ts_str on success (batch CSV written), None on skip/failure.
+    """
+    # Lazy import inside worker so it picks up BLAS-suppressed env
+    from core.pricing.btc_pricing_engine import calculate_probabilities
+
+    ts_str: str = item["ts_str"]
+    ts_iso: str = item["ts_iso"]
+    ts_date_str: str = item["ts_date"]
+    contracts: List[Dict[str, Any]] = item["contracts"]
+    s0_from_daily: Optional[float] = item["s0_from_daily"]
+    output_path: str = item["output_path"]
+    seed: int = item["seed"]
+    n_sims: int = item["n_sims"]
+    advanced_features: bool = item["advanced_features"]
+
+    ts_dt = pd.Timestamp(ts_iso)
+    ts_date_dt = pd.Timestamp(ts_date_str)
+
+    # ---- truncate intraday data ----
+    intraday_slice = _worker_intraday[_worker_intraday.index <= ts_dt]
+    if intraday_slice.empty:
+        if s0_from_daily is None:
+            logger.warning("Skipping %s: no intraday or daily data available", ts_str)
+            return None
+        intraday_for_engine = pd.DataFrame({"close": [s0_from_daily]})
+    else:
+        intraday_for_engine = intraday_slice.reset_index(drop=True)
+
+    # ---- truncate hourly data for GARCH ----
+    if _worker_hourly is None or _worker_hourly.empty:
+        logger.warning(
+            "Skipping %s: no hourly data available for GARCH fitting", ts_str
+        )
+        return None
+
+    hourly_slice = _worker_hourly[
+        _worker_hourly.index.tz_localize(None).normalize() <= ts_date_dt
+    ]
+    if len(hourly_slice) < 500:
+        logger.warning(
+            "Skipping %s: insufficient hourly data (%d rows, need >=500)",
+            ts_str, len(hourly_slice),
+        )
+        return None
+    hourly_for_engine = hourly_slice.reset_index(drop=True)
+
+    # ---- validate contracts ----
+    contracts_df = pd.DataFrame(contracts)
+    if contracts_df.empty:
+        return None
+
+    # ---- group by expiry_date and price each group ----
+    results: List[Dict[str, Any]] = []
+
+    for expiry, group in contracts_df.groupby("expiry_date"):
+        try:
+            expiry_dt = pd.to_datetime(expiry, utc=True)
+            hours_to_expiry = max(
+                (expiry_dt - ts_dt).total_seconds() / 3600, 0.001
+            )
+        except Exception:
+            logger.warning("Could not parse expiry date: %s", expiry)
+            continue
+
+        if hours_to_expiry <= 0:
+            logger.debug(
+                "Skipping expired group: expiry=%s, hours=%.1f",
+                expiry, hours_to_expiry,
+            )
+            continue
+
+        group_strikes = group["strike"].unique().tolist()
+
+        try:
+            probs = calculate_probabilities(
+                strikes=group_strikes,
+                hours_to_expiry=hours_to_expiry,
+                hourly_df=hourly_for_engine,
+                intraday_df=intraday_for_engine,
+                n_sims=n_sims,
+                seed=seed,
+                use_svcj=advanced_features,
+                use_skewed_t=advanced_features,
+                use_figarch=advanced_features,
+                use_regime_switching=advanced_features,
+                use_xgb_direction=advanced_features,
+                disable_staleness_check=True,
+            )
+
+            for _, row in group.iterrows():
+                strike = row["strike"]
+                results.append({
+                    "slug": row.get("slug", ""),
+                    "strike": strike,
+                    "market_price": row["market_price"],
+                    "model_probability": probs.get(strike, np.nan),
+                    "T_days": hours_to_expiry / 24.0,
+                    "date": ts_dt,
+                    "expiry_date": expiry,
+                })
+        except Exception:
+            logger.warning(
+                "Error calculating probs for %s, expiry %s",
+                ts_str, expiry, exc_info=True,
+            )
+
+    # ---- save batch ----
+    if results:
+        result_df = pd.DataFrame(results)
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        result_df.to_csv(output_path, index=False)
+
+    return ts_str
+
 
 # ---------------------------------------------------------------------------
 # BackrunnerEngine
@@ -52,6 +253,9 @@ class BackrunnerEngine:
 
     Absorbs ``prob_backrunner_engine.py`` lines 73-356 logic while
     keeping the disk-native streaming-write pattern.
+
+    Supports parallel execution via ProcessPoolExecutor (--workers N)
+    and serial execution for debugging (--serial).
     """
 
     def __init__(
@@ -166,11 +370,11 @@ class BackrunnerEngine:
         if csv_path is None:
             # Try new store first
             store = ContractPriceStore()
-            store.load()
-            if not store.df.empty:
+            store_df = store.load()
+            if not store_df.empty:
                 logger.info(
                     "Loaded market prices from store: %d rows, %d unique timestamps",
-                    len(store.df), store.df["date"].nunique(),
+                    len(store_df), store_df["date"].nunique(),
                 )
                 return store.to_market_df()
             # Fallback to legacy CSV
@@ -187,6 +391,143 @@ class BackrunnerEngine:
         return market_df
 
     # ------------------------------------------------------------------
+    # Pre-processing (builds work items for parallel dispatch)
+    # ------------------------------------------------------------------
+
+    def _preprocess_work_items(
+        self,
+        market_df: pd.DataFrame,
+        daily_df: pd.DataFrame,
+        intraday_df: pd.DataFrame,
+        limit: Optional[int] = None,
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        """Build work items for parallel processing.
+
+        Pre-computes S0 daily-close fallbacks so workers don't need
+        the full daily DataFrame. Derives deterministic per-timestamp
+        seeds via hashlib.md5 (not Python ``hash()`` — broken across
+        processes by PYTHONHASHSEED).
+
+        Parameters
+        ----------
+        market_df : pd.DataFrame
+            Columns: slug, strike, market_price, date, expiry_date.
+        daily_df : pd.DataFrame
+            BTC daily data, indexed by UTC datetime.
+        intraday_df : pd.DataFrame
+            BTC intraday data, indexed by UTC datetime.
+        limit : int or None
+            Cap the number of timestamps.
+
+        Returns
+        -------
+        (work_items, n_total)
+            n_total is the raw count of unique timestamps (used for progress
+            denominator). work_items only includes processable timestamps.
+        """
+        unique_timestamps = sorted(market_df["date"].unique())
+        if limit:
+            unique_timestamps = unique_timestamps[:limit]
+            logger.info("Limited to first %d timestamps", limit)
+
+        n_total = len(unique_timestamps)
+        logger.info("Pre-processing %d unique timestamps...", n_total)
+
+        # ---- precompute sorted index arrays for O(log n) lookups ----
+        # Avoids O(n) boolean masking per timestamp (was O(n_ts * n_rows)).
+        intraday_asi8 = intraday_df.index.asi8
+        daily_asi8 = daily_df.index.asi8
+        daily_col_map = {c.lower(): c for c in daily_df.columns}
+        _daily_close_col = daily_col_map.get("close")
+        daily_close_vals = (
+            daily_df[_daily_close_col].to_numpy()
+            if _daily_close_col is not None
+            else None
+        )
+
+        work_items: List[Dict[str, Any]] = []
+        _intraday_fallback_used = False
+
+        for ts in unique_timestamps:
+            ts_dt = pd.Timestamp(ts).to_pydatetime()
+            ts_str = ts_dt.strftime("%Y%m%d_%H%M%S")
+            output_path = self.unfitted_dir / f"batch_{ts_str}.csv"
+
+            # Idempotent: skip already-processed timestamps
+            if output_path.exists():
+                logger.debug("Already exists: %s", output_path.name)
+                continue
+
+            # Contracts at this timestamp
+            contracts = market_df[market_df["date"] == ts]
+            if contracts.empty:
+                continue
+
+            # Validate expiry dates
+            if "expiry_date" not in contracts.columns:
+                continue
+            contracts = contracts[contracts["expiry_date"].notna()]
+            if contracts.empty:
+                continue
+
+            # ---- pre-compute S0 daily-close fallback (searchsorted, O(log n)) ----
+            s0_from_daily: Optional[float] = None
+            ts_val = pd.Timestamp(ts).value  # int64 ns, UTC
+            intraday_pos = int(np.searchsorted(intraday_asi8, ts_val, side="right"))
+            if intraday_pos == 0:  # no intraday rows <= ts
+                if not _intraday_fallback_used:
+                    logger.info(
+                        "Intraday data unavailable for timestamps before %s; "
+                        "using daily close as S0 fallback.",
+                        intraday_df.index.min().strftime("%Y-%m-%d"),
+                    )
+                    _intraday_fallback_used = True
+
+                if daily_close_vals is not None:
+                    # Daily bars are indexed at day-start (D 00:00) but `close`
+                    # is the END-of-day-D price (≈ D+1 00:00). The price actually
+                    # KNOWN at the contract's midnight (D 00:00) is therefore the
+                    # PRIOR day's close. Using row D would leak ~24h of lookahead.
+                    cutoff = pd.Timestamp(ts).normalize().value  # D 00:00:00
+                    daily_pos = int(np.searchsorted(daily_asi8, cutoff, side="left"))
+                    if daily_pos > 0:
+                        s0_from_daily = float(daily_close_vals[daily_pos - 1])
+
+            # ---- build contract list (small — a few rows per timestamp) ----
+            contract_list: List[Dict[str, Any]] = []
+            for _, row in contracts.iterrows():
+                contract_list.append({
+                    "slug": str(row.get("slug", "")),
+                    "strike": float(row["strike"]),
+                    "market_price": float(row["market_price"]),
+                    "expiry_date": str(row["expiry_date"]),
+                })
+
+            # ---- deterministic per-timestamp seed ----
+            seed_bytes = hashlib.md5(ts_str.encode()).hexdigest()[:8]
+            item_seed = self.seed + int(seed_bytes, 16)
+
+            ts_date_str = pd.Timestamp(ts).normalize().strftime("%Y-%m-%d")
+
+            work_items.append({
+                "ts_str": ts_str,
+                "ts_iso": ts_dt.isoformat(),
+                "ts_date": ts_date_str,
+                "contracts": contract_list,
+                "s0_from_daily": s0_from_daily,
+                "output_path": str(output_path),
+                "seed": item_seed,
+                "n_sims": self.n_sims,
+                "advanced_features": self.advanced_features,
+            })
+
+        logger.info(
+            "Pre-processed %d work items from %d timestamps (%d already cached)",
+            len(work_items), n_total, n_total - len(work_items),
+        )
+        return work_items, n_total
+
+    # ------------------------------------------------------------------
     # Main time-travel loop
     # ------------------------------------------------------------------
 
@@ -197,6 +538,7 @@ class BackrunnerEngine:
         intraday_df: pd.DataFrame,
         hourly_df: Optional[pd.DataFrame] = None,
         limit: Optional[int] = None,
+        workers: Optional[int] = None,
     ) -> Path:
         """Run the time-travel backtest loop.
 
@@ -204,16 +546,24 @@ class BackrunnerEngine:
         that timestamp, groups contracts by expiry, runs MC pricing, and
         writes per-timestamp batch CSVs to ``self.unfitted_dir``.
 
+        When *workers* > 1, uses ProcessPoolExecutor for parallel execution
+        with per-worker BTC data loading via ``_init_worker()``.
+
         Parameters
         ----------
         market_df : pd.DataFrame
             Columns: slug, strike, market_price, date, expiry_date.
         daily_df, intraday_df : pd.DataFrame
             BTC data loaded via :meth:`load_btc_data`.
+            ``daily_df`` is used as S0 fallback when intraday data is unavailable
+            for a timestamp (intraday starts ~2026-03-01; daily goes back to 2021).
         hourly_df : pd.DataFrame or None
             Hourly BTC data for GARCH fitting.
         limit : int or None
             Cap the number of timestamps processed.
+        workers : int or None
+            Number of worker processes. None or 1 = serial mode.
+            Default when called via CLI: ``min(cpu_count - 4, 12)``.
 
         Returns
         -------
@@ -222,151 +572,124 @@ class BackrunnerEngine:
         """
         self.unfitted_dir.mkdir(parents=True, exist_ok=True)
 
-        unique_timestamps = sorted(market_df["date"].unique())
-        if limit:
-            unique_timestamps = unique_timestamps[:limit]
-            logger.info("Limited to first %d timestamps", limit)
+        # ---- pre-process work items (S0 fallback, seeds, skips) ----
+        work_items, n_total = self._preprocess_work_items(
+            market_df, daily_df, intraday_df, limit
+        )
 
-        n_total = len(unique_timestamps)
-        logger.info("Processing %d unique timestamps...", n_total)
+        if not work_items:
+            logger.info("No work items to process (all cached or empty)")
+            return self.unfitted_dir
 
-        for i, ts in enumerate(unique_timestamps):
-            ts_dt = pd.Timestamp(ts).to_pydatetime()
-            ts_str = ts_dt.strftime("%Y%m%d_%H%M%S")
-            output_path = self.unfitted_dir / f"batch_{ts_str}.csv"
+        # ---- resolve worker count ----
+        # Clamp to work-item count: no point spawning more processes than tasks.
+        if workers is not None and workers > 1:
+            workers = min(workers, len(work_items))
 
-            # Idempotent: skip already-processed timestamps
-            if output_path.exists():
-                logger.debug("Already exists: %s", output_path.name)
-                if self._progress:
-                    self._progress("pricing", i + 1, n_total)
-                continue
-
-            # --- contracts at this timestamp ---
-            contracts = market_df[market_df["date"] == ts].copy()
-            if contracts.empty:
-                if self._progress:
-                    self._progress("pricing", i + 1, n_total)
-                continue
-
-            ts_date = pd.Timestamp(ts).normalize().tz_localize(None)
-
-            # --- truncate intraday data: include all rows <= ts ---
-            intraday_slice = intraday_df[intraday_df.index <= ts]
-            if intraday_slice.empty:
-                logger.warning("Skipping %s: no intraday data available", ts_str)
-                if self._progress:
-                    self._progress("pricing", i + 1, n_total)
-                continue
-            intraday_for_engine = intraday_slice.reset_index(drop=True)
-
-            # --- truncate hourly data for GARCH (time-travel) ---
-            hourly_for_engine: Optional[pd.DataFrame] = None
-            if hourly_df is not None and not hourly_df.empty:
-                hourly_slice = hourly_df[
-                    hourly_df.index.tz_localize(None).normalize() <= ts_date
-                ]
-                if len(hourly_slice) < 500:
-                    logger.warning(
-                        "Skipping %s: insufficient hourly data (%d rows, need >=500)",
-                        ts_str, len(hourly_slice),
-                    )
-                    if self._progress:
-                        self._progress("pricing", i + 1, n_total)
-                    continue
-                hourly_for_engine = hourly_slice.reset_index(drop=True)
-            else:
-                logger.warning(
-                    "Skipping %s: no hourly data available for GARCH fitting", ts_str
-                )
-                if self._progress:
-                    self._progress("pricing", i + 1, n_total)
-                continue
-
-            # --- validate expiry dates ---
-            if "expiry_date" not in contracts.columns or not contracts["expiry_date"].notna().any():
-                logger.warning("Skipping %s: no expiry_date column", ts_str)
-                if self._progress:
-                    self._progress("pricing", i + 1, n_total)
-                continue
-
-            valid_expiry_mask = contracts["expiry_date"].notna()
-            contracts = contracts[valid_expiry_mask]
-            if contracts.empty:
-                logger.warning("Skipping %s: no contracts with valid expiry dates", ts_str)
-                if self._progress:
-                    self._progress("pricing", i + 1, n_total)
-                continue
-
-            # --- group by expiry_date and price each group ---
-            strikes = contracts["strike"].unique().tolist()
-            results = []
-
-            for expiry, group in contracts.groupby("expiry_date"):
-                try:
-                    expiry_dt = pd.to_datetime(expiry, utc=True)
-                    hours_to_expiry = max(
-                        (expiry_dt - ts_dt).total_seconds() / 3600, 0.001
-                    )
-                except Exception:
-                    logger.warning("Could not parse expiry date: %s", expiry)
-                    continue
-
-                if hours_to_expiry <= 0:
-                    logger.debug(
-                        "Skipping expired group: expiry=%s, hours=%.1f",
-                        expiry, hours_to_expiry,
-                    )
-                    continue
-
-                group_strikes = group["strike"].unique().tolist()
-
-                try:
-                    probs = calculate_probabilities(
-                        strikes=group_strikes,
-                        hours_to_expiry=hours_to_expiry,
-                        hourly_df=hourly_for_engine,
-                        intraday_df=intraday_for_engine,
-                        n_sims=self.n_sims,
-                        seed=self.seed,
-                        use_svcj=self.advanced_features,
-                        use_skewed_t=self.advanced_features,
-                        use_figarch=self.advanced_features,
-                        use_regime_switching=self.advanced_features,
-                        use_xgb_direction=self.advanced_features,
-                    )
-
-                    for _, row in group.iterrows():
-                        strike = row["strike"]
-                        results.append({
-                            "slug": row.get("slug", ""),
-                            "strike": strike,
-                            "market_price": row["market_price"],
-                            "model_probability": probs.get(strike, np.nan),
-                            "T_days": hours_to_expiry / 24.0,
-                            "date": ts_dt,
-                            "expiry_date": expiry,
-                        })
-                except Exception:
-                    logger.warning(
-                        "Error calculating probs for %s, expiry %s",
-                        ts_str, expiry, exc_info=True,
-                    )
-
-            # --- save batch ---
-            if results:
-                result_df = pd.DataFrame(results)
-                result_df.to_csv(output_path, index=False)
-
-            # progress
-            if self._progress:
-                self._progress("pricing", i + 1, n_total)
-
-            if (i + 1) % 10 == 0 or i == n_total - 1:
-                logger.info("Progress: %d/%d timestamps processed", i + 1, n_total)
+        if workers is None or workers <= 1:
+            self._run_serial(work_items, n_total, daily_df, intraday_df, hourly_df)
+        else:
+            self._run_parallel(work_items, n_total, workers)
 
         logger.info("Backtest loop complete. Results saved to %s", self.unfitted_dir)
         return self.unfitted_dir
+
+    # ------------------------------------------------------------------
+    # Serial execution (original loop logic, kept for debugging)
+    # ------------------------------------------------------------------
+
+    def _run_serial(
+        self,
+        work_items: List[Dict[str, Any]],
+        n_total: int,
+        daily_df: pd.DataFrame,
+        intraday_df: pd.DataFrame,
+        hourly_df: Optional[pd.DataFrame],
+    ) -> None:
+        """Process work items sequentially in the current process.
+
+        Populates module-level worker globals from already-loaded DataFrames
+        so ``_process_one()`` can be used unchanged.
+        """
+        logger.info("Processing %d timestamps (serial mode)...", len(work_items))
+
+        # Populate worker globals from already-loaded data
+        global _worker_daily, _worker_intraday, _worker_hourly
+        _worker_daily = daily_df
+        _worker_intraday = intraday_df
+        _worker_hourly = hourly_df
+
+        completed = 0
+        for i, item in enumerate(work_items):
+            try:
+                _process_one(item)
+            except Exception:
+                logger.warning(
+                    "Worker failed for %s", item["ts_str"], exc_info=True,
+                )
+            completed += 1
+
+            if self._progress:
+                self._progress("pricing", completed, n_total)
+
+            if (i + 1) % 10 == 0 or i == len(work_items) - 1:
+                logger.info(
+                    "Progress: %d/%d timestamps processed", completed, n_total
+                )
+
+    # ------------------------------------------------------------------
+    # Parallel execution (ProcessPoolExecutor)
+    # ------------------------------------------------------------------
+
+    def _run_parallel(
+        self,
+        work_items: List[Dict[str, Any]],
+        n_total: int,
+        workers: int,
+    ) -> None:
+        """Process work items in parallel via ProcessPoolExecutor.
+
+        Each worker loads its own BTC data via ``_init_worker()`` to avoid
+        pickling DataFrames across process boundaries.
+        """
+        logger.info(
+            "Processing %d timestamps (parallel mode, %d workers)...",
+            len(work_items), workers,
+        )
+
+        completed = 0
+
+        with ProcessPoolExecutor(
+            max_workers=workers,
+            initializer=_init_worker,
+            initargs=(str(DATA_DIR),),
+        ) as executor:
+            # Submit all tasks
+            future_map = {
+                executor.submit(_process_one, item): item["ts_str"]
+                for item in work_items
+            }
+
+            # Collect results as they complete
+            for future in as_completed(future_map):
+                ts_str = future_map[future]
+                try:
+                    future.result()
+                    completed += 1
+                except Exception:
+                    logger.warning(
+                        "Worker failed for %s", ts_str, exc_info=True,
+                    )
+                    completed += 1
+
+                if self._progress:
+                    self._progress("pricing", completed, n_total)
+
+                if completed % 10 == 0 or completed == len(work_items):
+                    logger.info(
+                        "Progress: %d/%d timestamps processed",
+                        completed, n_total,
+                    )
 
     # ------------------------------------------------------------------
     # Curve fitting
@@ -437,6 +760,11 @@ def main() -> int:
     Note: automatic BTC data refresh (subprocess call to data_fetcher.py)
     has been removed. Run ``python core/data/data_fetcher.py`` manually first.
     """
+    import multiprocessing
+
+    cpu_count = multiprocessing.cpu_count()
+    default_workers = min(max(cpu_count - 4, 1), 12)
+
     parser = argparse.ArgumentParser(
         description="Backtest pricing engine across historical market data"
     )
@@ -492,11 +820,33 @@ def main() -> int:
         dest="advanced_features",
         help="Disable all advanced features (plain GARCH+t+Kou baseline)",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help=(
+            f"Number of worker processes for parallel execution "
+            f"(default: {default_workers} on this {cpu_count}-core machine)"
+        ),
+    )
+    parser.add_argument(
+        "--serial",
+        action="store_true",
+        help="Force single-process serial execution (for debugging)",
+    )
 
     args = parser.parse_args()
 
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
+
+    # Resolve workers: --serial overrides --workers
+    if args.serial:
+        workers = None  # serial mode
+    elif args.workers is not None:
+        workers = args.workers
+    else:
+        workers = default_workers  # parallel by default via CLI
 
     # Create engine
     engine = BackrunnerEngine(
@@ -520,6 +870,7 @@ def main() -> int:
         intraday_df=intraday_df,
         daily_df=daily_df,
         limit=args.limit,
+        workers=workers,
     )
 
     # Curve fitting

@@ -22,8 +22,21 @@ from core.backtesting.diagnostics import SignalDiagnostics
 
 logger = logging.getLogger(__name__)
 
-# Default directories
-OUTPUT_ROOT = Path("backtested_probabilities")
+
+def default_worker_count() -> int:
+    """Sane default worker count: leave 4 cores free, cap at 12.
+
+    Mirrors the CLI heuristic in ``backrunner.main()`` so the dashboard
+    path runs parallel by default too.
+    """
+    import multiprocessing
+
+    return min(max(multiprocessing.cpu_count() - 4, 1), 12)
+
+
+# Default directories — resolved relative to this file so CWD doesn't matter (Streamlit, etc.)
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+OUTPUT_ROOT = _PROJECT_ROOT / "backtested_probabilities"
 UNFITTED_DIR = OUTPUT_ROOT / "unfitted"
 FITTED_DIR = OUTPUT_ROOT / "fitted"
 
@@ -90,15 +103,47 @@ class BacktestingOrchestrator:
     # ------------------------------------------------------------------
 
     def run_pricing_backrun(
-        self, limit: Optional[int] = None, market_csv: Optional[str] = None
+        self,
+        limit: Optional[int] = None,
+        market_csv: Optional[str] = None,
+        workers: Optional[int] = None,
     ) -> Path:
         """Run time-travel MC pricing backrunner.
 
         Uses the ContractPriceStore data by default, or a legacy market CSV
         if *market_csv* is provided.
 
+        Parameters
+        ----------
+        workers : int or None
+            Number of worker processes. None → ``default_worker_count()``
+            (parallel). Pass 1 to force serial. This is what makes the
+            dashboard path run parallel — previously it always ran serial.
+
         Returns path to ``unfitted_dir`` containing batch CSV files.
         """
+        if workers is None:
+            workers = default_worker_count()
+
+        # ---- spawn-safety guard (route parallel through CLI subprocess) ----
+        # An in-process ProcessPoolExecutor uses spawn on Windows; each worker
+        # re-imports the parent __main__. When the orchestrator is driven from
+        # Streamlit (__main__ = page script) or `python -c` (__main__ = the -c
+        # string), that re-import re-runs unguarded top-level code — a warning
+        # flood under Streamlit, a fork-bomb under `-c`. The backrunner CLI has
+        # a proper __main__ guard, so run parallel work there instead. In-process
+        # pooling is reserved for the CLI entrypoint (backrunner.main) only.
+        if workers > 1:
+            if self.unfitted_dir == UNFITTED_DIR and self.fitted_dir == FITTED_DIR:
+                return self._run_backrun_subprocess(
+                    limit=limit, market_csv=market_csv, workers=workers
+                )
+            logger.warning(
+                "Custom backrun dirs — CLI subprocess can't target them; "
+                "falling back to serial to avoid spawn re-importing __main__."
+            )
+            workers = 1
+
         if self._backrunner is None:
             self._backrunner = BackrunnerEngine(
                 n_sims=self.n_sims,
@@ -127,14 +172,79 @@ class BacktestingOrchestrator:
                 self.unfitted_dir.mkdir(parents=True, exist_ok=True)
                 return self.unfitted_dir
 
+        logger.info("Backrunner workers=%s", workers)
         unfitted_path = self._backrunner.run(
             market_df=market_df,
             daily_df=daily_df,
             intraday_df=intraday_df,
             hourly_df=hourly_df,
             limit=limit,
+            workers=workers,
         )
         return unfitted_path
+
+    def _run_backrun_subprocess(
+        self,
+        limit: Optional[int],
+        market_csv: Optional[str],
+        workers: int,
+    ) -> Path:
+        """Run the parallel backrun via the backrunner CLI in a subprocess.
+
+        Safe under Streamlit on Windows: the CLI has a ``__main__`` guard, so
+        its spawned workers import ``core.backtesting.backrunner`` (clean), not
+        the Streamlit page. Progress lines on the child's stderr drive the UI
+        callback. Writes to the default ``backtested_probabilities`` dirs.
+        """
+        import re
+        import subprocess
+        import sys
+
+        backrunner_py = _PROJECT_ROOT / "core" / "backtesting" / "backrunner.py"
+        cmd = [
+            sys.executable,
+            str(backrunner_py),
+            "--workers", str(workers),
+            "--n-sims", str(self.n_sims),
+            "--seed", str(self.seed),
+            "--skip-fitting",  # orchestrator runs curve fitting itself afterwards
+        ]
+        if not self.advanced_features:
+            cmd.append("--no-advanced-features")
+        if limit is not None:
+            cmd += ["--limit", str(limit)]
+        if market_csv:
+            cmd += ["--market-prices", market_csv]
+
+        logger.info("Launching backrun subprocess: %s", " ".join(cmd))
+
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(_PROJECT_ROOT),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+
+        progress_re = re.compile(r"Progress:\s+(\d+)/(\d+)")
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            line = line.rstrip()
+            if not line:
+                continue
+            logger.info("[backrun] %s", line)
+            m = progress_re.search(line)
+            if m and self._progress:
+                done, total = int(m.group(1)), int(m.group(2))
+                self._progress("pricing", done, total)
+
+        proc.wait()
+        if proc.returncode != 0:
+            logger.error("Backrun subprocess exited with code %d", proc.returncode)
+        else:
+            logger.info("Backrun subprocess complete.")
+        return self.unfitted_dir
 
     # ------------------------------------------------------------------
     # Step 3: Curve fitting
@@ -233,6 +343,7 @@ class BacktestingOrchestrator:
         limit: Optional[int] = None,
         market_csv: Optional[str] = None,
         price_df: Optional[pd.DataFrame] = None,
+        workers: Optional[int] = None,
     ) -> dict:
         """Run the full backtesting pipeline.
 
@@ -250,6 +361,8 @@ class BacktestingOrchestrator:
             Legacy market data CSV path (bypasses contract store).
         price_df : pd.DataFrame or None
             Pre-loaded BTC price DataFrame for the backtest engine.
+        workers : int or None
+            Worker processes for the backrunner. None → parallel default.
 
         Returns
         -------
@@ -268,7 +381,7 @@ class BacktestingOrchestrator:
         # ---- Backrun ----
         if backrun:
             results["unfitted_dir"] = self.run_pricing_backrun(
-                limit=limit, market_csv=market_csv
+                limit=limit, market_csv=market_csv, workers=workers
             )
         else:
             results["unfitted_dir"] = self.unfitted_dir

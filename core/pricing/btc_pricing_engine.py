@@ -112,12 +112,17 @@ def load_and_prep_data(
     hourly_df: pd.DataFrame = None,
     intraday_df: pd.DataFrame = None,
     training_start_date: str = "2019-10-01",
+    disable_staleness_check: bool = False,
 ):
     """
     Loads hourly data for GARCH fitting and intraday data for the latest price mark.
     Supports dependency injection for backtesting.
 
     Phase 0.1: training_start_date filters data to post-break period (Pakstaite 2025).
+
+    disable_staleness_check: when True, skip the intraday staleness check against
+    current wall-clock time. Set True during time-travel backtesting where the
+    last data row is always in the past by design.
     """
     # 1. Load Hourly Data for GARCH fitting
     if hourly_df is None:
@@ -165,26 +170,29 @@ def load_and_prep_data(
     # ---- Staleness Check (Issue 3.1 guard) ----
     # Intraday S0 drives all simulation; stale data silently produces absurd
     # probabilities (all paths above/below market-relevant strikes).
-    ts_col_intra = col_map_intra.get('timestamp', col_map_intra.get('date', None))
-    if ts_col_intra:
-        try:
-            last_ts = pd.to_datetime(intraday_df[ts_col_intra].iloc[-1], utc=True)
-            age_hours = (pd.Timestamp.now(tz='UTC') - last_ts).total_seconds() / 3600
-            if age_hours > 168:  # 7 days
-                logger.error(
-                    "CRITICAL: intraday data is %.0f hours stale (last: %s). "
-                    "S0=%.2f from this data. Run 'python core/data/data_fetcher.py' "
-                    "to refresh. Continuing with stale S0 will produce nonsense edges.",
-                    age_hours, last_ts.isoformat(), current_price_S0,
-                )
-            elif age_hours > 24:
-                logger.warning(
-                    "Intraday data is %.0f hours stale (last: %s). S0=%.2f. "
-                    "Consider refreshing: python core/data/data_fetcher.py",
-                    age_hours, last_ts.isoformat(), current_price_S0,
-                )
-        except Exception:
-            pass  # Don't break if timestamp parsing fails
+    # Suppressed during time-travel backtesting where the last data row is
+    # always in the past by design.
+    if not disable_staleness_check:
+        ts_col_intra = col_map_intra.get('timestamp', col_map_intra.get('date', None))
+        if ts_col_intra:
+            try:
+                last_ts = pd.to_datetime(intraday_df[ts_col_intra].iloc[-1], utc=True)
+                age_hours = (pd.Timestamp.now(tz='UTC') - last_ts).total_seconds() / 3600
+                if age_hours > 168:  # 7 days
+                    logger.error(
+                        "CRITICAL: intraday data is %.0f hours stale (last: %s). "
+                        "S0=%.2f from this data. Run 'python core/data/data_fetcher.py' "
+                        "to refresh. Continuing with stale S0 will produce nonsense edges.",
+                        age_hours, last_ts.isoformat(), current_price_S0,
+                    )
+                elif age_hours > 24:
+                    logger.warning(
+                        "Intraday data is %.0f hours stale (last: %s). S0=%.2f. "
+                        "Consider refreshing: python core/data/data_fetcher.py",
+                        age_hours, last_ts.isoformat(), current_price_S0,
+                    )
+            except Exception:
+                pass  # Don't break if timestamp parsing fails
 
     return hourly_returns, current_price_S0
 
@@ -214,117 +222,114 @@ def skewed_t_rvs(
         rng: NumPy random generator.
 
     Returns:
-        Array of skewed-t variates with approximate mean 0 and variance 1.
+        Array of standardized skewed-t variates with mean 0 and variance 1
+        (by Hansen's construction — a and b are chosen precisely for this).
 
     Reference:
         Hansen, B.E. (1994). "Autoregressive Conditional Density Estimation."
         International Economic Review, 35(3), 705-730.
 
-        Hansen maps skewed-t (ε) → standardized t (z) via:
-            z = (b*ε + a) / (1 - λ*s)   where s = sign(b*ε + a)
-
-        Inverse (ε from z):
-            For z < -a/b:  ε = (z*(1+λ) - a) / b   (left tail)
-            For z ≥ -a/b:  ε = (z*(1-λ) - a) / b   (right tail)
-
-        With λ < 0: left tail denominator is (1+λ) < 1 → amplifies negatives → neg skew.
+        This implements Hansen's standardized skew-t via the inverse-CDF method.
+        With constants
+            c = Γ((ν+1)/2) / (√(π(ν-2)) Γ(ν/2)),  a = 4λc(ν-2)/(ν-1),
+            b = √(1 + 3λ² - a²),
+        the density has a left piece (mass (1-λ)/2) and a right piece (mass
+        (1+λ)/2). Sampling: draw U~Uniform(0,1); within each piece invert the
+        standardized-t quantile T*(p) = t.ppf(p,ν)·√((ν-2)/ν), then map:
+            U < (1-λ)/2:  z = ((1-λ)/b)·T*(U/(1-λ)) - a/b
+            else:         z = ((1+λ)/b)·T*(0.5 + (U-(1-λ)/2)/(1+λ)) - a/b
+        Continuous at U=(1-λ)/2 (both give z=-a/b). λ<0 ⇒ heavier left tail ⇒
+        negative skew. Mean 0, variance 1 by construction — no external rescale.
     """
     if nu <= 2:
-        # Fall back to standard t if df too low
+        # Fall back to standard t if df too low (cannot standardize variance)
         scale = np.sqrt((nu - 2) / nu) if nu > 2 else 1.0
         return rng.standard_t(nu, size=size) * scale
 
-    # Hansen's constants (from eq 8-10 in Hansen 1994)
-    # a controls the mean; b ensures distribution is properly scaled
-    # (note: b does NOT standardise variance — output still ~nu/(nu-2))
+    # Hansen's constants (eq 8-10 in Hansen 1994)
     c_const = gamma_func((nu + 1) / 2) / (np.sqrt(np.pi * (nu - 2)) * gamma_func(nu / 2))
     a = 4 * lam * c_const * (nu - 2) / (nu - 1)
     b_sq = 1 + 3 * lam ** 2 - a ** 2
 
     if b_sq <= 0:
-        # Numerical fallback
+        # Numerical fallback (extreme lam)
         return rng.standard_t(nu, size=size) * np.sqrt((nu - 2) / nu)
 
     b = np.sqrt(b_sq)
+    t_std_scale = np.sqrt((nu - 2) / nu)  # standardized-t (unit variance) scale
 
-    # Draw from standard t (mean 0, variance nu/(nu-2) for nu>2)
-    z = rng.standard_t(nu, size=size)
+    u = rng.uniform(size=size)
+    left = u < (1 - lam) / 2
 
-    # Threshold: the boundary between left/right tail regimes
-    threshold = -a / b
+    # Inner standardized-t quantiles per piece
+    p_inner = np.empty(size)
+    p_inner[left] = u[left] / (1 - lam)
+    p_inner[~left] = 0.5 + (u[~left] - (1 - lam) / 2) / (1 + lam)
+    t_q = student_t.ppf(p_inner, nu) * t_std_scale
 
-    # Inverse transformation (Hansen 1994, adapted for RVS generation)
-    # Hansen's λ convention: λ < 0 produces NEGATIVE skew (heavy left tail)
-    # The regime assignment uses (1-λ) for left, (1+λ) for right
-    g = np.where(
-        z < threshold,
-        (z * (1 - lam) - a) / b,   # λ<0 → (1-λ)>1 → amplifies negatives → neg skew
-        (z * (1 + lam) - a) / b,   # λ<0 → (1+λ)<1 → dampens positives
-    )
-
-    # Hansen's b parameter (computed above as sqrt(1 + 3*lam**2 - a**2))
-    # normalises the distribution's shape. The output variance is ~nu/(nu-2),
-    # same as standard-t — corrected externally via skewed_t_scale_factor().
+    g = np.empty(size)
+    g[left] = ((1 - lam) * t_q[left] - a) / b
+    g[~left] = ((1 + lam) * t_q[~left] - a) / b
 
     return g
 
 
 def skewed_t_scale_factor(nu: float, lam: float) -> float:
     """
-    Compute scale factor to ensure ~unit variance in skewed-t samples.
-
-    Multiplier applied externally to skewed_t_rvs() output. Corrects for
-    Student-t overdispersion (nu/(nu-2)). Hansen's b parameter normalises
-    the distribution shape (skewness), NOT the variance — skewed_t_rvs
-    output is still ~nu/(nu-2) variance, same as standard_t.
-
-    For symmetric case (lam=0): standard t scale factor sqrt((nu-2)/nu).
+    Scale factor for skewed_t_rvs() output. Returns 1.0 for nu>2 because
+    skewed_t_rvs now returns Hansen's STANDARDIZED variate (mean 0, variance 1
+    by construction). Retained for backward-compatible call sites that still
+    multiply by this factor. Returns 1.0 for the nu<=2 standard-t fallback too.
     """
-    if nu <= 2:
-        return 1.0
-    base_scale = np.sqrt((nu - 2) / nu)
-    return base_scale
+    return 1.0
 
 
 # ==============================================================================
 # FIGARCH BINOMIAL WEIGHTS — Phase 2.5
 # ==============================================================================
 
-def _compute_figarch_weights(d: float, trunc_k: int = FIGARCH_TRUNC_K) -> np.ndarray:
+def _compute_figarch_weights(d: float, beta: float, trunc_k: int = FIGARCH_TRUNC_K) -> np.ndarray:
     """
-    Precompute fractional differencing binomial weights for (1-L)^d.
+    Precompute FIGARCH(1,d,1) infinite-AR weights for the variance recursion.
 
-    λ_k = Γ(k - d) / (Γ(k + 1) * Γ(-d)) for k = 0, 1, ..., trunc_k-1
+    The standard FIGARCH(1,d,1) variance equation follows Chung (1999):
+        σ²_t = ω/(1-β) + [1 - (1-βL)⁻¹(1-L)^d] ε²_t
 
-    These weights are used in the fractionally integrated variance recursion:
-        σ²_t = ω / (1 - β) + Σ_{k=0}^{∞} λ_k ε²_{t-k}
+    Expanding (1-L)^d into binomial weights λ_k (λ_0=1) and convolving with
+    (1-βL)⁻¹ gives the ψ_k filter:
+        ψ_0 = 0                    (no contemporaneous ε² term)
+        ψ_k = -f_k  for k ≥ 1      where f_k = λ_k + β·f_{k-1},  f_0 = 1
+
+    Variance update:  σ²_t = ω/(1-β) + Σ_{k=1}^{trunc_k-1} ψ_k · ε²_{t-k}
 
     Args:
         d: Long memory parameter (0 < d < 1).
+        beta: GARCH β parameter for (1-βL)⁻¹ convolution.
         trunc_k: Number of lags in truncation.
 
     Returns:
-        Array of length trunc_k with λ_k weights.
+        Array of length trunc_k with ψ_k weights (ψ_0=0, ψ_k = -f_k for k≥1).
     """
     if d <= 0 or d >= 1:
         raise ValueError(f"FIGARCH d must be in (0, 1), got {d}")
 
-    k = np.arange(trunc_k, dtype=float)
-    # λ_k = Γ(k - d) / (Γ(k + 1) * Γ(-d))
-    # Using log-gamma for numerical stability
-    log_weights = (
-        gamma_func(k - d + 1) / gamma_func(k + 2)
-    )  # Not quite right — using ratio form
-
-    # Correct computation via recurrence:
-    # λ_0 = 1
-    # λ_k = λ_{k-1} * (k - 1 - d) / k  for k >= 1
-    weights = np.ones(trunc_k)
+    # Step 1: Binomial weights for (1-L)^d via recurrence
+    #   λ_0 = 1,  λ_k = λ_{k-1} · (k-1-d)/k  for k ≥ 1
+    lam = np.ones(trunc_k)
     for i in range(1, trunc_k):
-        weights[i] = weights[i - 1] * (i - 1 - d) / i
+        lam[i] = lam[i - 1] * (i - 1 - d) / i
 
-    # Normalize to sum to 1 / (1 - β) for GARCH integration
-    return weights
+    # Step 2: Convolve with (1-βL)⁻¹ to get FIGARCH(1,d,1) filter
+    #   f_k = λ_k + β·f_{k-1}  with f_0 = 1
+    #   ψ_0 = 0,  ψ_k = -f_k  for k ≥ 1
+    psi = np.zeros(trunc_k)
+    f_prev = 1.0  # f_0 = λ_0 = 1
+    for i in range(1, trunc_k):
+        f_i = lam[i] + beta * f_prev
+        psi[i] = -f_i
+        f_prev = f_i
+
+    return psi
 
 
 # ==============================================================================
@@ -362,8 +367,32 @@ def fit_garch_model(
     scaled_returns = returns * 100
 
     # 2. Fit GARCH(1,1) with Student-t
+    # Suppress arch's raw ConvergenceWarning (scipy SLSQP code 8 is intermittent
+    # and the returned params are usually still usable). We check convergence
+    # ourselves and log a clean warning with context.
     model = arch_model(scaled_returns, vol='Garch', p=1, q=1, dist='t', mean='Constant')
-    res = model.fit(disp='off')
+    res = model.fit(disp='off', show_warning=False)
+
+    if res.convergence_flag != 0:
+        status_code = res.optimization_result.get('status', 'unknown')
+        status_msg = res.optimization_result.get('message', 'unknown')
+        logger.warning(
+            "GARCH fit may not have converged (code=%s): %s. "
+            "Retrying with relaxed tolerance.",
+            status_code, status_msg,
+        )
+        # Fallback: relaxed tolerance can help when SLSQP linesearch stalls
+        # near a flat gradient region (common with heavy-tailed data + Student-t).
+        try:
+            res = model.fit(disp='off', show_warning=False, options={'ftol': 1e-6, 'maxiter': 500})
+        except Exception:
+            logger.warning("GARCH fallback fit failed; continuing with original parameters")
+        if res.convergence_flag != 0:
+            logger.warning(
+                "GARCH fallback fit also not converged (code=%s). "
+                "Continuing with best available parameters.",
+                res.optimization_result.get('status', 'unknown'),
+            )
 
     params = res.params
 
@@ -387,11 +416,26 @@ def fit_garch_model(
     # FIGARCH precomputation (Phase 2.5)
     if use_figarch:
         try:
-            weights = _compute_figarch_weights(figarch_d, figarch_trunc_k)
-            result['figarch_weights'] = weights
-            result['figarch_d'] = figarch_d
-            result['figarch_trunc_k'] = figarch_trunc_k
-            logger.info(f"FIGARCH enabled: d={figarch_d:.3f}, trunc_k={figarch_trunc_k}")
+            weights = _compute_figarch_weights(figarch_d, beta_val, figarch_trunc_k)
+            # Bollerslev-Mikkelsen non-negativity: the conditional variance is only
+            # guaranteed positive when the ψ_k ARCH weights (k>=1) are non-negative.
+            # With the Siu d=0.578 estimate and typical β, ψ_1 = d-β can be negative,
+            # in which case a large recent shock would REDUCE variance — not a valid
+            # variance process. Reject and fall back to GARCH rather than masking it
+            # behind the downstream 1e-10 floor.
+            if np.any(weights[1:] < -1e-10):
+                n_neg = int(np.sum(weights[1:] < -1e-10))
+                logger.warning(
+                    "FIGARCH positivity violated: %d negative ψ_k weights "
+                    "(d=%.3f, beta=%.3f, e.g. psi_1=%.4f). Falling back to GARCH.",
+                    n_neg, figarch_d, beta_val, weights[1],
+                )
+                result['use_figarch'] = False
+            else:
+                result['figarch_weights'] = weights
+                result['figarch_d'] = figarch_d
+                result['figarch_trunc_k'] = figarch_trunc_k
+                logger.info(f"FIGARCH enabled: d={figarch_d:.3f}, trunc_k={figarch_trunc_k}")
         except Exception as e:
             logger.warning(f"FIGARCH weight computation failed ({e}), falling back to GARCH")
             result['use_figarch'] = False
@@ -455,6 +499,7 @@ def simulate_paths(
     n_sims=15000,
     seed=None,
     apply_jump_drift_correction: bool = True,
+    martingale_anchor: bool = False,
     # --- Phase 1 feature flags ---
     use_naive_prior: bool = True,
     use_svcj: bool = False,
@@ -486,6 +531,10 @@ def simulate_paths(
         n_sims: Number of Monte Carlo paths.
         seed: Random seed for reproducibility.
         apply_jump_drift_correction: If True, subtract expected_jump_drift from mu.
+        martingale_anchor: If True, use the exponential cumulant compensator
+            lam*(E[e^J]-1) (true risk-neutral martingale, E[S_T]=S0). If False
+            (default), use the legacy log-mean compensator lam*E[J]. Default False
+            preserves historical probabilities; calibration was established under it.
         use_naive_prior: If True, set drift μ=0 (Baquero/Shelton naive anchor).
         use_svcj: If True, add correlated volatility jumps.
         use_skewed_t: If True, use Hansen skewed-t instead of Student-t.
@@ -538,12 +587,33 @@ def simulate_paths(
 
     # 1. Convert Annual Lambda to Hourly
     lam_hourly = lam / HOURS_PER_YEAR
-    # For SVCJ: same Poisson driver for both return and vol jumps
-    lam_v_hourly = jump_params.get('lam_v', lam) / HOURS_PER_YEAR if jump_params else lam_hourly
+    # SVCJ uses the SAME Poisson count (k) as return jumps for contemporaneous
+    # return/variance jumps (Eraker 2004). The legacy independent lam_v driver
+    # is deprecated — a separate lam_v_hourly would break the SVCJ correlation.
 
     # 2. Calculate Expected Jump Drift (hourly log-return)
-    # E[J] = (1-p_crash)/eta_up - p_crash/eta_down
-    expected_jump_drift = lam_hourly * ((1 - p_crash) / eta_up - p_crash / eta_down)
+    if martingale_anchor:
+        # Exponential cumulant: true risk-neutral compensator lam*(E[e^J]-1) so
+        # that E[S_T]=S0. For Kou double-exponential jumps:
+        #   E[e^J] = (1-p)*eta_up/(eta_up-1) + p*eta_down/(eta_down+1)
+        # Requires eta_up>1 (else E[e^J] diverges); fall back to log-mean if not.
+        if eta_up > 1:
+            expected_jump_drift = lam_hourly * (
+                (1 - p_crash) * eta_up / (eta_up - 1)
+                + p_crash * eta_down / (eta_down + 1)
+                - 1.0
+            )
+        else:
+            logger.warning(
+                "martingale_anchor=True but eta_up=%.3f<=1; E[e^J] diverges. "
+                "Falling back to log-mean compensator.", eta_up,
+            )
+            expected_jump_drift = lam_hourly * ((1 - p_crash) / eta_up - p_crash / eta_down)
+    else:
+        # Legacy log-mean compensator: E[J] = (1-p)/eta_up - p/eta_down.
+        # NOT a true martingale correction (drops the convexity/Jensen term),
+        # but preserves historical default probabilities and calibration.
+        expected_jump_drift = lam_hourly * ((1 - p_crash) / eta_up - p_crash / eta_down)
 
     n_hours = int(np.ceil(hours_to_expiry))
     dt_schedule = np.ones(n_hours)
@@ -555,7 +625,7 @@ def simulate_paths(
     beta_val = garch_params['beta']
     nu = garch_params['nu']
     mu = garch_params['mu']  # Hourly log-return units (scalar)
-    current_variance = garch_params['last_variance']  # Hourly variance
+    current_variance = np.maximum(garch_params['last_variance'], 1e-10)  # Hourly variance
 
     # FIGARCH precomputed weights (Phase 2.5)
     figarch_weights = garch_params.get('figarch_weights', None)
@@ -580,9 +650,9 @@ def simulate_paths(
     for step_idx, dt in enumerate(dt_schedule):
         # ---- Innovation Distribution ----
         if use_skewed_t and nu > 2:
-            # Skewed-t (Phase 1.4): skewed_t_rvs ~ nu/(nu-2) variance (like
-            # standard-t). scale_factor corrects to unit variance. Hansen's b
-            # handles distribution shape; it does NOT standardise the variance.
+            # Skewed-t (Phase 1.4): skewed_t_rvs now returns Hansen's standardized
+            # variate (mean 0, variance 1). scale_factor is 1.0; multiply kept for
+            # backward-compatible symmetry with the Student-t branch below.
             scale_factor = skewed_t_scale_factor(nu, skewed_t_lam)
             z_t = skewed_t_rvs(nu, skewed_t_lam, n_sims, rng) * scale_factor
         else:
@@ -613,11 +683,11 @@ def simulate_paths(
             epsilon_squared = (step_sigma * z_t) ** 2  # (sigma * z)² = return²
 
             if use_figarch and figarch_weights is not None:
-                # Fractionally integrated variance: σ²_t = ω/(1-β) + Σ λ_k ε²_{t-k}
+                # FIGARCH(1,d,1): σ²_t = ω/(1-β) + Σ ψ_k · ε²_{t-k}
                 # Shift past returns, insert current
                 past_eps_sq = np.roll(past_eps_sq, 1, axis=1)
                 past_eps_sq[:, 0] = epsilon_squared
-                # Weighted sum
+                # Weighted sum (ψ_0 = 0, so no contemporaneous ε² term)
                 figarch_component = np.sum(
                     past_eps_sq[:, :figarch_trunc_k] * figarch_weights[np.newaxis, :figarch_trunc_k],
                     axis=1
@@ -626,6 +696,9 @@ def simulate_paths(
             else:
                 # Standard GARCH(1,1)
                 variances = omega + alpha * epsilon_squared + beta_val * variances
+
+            # Guard against negative variance (numeric / edge case)
+            variances = np.maximum(variances, 1e-10)
 
         # 6. COMPOUND POISSON JUMPS (Kou double-exponential)
         k = rng.poisson(lam_hourly * dt, size=n_sims)
@@ -646,18 +719,25 @@ def simulate_paths(
 
         # ---- SVCJ Volatility Jumps (Phase 1.3) ----
         if use_svcj and svcj_mu_v > 0:
-            # Vol jumps triggered by same Poisson process (correlated structure)
-            k_v = rng.poisson(lam_v_hourly * dt, size=n_sims)
-            mask_vol_jump = k_v > 0
+            # Eraker (2004) SVCJ: return and variance jump on the SAME Poisson
+            # events (k) — contemporaneous, not an independent vol-jump process.
+            mask_vol_jump = k > 0
 
             if np.any(mask_vol_jump):
-                vol_jump_mag = rng.exponential(svcj_mu_v, size=n_sims)
-                vol_jump_mag[~mask_vol_jump] = 0.0
+                # Magnitude of the variance jump given k jumps in the step: sum of
+                # k exponential(mean=mu_v) draws = Gamma(k, scale=mu_v). Zero where k=0.
+                vol_jump_mag = np.zeros(n_sims)
+                vol_jump_mag[mask_vol_jump] = rng.gamma(
+                    k[mask_vol_jump], scale=svcj_mu_v
+                )
 
-                # Eraker et al. (2004): ξ_s | ξ_v ~ N(μ_s + ρ_J ξ_v, σ_s²)
-                # Return jump includes deterministic ρ_J correlation plus stochastic residual
-                correlated_adjustment = svcj_rho_j * vol_jump_mag
+                # Eraker et al. (2004): ξ_s | ξ_v ~ N(ρ_J ξ_v, σ_s²), applied ONLY
+                # on jump events. Both the deterministic ρ_J term and the stochastic
+                # residual must be masked to jumping paths — leaking the residual to
+                # non-jumping paths injects spurious per-step variance into every path.
+                correlated_adjustment = svcj_rho_j * vol_jump_mag  # already 0 off-mask
                 stochastic_residual = rng.normal(0, svcj_sigma_s, size=n_sims)
+                stochastic_residual[~mask_vol_jump] = 0.0
                 jump_sizes += correlated_adjustment + stochastic_residual
                 variances += vol_jump_mag  # Add vol jump to variance
 
@@ -665,8 +745,15 @@ def simulate_paths(
                 variances = np.maximum(variances, 1e-12)
 
         total_log_return = garch_ret + jump_sizes
+        # Clip per-step return to prevent variance feedback cascade from
+        # extreme Student-t tail draws (10σ+ possible with low nu) pushing
+        # cumulative log_prices past float64 exp limit (~709).
+        # ±2.0 ≈ ±640% hourly return; BTC worst hourly return ever ~40%.
+        total_log_return = np.clip(total_log_return, -2.0, 2.0)
         log_prices += total_log_return
 
+    # Belt-and-suspenders: exp(50) ≈ 5e21, well within float64 max 1.8e308.
+    log_prices = np.clip(log_prices, -50.0, 50.0)
     return np.exp(log_prices)
 
 
@@ -695,6 +782,7 @@ def calculate_probabilities(
     n_sims: int = 15000,
     jump_params: dict = None,
     seed: int = None,
+    martingale_anchor: bool = False,
     # --- Phase 0 ---
     training_start_date: str = "2019-10-01",
     # --- Phase 1 ---
@@ -710,6 +798,8 @@ def calculate_probabilities(
     # --- External dependencies ---
     regime_detector=None,  # RegimeDetector instance
     xgb_model=None,        # DirectionalXGB instance
+    # --- Backtesting ---
+    disable_staleness_check: bool = False,
 ):
     """
     Calculates probabilities for multiple strikes using hourly simulation.
@@ -781,6 +871,7 @@ def calculate_probabilities(
         hourly_df=hourly_df,
         intraday_df=intraday_df,
         training_start_date=training_start_date,
+        disable_staleness_check=disable_staleness_check,
     )
 
     garch_params = fit_garch_model(
@@ -811,18 +902,26 @@ def calculate_probabilities(
 
     # ---- Regime-Conditional Simulation OR Single Simulation ----
     if use_regime_switching and regime_detector is not None:
-        # Post-hoc weighting approach per plan Section 10 C1 resolution:
-        # Run independent simulations per regime, weight terminal prices by HMM posterior
-        n_per_regime = n_sims // 3
+        # Mixture by PROPORTIONAL ALLOCATION: each active regime receives a path
+        # count proportional to its HMM posterior weight, summing to ~n_sims. This
+        # encodes the mixture in the sample itself (equal per-path weight downstream)
+        # and preserves the full effective sample size — the old fixed n_sims//3
+        # split dropped to ~n_sims/3 effective paths whenever one regime dominated.
+        regime_labels = ["bear", "sideways", "bull"]
+        active = [(rl, regime_weights.get(rl, 0.0))
+                  for rl in regime_labels if regime_weights.get(rl, 0.0) >= 0.01]
+        total_w = sum(w for _, w in active)
 
         all_paths = []
-        all_weights = []
+        for i, (rl, w) in enumerate(active):
+            n_r = int(round(n_sims * w / total_w)) if total_w > 0 else 0
+            if n_r <= 0:
+                continue
 
-        regime_labels = ["bear", "sideways", "bull"]
-        for rl in regime_labels:
-            w = regime_weights.get(rl, 0.0)
-            if w < 0.01:
-                continue  # Skip negligible regimes
+            # Distinct sub-seed per regime so the regime draws are INDEPENDENT.
+            # Sharing one seed across regimes correlates their innovations and
+            # breaks the mixture's independence assumption.
+            seed_r = None if seed is None else int(seed) + i + 1
 
             # Regime-specific skewed-t lambda
             if use_skewed_t:
@@ -840,8 +939,9 @@ def calculate_probabilities(
                 garch_params=garch_params,
                 jump_params=jump_params,
                 hours_to_expiry=hours_to_expiry,
-                n_sims=n_per_regime,
-                seed=seed,
+                n_sims=n_r,
+                seed=seed_r,
+                martingale_anchor=martingale_anchor,
                 use_naive_prior=use_naive_prior,
                 use_svcj=use_svcj,
                 use_skewed_t=use_skewed_t,
@@ -852,21 +952,21 @@ def calculate_probabilities(
             )
 
             all_paths.append(paths)
-            all_weights.append(np.full(n_per_regime, w))
 
         if not all_paths:
             # Fallback: single simulation
             paths = simulate_paths(
                 S0=S0, garch_params=garch_params, jump_params=jump_params,
                 hours_to_expiry=hours_to_expiry, n_sims=n_sims, seed=seed,
+                martingale_anchor=martingale_anchor,
                 use_naive_prior=use_naive_prior, use_svcj=use_svcj,
                 use_skewed_t=use_skewed_t, use_figarch=use_figarch,
                 regime_label=dominant_regime,
             )
         else:
+            # Proportional allocation already encodes the mixture: equal weight.
             paths = np.concatenate(all_paths)
-            weights_array = np.concatenate(all_weights)
-            # Weighted probability computation below
+        weights_array = None
     else:
         # ---- Single Simulation (legacy / non-regime path) ----
         paths = simulate_paths(
@@ -876,6 +976,7 @@ def calculate_probabilities(
             hours_to_expiry=hours_to_expiry,
             n_sims=n_sims,
             seed=seed,
+            martingale_anchor=martingale_anchor,
             use_naive_prior=use_naive_prior,
             use_svcj=use_svcj,
             use_skewed_t=use_skewed_t,
@@ -921,6 +1022,7 @@ def calculate_probabilities(
         'regime_weights': regime_weights,
         'dominant_regime': dominant_regime,
         'use_naive_prior': use_naive_prior,
+        'martingale_anchor': martingale_anchor,
         'use_regime_switching': use_regime_switching,
         'use_svcj': use_svcj,
         'use_skewed_t': use_skewed_t,
@@ -1366,10 +1468,9 @@ if __name__ == "__main__":
     # Test 7: FIGARCH Weights (Phase 2.5)
     # -------------------------------------------------------------------------
     print("\n[Test 7] FIGARCH Weights...")
-    weights = _compute_figarch_weights(d=0.578, trunc_k=100)
-    # Weights should decay hyperbolically (not exponentially)
-    if weights[0] > weights[-1] * 10:
-        print(f"  PASS: FIGARCH weights decay correctly (w0={weights[0]:.6f}, w99={weights[-1]:.12f})")
+    psi = _compute_figarch_weights(d=0.578, beta=0.85, trunc_k=100)
+    if psi[0] == 0.0 and abs(psi[1]) > abs(psi[-1]) * 10:
+        print(f"  PASS: FIGARCH psi_k correct (psi0={psi[0]:.6f}, psi1={psi[1]:.6f}, psi99={psi[-1]:.12f})")
     else:
         print(f"  FAIL: Unexpected FIGARCH weight pattern")
         all_passed = False
@@ -1409,28 +1510,34 @@ if __name__ == "__main__":
     # Test 9: Skewed-t Variance Consistency (Regression guard for Bug 1)
     # -------------------------------------------------------------------------
     print("\n[Test 9] Skewed-t Variance Consistency...")
-    rng9 = np.random.default_rng(99)
-    n_var_test = 50000
+    n_var_test = 200000
     nu_test = 5.0
 
     all_var_ok = True
-    for lam_test in [-0.3, 0.0, 0.3]:
+    for lam_test in [-0.3, -0.1, 0.0, 0.2, 0.3]:
+        # Fresh independent RNG per lam for reproducible per-case estimates.
+        rng9 = np.random.default_rng(99 + int(round(lam_test * 10)))
         s = skewed_t_rvs(nu_test, lam_test, n_var_test, rng9)
         sf = skewed_t_scale_factor(nu_test, lam_test)
         samples = s * sf  # Combined output as used in simulate_paths
         emp_var = np.var(samples)
-        # Threshold distortion effect: |lam|>0 shifts proportion of samples in each tail
-        # relative to Hansen's unit-variance derivation. Expected ~0.95-0.98 at lam=-0.3.
-        var_ok = 0.94 <= emp_var <= 1.06
-        status = "PASS" if var_ok else "FAIL"
-        if not var_ok:
+        emp_mean = np.mean(samples)
+        # Hansen standardized skew-t: mean 0, variance 1 by construction. Band
+        # reflects finite-sample MC noise (t(nu=5) has high kurtosis -> noisy var
+        # estimate). The old non-standardized sampler injected a nonzero mean
+        # (unintended drift); the |mean| check is the key regression guard.
+        var_ok = 0.96 <= emp_var <= 1.04
+        mean_ok = abs(emp_mean) < 0.02
+        ok = var_ok and mean_ok
+        status = "PASS" if ok else "FAIL"
+        if not ok:
             all_var_ok = False
-        print(f"    lam={lam_test:+4.1f}: variance={emp_var:.4f} [{status}]")
+        print(f"    lam={lam_test:+4.1f}: mean={emp_mean:+.4f} variance={emp_var:.4f} [{status}]")
 
     if all_var_ok:
-        print("  PASS: All skewed-t variances within [0.94, 1.06]")
+        print("  PASS: All skewed-t mean~0 (|m|<0.02) and variance in [0.96, 1.04]")
     else:
-        print("  FAIL: One or more skewed-t variances outside [0.94, 1.06]")
+        print("  FAIL: One or more skewed-t mean/variance out of bounds")
         all_passed = False
 
     # -------------------------------------------------------------------------

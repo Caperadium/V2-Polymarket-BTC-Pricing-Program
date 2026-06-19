@@ -27,7 +27,10 @@ from core.backtesting.batch_loader import (
     scan_batch_files,
     scan_flat_batch_files,
 )
-from core.backtesting.orchestrator import BacktestingOrchestrator
+from core.backtesting.orchestrator import (
+    BacktestingOrchestrator,
+    default_worker_count,
+)
 
 st.set_page_config(page_title="Backtesting", page_icon="📊", layout="wide")
 
@@ -184,6 +187,13 @@ if BACKTEST_MODE == "🌐 Live Fetch from Polymarket":
                                      help="Number of Monte Carlo paths per pricing run")
     fetch_limit = st.sidebar.number_input("Timestamp Limit", 0, 1000, 0, 1,
                                           help="Max number of historical timestamps to backrun (0 = all)")
+    import multiprocessing as _mp
+    _cpu = _mp.cpu_count()
+    n_workers = st.sidebar.number_input(
+        "Worker Processes", 1, _cpu, default_worker_count(), 1,
+        help=f"Parallel processes for MC backrun (1 = serial). This {_cpu}-core "
+             f"machine defaults to {default_worker_count()}.",
+    )
 
 if BACKTEST_MODE == "🌐 Live Fetch from Polymarket":
     # Live Fetch main panel
@@ -236,8 +246,18 @@ if BACKTEST_MODE == "🌐 Live Fetch from Polymarket":
                     "correlation_penalty": correlation_penalty,
                 },
             )
+            _limit = fetch_limit if fetch_limit > 0 else None
+            if _limit is None:
+                st.warning(
+                    "Timestamp Limit = 0 → backrunning **all** historical timestamps "
+                    "with advanced features. This can take a very long time even in "
+                    "parallel. Set a limit to test first.",
+                    icon="⚠️",
+                )
             with st.status("Running full backtesting pipeline...") as status:
-                result = orch.run_full(fetch=False, limit=fetch_limit if fetch_limit > 0 else None)
+                result = orch.run_full(
+                    fetch=False, limit=_limit, workers=int(n_workers)
+                )
                 status.update(label="Pipeline complete!", state="complete")
 
             st.session_state["bt_trades"] = result["trades_df"]
@@ -247,17 +267,24 @@ if BACKTEST_MODE == "🌐 Live Fetch from Polymarket":
             st.session_state["bt_initial"] = initial_bankroll
 
             fetch_errors = result.get("fetch_errors", [])
-            if fetch_errors:
+
+            if len(result.get("trades_df", pd.DataFrame())) == 0:
+                st.warning(
+                    "Pipeline completed but produced 0 trades. "
+                    "Check that BTC data covers the contract date range. "
+                    "Run `python core/data/data_fetcher.py` to refresh data."
+                )
+            elif fetch_errors:
                 st.warning(
                     f"Pipeline complete! {len(result['trades_df'])} trades, "
                     f"{result['new_records']} new price records. "
                     f"{len(fetch_errors)} fetch issue(s) — see Fetch step."
                 )
             else:
-                st.success(
-                    f"Pipeline complete! {len(result['trades_df'])} trades, "
-                    f"{result['new_records']} new price records."
-                )
+                msg = f"Pipeline complete! {len(result['trades_df'])} trades."
+                if result.get("new_records", 0) > 0:
+                    msg += f" {result['new_records']} new price records."
+                st.success(msg)
 
 else:
     # -----------------------------------------------------------------------------

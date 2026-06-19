@@ -9,14 +9,15 @@ and conversion to the market_df format expected by the backrunner engine.
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, Set
+from typing import Dict, Optional, Set, Tuple
 
 import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-# Default CSV path relative to repo root
-DATA_DIR = Path("DATA")
+# Default CSV path resolved relative to this file (works regardless of CWD)
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+DATA_DIR = _PROJECT_ROOT / "DATA"
 DEFAULT_CSV_PATH = DATA_DIR / "historical_contract_prices.csv"
 
 # Schema: every row is one contract at one midnight-UTC date
@@ -106,20 +107,25 @@ class ContractPriceStore:
 
     def get_known_clob_token_ids(self) -> Set[str]:
         """Set of all clobTokenIds already stored."""
-        df = self.load()
-        if df.empty:
-            return set()
-        return set(df["clobTokenId"].dropna().unique())
+        known, _ = self.build_token_index()
+        return known
 
     def get_clob_token_max_date(self, token_id: str) -> Optional[datetime]:
         """Most recent stored date for a specific clobTokenId, or None."""
+        _, max_dates = self.build_token_index()
+        return max_dates.get(str(token_id))
+
+    def build_token_index(self) -> Tuple[Set[str], Dict[str, datetime]]:
+        """Load CSV once and return (known_ids, {token_id: max_date}) in one pass."""
         df = self.load()
         if df.empty:
-            return None
-        mask = df["clobTokenId"] == str(token_id)
-        if not mask.any():
-            return None
-        return df.loc[mask, "date"].max().to_pydatetime()
+            return set(), {}
+        df = df.dropna(subset=["clobTokenId"])
+        known: Set[str] = set(df["clobTokenId"].unique())
+        max_dates: Dict[str, datetime] = (
+            df.groupby("clobTokenId")["date"].max().to_dict()
+        )
+        return known, max_dates
 
     # ------------------------------------------------------------------
     # Merge & Append
