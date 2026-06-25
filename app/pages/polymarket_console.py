@@ -30,6 +30,7 @@ import streamlit as st
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from core.strategy.auto_reco import recommend_trades, recommendations_to_dataframe, load_latest_fitted_batch, RebalanceConfig, DeltaIntent
+from app.ui_filters import moneyness_filter_controls
 from polymarket.db import init_db, get_connection
 from polymarket.models import (
     OrderIntent,
@@ -440,25 +441,7 @@ with st.expander("Auto-Reco Parameters", expanded=True):
         )
 
     with param_row5_col3:
-        use_moneyness_filter = st.checkbox("Limit Moneyness", value=False)
-        min_moneyness = st.number_input(
-            "Min Moneyness",
-            min_value=0.0,
-            max_value=0.5,
-            value=0.0,
-            step=0.01,
-            format="%.2f",
-            disabled=not use_moneyness_filter,
-        )
-        max_moneyness = st.number_input(
-            "Max Moneyness",
-            min_value=0.0,
-            max_value=0.5,
-            value=0.05,
-            step=0.01,
-            format="%.2f",
-            disabled=not use_moneyness_filter,
-        )
+        _mny = moneyness_filter_controls(st, key_prefix="console")
 
     with param_row5_col4:
         use_spread_gate = st.checkbox("Spread-Aware Gate", value=True)
@@ -526,8 +509,9 @@ with st.expander("Auto-Reco Parameters", expanded=True):
         use_prob_threshold=use_prob_threshold,
         prob_threshold_yes=prob_threshold_yes,
         prob_threshold_no=prob_threshold_no,
-        min_moneyness=min_moneyness if use_moneyness_filter else None,
-        max_moneyness=max_moneyness if use_moneyness_filter else None,
+        min_moneyness=_mny["min_moneyness"],
+        max_moneyness=_mny["max_moneyness"],
+        moneyness_mode=_mny["mode"],
     )
 
     reco_extra_params = {

@@ -210,19 +210,30 @@ def run_pipeline_programmatic(
         intraday_csv = str(_project_root / "DATA" / "btc_intraday_1m.csv")
 
         hourly_returns, S0 = load_and_prep_data(hourly_csv, intraday_csv)
-        garch_params = fit_garch_model(hourly_returns)
+        # FIX 1 (C1): fit FIGARCH when advanced features are on so
+        # simulate_paths(use_figarch=True) actually uses long-memory weights
+        # instead of silently falling back to GARCH. Matches the backtest path.
+        garch_params = fit_garch_model(hourly_returns, use_figarch=advanced_features)
         log(f"✅ Model fitted. S0=${S0:.2f}")
 
-        # Optionally calibrate jump parameters from data
+        # FIX 2 (M1): calibrate jumps by default when advanced features are on so the
+        # live jump source matches the backtest (calibrated everywhere via bipower).
+        # Map load_calibrated_jumps' 'lam'/'p_crash' keys to simulate_paths' expected
+        # 'lambda'/'crash_prob' (passing the raw dict silently drops the calibrated
+        # lambda/crash to module defaults).
         calibrated_jumps = None
-        if recalibrate_jumps:
+        if advanced_features or recalibrate_jumps:
             from core.pricing.btc_pricing_engine import load_calibrated_jumps
             cal = load_calibrated_jumps(
-                hourly_csv=hourly_csv, force_recalibrate=True,
+                hourly_csv=hourly_csv, force_recalibrate=recalibrate_jumps,
             )
             if cal.get("fit_converged"):
-                calibrated_jumps = cal
-                log("Using data-calibrated jump parameters")
+                calibrated_jumps = {
+                    "lambda": cal["lam"], "crash_prob": cal["p_crash"],
+                    "eta_up": cal["eta_up"], "eta_down": cal["eta_down"],
+                    "mu_v": cal["mu_v"], "rho_J": cal["rho_J"],
+                }
+                log("Using data-calibrated jump parameters (live)")
         
         now_utc = datetime.now(timezone.utc)
         
@@ -504,7 +515,7 @@ Examples:
                         help="Calibrate jump parameters from BTC data instead of hardcoded defaults")
     parser.add_argument("--advanced-features", action="store_true", default=True,
                         dest="advanced_features",
-                        help="Enable SVCJ+skewed-t+FIGARCH+regime+XGBoost (default: on)")
+                        help="Enable SVCJ+skewed-t+FIGARCH+calibrated-jumps (default: on)")
     parser.add_argument("--no-advanced-features", action="store_false",
                         dest="advanced_features",
                         help="Disable all advanced features (plain GARCH+t+Kou baseline)")

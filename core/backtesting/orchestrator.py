@@ -228,10 +228,25 @@ class BacktestingOrchestrator:
         )
 
         progress_re = re.compile(r"Progress:\s+(\d+)/(\d+)")
+        # hmmlearn's EM convergence monitor can log WARNING-level messages about
+        # log-likelihood oscillations at float-epsilon (~1e-15) — harmless numerical
+        # noise, not real non-convergence. These are suppressed at source in
+        # regime_detector.py, but this regex catches any that leak through other
+        # paths (slsqp Fortran convergence chatter, etc.) so only actionable output
+        # reaches the INFO log.
+        _CONVERGENCE_NOISE = re.compile(
+            r"^\s*(Model is not converging\.\s*"
+            r"(Current:\s+[\d.e+\-]+ is not greater than [\d.e+\-]+\.\s*"
+            r"Delta is [\d.e+\-]+)?|"
+            r"WARNING:hmmlearn\.base:Model is not converging)"
+        )
         assert proc.stdout is not None
         for line in proc.stdout:
             line = line.rstrip()
             if not line:
+                continue
+            if _CONVERGENCE_NOISE.match(line):
+                logger.debug("[backrun noise] %s", line)
                 continue
             logger.info("[backrun] %s", line)
             m = progress_re.search(line)
@@ -407,6 +422,14 @@ class BacktestingOrchestrator:
         # ---- Backtest ----
         if self._progress:
             self._progress("backtesting", 0, 1)
+        if price_df is None:
+            from core.strategy.auto_reco import load_btc_csv
+            # Resolve btc_price_path to absolute so load_btc_csv finds it
+            # regardless of CWD (e.g. Streamlit running from app/)
+            btc_path = Path(self.btc_price_path)
+            if not btc_path.is_absolute():
+                btc_path = _PROJECT_ROOT / btc_path
+            price_df = load_btc_csv(str(btc_path))
         trades_df, equity_df, all_priced_df = self.run_backtest(
             fitted_batches, price_df=price_df
         )
@@ -419,5 +442,16 @@ class BacktestingOrchestrator:
 
         # ---- Diagnostics ----
         results["diagnostics"] = self.run_diagnostics(all_priced_df)
+
+        # ---- Calibration (FIX 7 / M2 Part A) ----
+        # Fit and persist the per-DTE logit shift on backtest history (walk-forward,
+        # leak-aware). This only emits the shift table; it does NOT change any edge
+        # unless core.strategy.common.USE_CALIBRATED_PROB is flipped on (default off).
+        try:
+            from core.pricing.fit_probability_curves import fit_calibration
+            results["calibration"] = fit_calibration(all_priced_df)
+        except Exception:
+            logger.warning("Calibration shift fit failed", exc_info=True)
+            results["calibration"] = {}
 
         return results

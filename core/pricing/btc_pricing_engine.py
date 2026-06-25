@@ -1,9 +1,9 @@
 """
 BTC Pricing Engine v2 — Regime-Switching SVCJ with Long Memory
 
-GARCH(1,1) + Fractionally Integrated Variance + Skewed-t + SVCJ (Kou Double Exponential
-with correlated volatility jumps) Monte Carlo simulator. Regime-conditional via
-3-state HMM. Hourly simulation steps.
+FIGARCH(1,d,1) + Skewed-t + SVCJ (Kou Double Exponential with correlated
+volatility jumps) Monte Carlo simulator. Regime-conditional via 3-state HMM.
+Hourly simulation steps.
 
 Enhancements over v1 (per 17-paper meta-analysis, June 2026):
   Phase 1.1 — Naive prior (μ=0 anchoring) [Baquero 2026, Shelton 2024]
@@ -12,7 +12,7 @@ Enhancements over v1 (per 17-paper meta-analysis, June 2026):
   Phase 1.4 — Skewed-t innovations (Hansen 1994) [Nakakita et al. 2025]
   Phase 1.5 — Horizon-gating (naive prior for T>30d) [Baquero 2026]
   Phase 2.4 — Regime-conditional jump parameters
-  Phase 2.5 — Fractionally integrated variance [Siu 2025]
+  Phase 2.5 — FIGARCH(1,d,1) [Baillie, Bollerslev & Mikkelsen 1996]
   Phase 2.6 — Regime-vol gate interaction protocol
 
 All new features gated by boolean flags (default off except naive prior).
@@ -38,6 +38,7 @@ Usage:
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
 import pandas as pd
 import numpy as np
@@ -46,6 +47,10 @@ from scipy.stats import t as student_t
 from scipy.special import gamma as gamma_func
 
 logger = logging.getLogger(__name__)
+
+# One-shot flag so the FIGARCH fallback (FIGARCH fit → GARCH) is reported
+# once per process instead of on every pricing call.
+_FIGARCH_FALLBACK_WARNED = False
 
 # ==============================================================================
 # JUMP PARAMETERS (Kou's Double Exponential Jump Diffusion)
@@ -63,17 +68,32 @@ SVCJ_MU_V = 0.000025     # Mean volatility jump size (hourly variance units)
 SVCJ_RHO_J = -0.08       # Return-vol jump correlation (Teng 2025 estimate)
 SVCJ_LAM_V = None        # If None, uses same lambda as return jumps
 SVCJ_SIGMA_S = 0.01      # Conditional std dev of return jump given vol jump (Eraker 2004)
+# FIX 5 (H3): persistence (per-hour decay) of the SVCJ variance-jump state on the
+# FIGARCH path. The ARCH(∞) base recomputes variance from the ε² buffer each step
+# and has no β to carry a one-shot vol-jump add, so without a separate decaying
+# state SVCJ degenerates to a plain return jump under FIGARCH. Mean-reversion analog
+# of Eraker's affine variance jump. Must be strictly in (0,1).
+SVCJ_PERSIST = 0.90      # Hourly decay of the vol-jump state (FIGARCH path)
+# Hard cap on the accumulated vol-jump state. With SVCJ_PERSIST=0.90 over a 720-step
+# (30-day hourly) horizon the geometric sum of repeated jumps can compound without
+# bound; the cap (≈ a few × unconditional hourly variance) keeps tails finite.
+VOL_JUMP_STATE_CAP = 1e-3
 
 # ==============================================================================
 # FIGARCH PARAMETERS
-# The fractionally integrated variance model uses (1-L)^d binomial weights
-# with β only in the intercept ω/(1-β). This is a simplified specification —
-# standard FIGARCH(1,d,1) would apply (1-βL)⁻¹ to the ARCH recursion,
-# giving AR(1) feedback on variance. For binary option pricing, the
-# long-memory parameter d dominates; the AR(1) feedback is second-order.
+# FIGARCH(1,d,1) per Baillie, Bollerslev & Mikkelsen (1996):
+#   σ²_t = ω/(1-β) + [1 - (1-βL)⁻¹(1-φL)(1-L)^d] ε²_t
+# ARCH(∞) form (Chung 1999):
+#   σ²_t = ω/(1-β) + Σ λ_k · ε²_{t-k}
+# where λ_k weights are computed via the δ_i and λ_i recurrences matching
+# the `arch` library's figarch_weights_python.
+#
+# φ, d, β are estimated jointly via arch_model(vol='FIGARCH') in fit_garch_model.
+# FIGARCH_D is a reference constant (Siu 2025) used only in testing; live fits
+# estimate d from hourly BTC data.
 # ==============================================================================
-FIGARCH_D = 0.578         # Long memory parameter (Siu 2025 estimate, SE=0.271)
-FIGARCH_TRUNC_K = 1000    # Truncation lag for binomial expansion
+FIGARCH_D = 0.578         # Reference long-memory estimate (Siu 2025, SE=0.271)
+FIGARCH_TRUNC_K = 1000    # Truncation lag for ARCH(∞) approximation
 
 # ==============================================================================
 # SKEWED-T PARAMETERS
@@ -285,51 +305,61 @@ def skewed_t_scale_factor(nu: float, lam: float) -> float:
 
 
 # ==============================================================================
-# FIGARCH BINOMIAL WEIGHTS — Phase 2.5
+# FIGARCH(1,d,1) INFINITE-ARCH WEIGHTS — Phase 2.5
 # ==============================================================================
 
-def _compute_figarch_weights(d: float, beta: float, trunc_k: int = FIGARCH_TRUNC_K) -> np.ndarray:
+def _compute_figarch_weights(d: float, phi: float, beta: float, trunc_k: int = FIGARCH_TRUNC_K) -> np.ndarray:
     """
-    Precompute FIGARCH(1,d,1) infinite-AR weights for the variance recursion.
+    Precompute FIGARCH(1,d,1) infinite-ARCH weights for the variance recursion.
 
-    The standard FIGARCH(1,d,1) variance equation follows Chung (1999):
-        σ²_t = ω/(1-β) + [1 - (1-βL)⁻¹(1-L)^d] ε²_t
+    The standard FIGARCH(1,d,1) specification (Baillie, Bollerslev & Mikkelsen 1996):
+        σ²_t = ω/(1-β) + [1 - (1-βL)⁻¹(1-φL)(1-L)^d] ε²_t
 
-    Expanding (1-L)^d into binomial weights λ_k (λ_0=1) and convolving with
-    (1-βL)⁻¹ gives the ψ_k filter:
-        ψ_0 = 0                    (no contemporaneous ε² term)
-        ψ_k = -f_k  for k ≥ 1      where f_k = λ_k + β·f_{k-1},  f_0 = 1
+    Chung (1999) gives the ARCH(∞) representation:
+        σ²_t = ω/(1-β) + Σ λ_k · ε²_{t-k}
 
-    Variance update:  σ²_t = ω/(1-β) + Σ_{k=1}^{trunc_k-1} ψ_k · ε²_{t-k}
+    where the λ_k weights follow the recurrence (matching the `arch` library):
+        δ₁ = d
+        λ₁ = φ - β + d
+        for i ≥ 2:
+            δ_i = ((i-1-d) / i) · δ_{i-1}
+            λ_i = β · λ_{i-1} + (δ_i - φ · δ_{i-1})
+
+    The returned array is aligned with the simulation's past_eps_sq buffer:
+        weights[0] = 0           (no contemporaneous ε² term)
+        weights[k] = λ_k for k≥1  (weight on ε²_{t-k})
 
     Args:
-        d: Long memory parameter (0 < d < 1).
-        beta: GARCH β parameter for (1-βL)⁻¹ convolution.
-        trunc_k: Number of lags in truncation.
+        d: Fractional differencing parameter (0 < d < 1).
+        phi: Short-run ARCH parameter.
+        beta: GARCH persistence parameter (also in intercept ω/(1-β)).
+        trunc_k: Number of lags in truncation (default 1000).
 
     Returns:
-        Array of length trunc_k with ψ_k weights (ψ_0=0, ψ_k = -f_k for k≥1).
+        Array of length trunc_k: weights[0]=0, weights[k]=λ_k for k=1..trunc_k-1.
     """
     if d <= 0 or d >= 1:
         raise ValueError(f"FIGARCH d must be in (0, 1), got {d}")
 
-    # Step 1: Binomial weights for (1-L)^d via recurrence
-    #   λ_0 = 1,  λ_k = λ_{k-1} · (k-1-d)/k  for k ≥ 1
-    lam = np.ones(trunc_k)
-    for i in range(1, trunc_k):
-        lam[i] = lam[i - 1] * (i - 1 - d) / i
+    # Compute λ_k for k = 1..trunc_k-1 (need trunc_k-1 weights
+    # since index 0 is reserved for the 0-valued contemporaneous slot)
+    n_lags = trunc_k - 1
+    delta = np.empty(n_lags)
+    lam = np.empty(n_lags)
 
-    # Step 2: Convolve with (1-βL)⁻¹ to get FIGARCH(1,d,1) filter
-    #   f_k = λ_k + β·f_{k-1}  with f_0 = 1
-    #   ψ_0 = 0,  ψ_k = -f_k  for k ≥ 1
-    psi = np.zeros(trunc_k)
-    f_prev = 1.0  # f_0 = λ_0 = 1
-    for i in range(1, trunc_k):
-        f_i = lam[i] + beta * f_prev
-        psi[i] = -f_i
-        f_prev = f_i
+    # Initialization: δ₁ = d,  λ₁ = φ - β + d
+    delta[0] = d
+    lam[0] = phi - beta + d
 
-    return psi
+    # Recurrence for i ≥ 2 (matching arch library figarch_weights_python)
+    for i in range(1, n_lags):
+        delta[i] = (i - d) / (i + 1) * delta[i - 1]
+        lam[i] = beta * lam[i - 1] + (delta[i] - phi * delta[i - 1])
+
+    # Build output: weights[0] = 0, weights[1:] = lam
+    weights = np.zeros(trunc_k)
+    weights[1:] = lam
+    return weights
 
 
 # ==============================================================================
@@ -344,10 +374,12 @@ def fit_garch_model(
     figarch_trunc_k: int = FIGARCH_TRUNC_K,
 ):
     """
-    Fits a GARCH(1,1) model with Student-t errors.
+    Fit GARCH(1,1) or FIGARCH(1,d,1) with Student-t errors via the `arch` library.
 
     Phase 0.1: training_start_date filters to post-2019 structural break.
-    Phase 2.5: Fractionally integrated variance available via use_figarch=True.
+    Phase 2.5: When use_figarch=True, fits FIGARCH(1,d,1) directly via
+      arch_model(vol='FIGARCH', p=1, q=1). Jointly estimates φ, d, β, ω, ν, μ.
+      Falls back to GARCH(1,1) on convergence failure.
 
     Uses the long-term fitted mean (structural mu) as drift.
     All returned parameters are in hourly log-return units.
@@ -355,18 +387,100 @@ def fit_garch_model(
     Args:
         returns: pd.Series of hourly log returns.
         training_start_date: Ignored here (filtered upstream in load_and_prep_data).
-        use_figarch: If True, fit FIGARCH instead of GARCH (requires arch>=7.0).
-        figarch_d: Long memory parameter for FIGARCH.
-        figarch_trunc_k: Truncation lag for FIGARCH binomial expansion.
+        use_figarch: If True, fit FIGARCH(1,d,1) instead of GARCH(1,1).
+        figarch_d: Unused when live-fitting FIGARCH (d comes from fit).
+            Retained for backward compat; FIGARCH_D constant used in tests only.
+        figarch_trunc_k: Unused when live-fitting FIGARCH (FIGARCH_TRUNC_K used).
 
     Returns:
-        Dict with omega, alpha, beta, nu, mu, last_variance (hourly units).
-        Additional keys if use_figarch: figarch_weights, d.
+        For FIGARCH: Dict with omega, beta, nu, mu, last_variance, use_figarch,
+            figarch_weights, figarch_d, figarch_phi, figarch_trunc_k.
+            (No 'alpha' key — consumers should use .get('alpha', 0.0).)
+        For GARCH: Dict with omega, alpha, beta, nu, mu, last_variance.
     """
     # 1. Scale returns for numerical stability
     scaled_returns = returns * 100
 
-    # 2. Fit GARCH(1,1) with Student-t
+    if use_figarch:
+        # ---- FIGARCH(1,d,1) fit (Phase 2.5) ----
+        # Fit FIGARCH jointly via arch library (Baillie-Bollerslev-Mikkelsen 1996).
+        # Joint estimation of φ, d, β satisfies B-M positivity internally.
+        try:
+            model = arch_model(scaled_returns, vol='FIGARCH', p=1, q=1, dist='t', mean='Constant')
+            res = model.fit(disp='off', show_warning=False)
+
+            if res.convergence_flag != 0:
+                status_code = res.optimization_result.get('status', 'unknown')
+                status_msg = res.optimization_result.get('message', 'unknown')
+                logger.warning(
+                    "FIGARCH fit may not have converged (code=%s): %s. "
+                    "Retrying with relaxed tolerance.",
+                    status_code, status_msg,
+                )
+                try:
+                    res = model.fit(disp='off', show_warning=False, options={'ftol': 1e-6, 'maxiter': 500})
+                except Exception:
+                    logger.warning("FIGARCH fallback fit failed; falling back to GARCH")
+                    use_figarch = False
+                if use_figarch and res.convergence_flag != 0:
+                    logger.warning(
+                        "FIGARCH fallback fit also not converged (code=%s). "
+                        "Falling back to GARCH.",
+                        res.optimization_result.get('status', 'unknown'),
+                    )
+                    use_figarch = False
+            if use_figarch:
+                params = res.params
+                omega = params['omega'] / 10000.0
+                phi_val = params['phi']
+                d_val = params['d']
+                beta_val = params['beta']
+                nu = params['nu']
+                mu = params['mu'] / 100.0
+
+                # Compute ARCH(∞) weights
+                weights = _compute_figarch_weights(d_val, phi_val, beta_val, FIGARCH_TRUNC_K)
+
+                # FIX 11 (L6): Baillie-Bollerslev-Mikkelsen positivity check.
+                # For pathological (φ,d,β) the ARCH(∞) weights can go negative,
+                # which would let the variance recursion produce negative variance
+                # (silently floored to 1e-10 downstream — i.e. a dead vol process).
+                # Detect it here and fall back to GARCH rather than ship a broken
+                # long-memory recursion. weights[0] is the (intentionally 0)
+                # contemporaneous slot, so only check weights[1:]. Raising routes to
+                # the outer `except` below, which sets use_figarch=False → GARCH fit.
+                if np.any(weights[1:] < -1e-10):
+                    n_neg = int(np.sum(weights[1:] < -1e-10))
+                    raise ValueError(
+                        f"FIGARCH weights violate B-M positivity ({n_neg} negative "
+                        f"lags, min={float(weights[1:].min()):.3e}) for d={d_val:.4f}, "
+                        f"phi={phi_val:.4f}, beta={beta_val:.4f}"
+                    )
+
+                result = {
+                    'omega': omega,
+                    'beta': beta_val,
+                    'nu': nu,
+                    'mu': mu,
+                    'last_variance': res.conditional_volatility.iloc[-1]**2 / 10000.0,
+                    'use_figarch': True,
+                    'figarch_weights': weights,
+                    'figarch_d': d_val,
+                    'figarch_phi': phi_val,
+                    'figarch_trunc_k': FIGARCH_TRUNC_K,
+                }
+                logger.info(
+                    "FIGARCH(1,d,1) fitted: d=%.4f, phi=%.4f, beta=%.4f, "
+                    "lambda_1=%.4f (B-M positivity satisfied)",
+                    d_val, phi_val, beta_val, weights[1],
+                )
+                return result
+        except Exception as e:
+            logger.warning("FIGARCH fit failed (%s), falling back to GARCH", e)
+            use_figarch = False
+        # Fall through to GARCH if FIGARCH failed
+
+    # ---- Standard GARCH(1,1) fit (legacy / FIGARCH fallback) ----
     # Suppress arch's raw ConvergenceWarning (scipy SLSQP code 8 is intermittent
     # and the returned params are usually still usable). We check convergence
     # ourselves and log a clean warning with context.
@@ -413,33 +527,6 @@ def fit_garch_model(
         'last_variance': res.conditional_volatility.iloc[-1]**2 / 10000.0
     }
 
-    # FIGARCH precomputation (Phase 2.5)
-    if use_figarch:
-        try:
-            weights = _compute_figarch_weights(figarch_d, beta_val, figarch_trunc_k)
-            # Bollerslev-Mikkelsen non-negativity: the conditional variance is only
-            # guaranteed positive when the ψ_k ARCH weights (k>=1) are non-negative.
-            # With the Siu d=0.578 estimate and typical β, ψ_1 = d-β can be negative,
-            # in which case a large recent shock would REDUCE variance — not a valid
-            # variance process. Reject and fall back to GARCH rather than masking it
-            # behind the downstream 1e-10 floor.
-            if np.any(weights[1:] < -1e-10):
-                n_neg = int(np.sum(weights[1:] < -1e-10))
-                logger.warning(
-                    "FIGARCH positivity violated: %d negative ψ_k weights "
-                    "(d=%.3f, beta=%.3f, e.g. psi_1=%.4f). Falling back to GARCH.",
-                    n_neg, figarch_d, beta_val, weights[1],
-                )
-                result['use_figarch'] = False
-            else:
-                result['figarch_weights'] = weights
-                result['figarch_d'] = figarch_d
-                result['figarch_trunc_k'] = figarch_trunc_k
-                logger.info(f"FIGARCH enabled: d={figarch_d:.3f}, trunc_k={figarch_trunc_k}")
-        except Exception as e:
-            logger.warning(f"FIGARCH weight computation failed ({e}), falling back to GARCH")
-            result['use_figarch'] = False
-
     return result
 
 
@@ -458,9 +545,9 @@ def check_variance_consistency(garch_params: dict, n_samples: int = 10000, seed:
     """
     rng = np.random.default_rng(seed)
 
-    omega = garch_params['omega']
-    alpha = garch_params['alpha']
-    beta_val = garch_params['beta']
+    omega = garch_params.get('omega', 0.0)
+    alpha = garch_params.get('alpha', 0.0)
+    beta_val = garch_params.get('beta', 0.0)
     nu = garch_params['nu']
     model_variance = garch_params['last_variance']
 
@@ -516,6 +603,14 @@ def simulate_paths(
     Simulates price paths using GARCH(1,1)/FIGARCH + Skewed-t/Student-t + SVCJ jumps
     on HOURLY steps.
 
+    MEASURE NOTE (FIX 9 / M3): by default this simulates under the PHYSICAL measure
+    and is MEDIAN-anchored (use_naive_prior sets μ=0 with only the jump-drift
+    compensator subtracted; there is NO diffusion convexity / Jensen correction). It
+    is therefore NOT a risk-neutral distribution and E[S_T] ≠ S0 in general. The
+    risk-neutral switch is `martingale_anchor=True`, which uses the exponential
+    cumulant compensator so E[S_T]=S0. Downstream `p_market_fit` (formerly p_rn_fit)
+    is a logistic fit to MARKET prices, not a risk-neutral model probability.
+
     Phase 1.1 (use_naive_prior): Sets μ=0, anchoring distribution on current price.
     Phase 1.3 (use_svcj): Adds correlated volatility jumps (Eraker 2004 specification).
     Phase 1.4 (use_skewed_t): Hansen (1994) skewed-t innovations instead of Student-t.
@@ -555,6 +650,7 @@ def simulate_paths(
         svcj_mu_v = SVCJ_MU_V
         svcj_rho_j = SVCJ_RHO_J
         svcj_sigma_s = SVCJ_SIGMA_S
+        svcj_persist = SVCJ_PERSIST
     else:
         lam = jump_params.get('lambda', LAMBDA)
         p_crash = jump_params.get('crash_prob', CRASH_PROB)
@@ -563,6 +659,7 @@ def simulate_paths(
         svcj_mu_v = jump_params.get('mu_v', SVCJ_MU_V)
         svcj_rho_j = jump_params.get('rho_J', SVCJ_RHO_J)
         svcj_sigma_s = jump_params.get('sigma_s', SVCJ_SIGMA_S)
+        svcj_persist = jump_params.get('svcj_persist', SVCJ_PERSIST)
 
     # --- Regime-Conditional Jump Overrides (Phase 2.4) ---
     if regime_jump_params and regime_label in regime_jump_params:
@@ -574,6 +671,7 @@ def simulate_paths(
         svcj_mu_v = rp.get('mu_v', svcj_mu_v)
         svcj_rho_j = rp.get('rho_J', svcj_rho_j)
         svcj_sigma_s = rp.get('sigma_s', svcj_sigma_s)
+        svcj_persist = rp.get('svcj_persist', svcj_persist)
         logger.debug(f"Regime-conditional jumps ({regime_label}): lam={lam:.1f}, p_crash={p_crash:.2f}")
 
     # --- Vol Gate Interaction (Phase 2.6) ---
@@ -584,6 +682,10 @@ def simulate_paths(
     elif vol_gate_regime == "high":
         lam *= 1.2
         svcj_mu_v *= 1.3
+
+    # FIX 5 (H3): the vol-jump state is a geometric accumulator; persistence must be
+    # strictly in (0,1) or it either never decays (≥1 → unbounded) or is inert (≤0).
+    svcj_persist = float(np.clip(svcj_persist, 1e-6, 1.0 - 1e-6))
 
     # 1. Convert Annual Lambda to Hourly
     lam_hourly = lam / HOURS_PER_YEAR
@@ -621,7 +723,7 @@ def simulate_paths(
         dt_schedule[-1] = hours_to_expiry % 1
 
     omega = garch_params['omega']
-    alpha = garch_params['alpha']
+    alpha = garch_params.get('alpha', 0.0)  # absent in FIGARCH-fitted dict
     beta_val = garch_params['beta']
     nu = garch_params['nu']
     mu = garch_params['mu']  # Hourly log-return units (scalar)
@@ -630,15 +732,30 @@ def simulate_paths(
     # FIGARCH precomputed weights (Phase 2.5)
     figarch_weights = garch_params.get('figarch_weights', None)
     if use_figarch and figarch_weights is None:
-        logger.warning("use_figarch=True but no figarch_weights in garch_params; using GARCH")
+        # FIGARCH weights missing: fit_garch_model either wasn't called with
+        # use_figarch=True or the FIGARCH fit fell back to GARCH.
+        # Log once per process.
+        global _FIGARCH_FALLBACK_WARNED
+        if not _FIGARCH_FALLBACK_WARNED:
+            logger.warning("use_figarch=True but no figarch_weights in garch_params; using GARCH")
+            _FIGARCH_FALLBACK_WARNED = True
+        else:
+            logger.debug("use_figarch=True but no figarch_weights in garch_params; using GARCH")
         use_figarch = False
 
     # FIGARCH lag buffer for past squared returns
     if use_figarch and figarch_weights is not None:
         figarch_trunc_k = len(figarch_weights)
-        # Initialize past squared returns with unconditional variance
-        unconditional_var = omega / (1 - alpha - beta_val) if (alpha + beta_val) < 1 else omega / 0.01
-        past_eps_sq = np.full((n_sims, figarch_trunc_k), unconditional_var)
+        # Initialize past squared returns with last fitted variance (works for
+        # both FIGARCH and GARCH dicts; buffer fills with actual ε² within K steps)
+        past_eps_init = garch_params.get('last_variance', omega / (1 - alpha - beta_val) if (alpha + beta_val) < 1 else omega / 0.01)
+        past_eps_sq = np.full((n_sims, figarch_trunc_k), past_eps_init)
+
+    # FIX 5 (H3): whether the FIGARCH recursion is actually active (it may have been
+    # disabled just above when weights are missing). Decides whether SVCJ vol jumps
+    # persist via the decaying `vol_jump_state` (FIGARCH path, no β) or via the
+    # inline `variances += vol_jump_mag` that GARCH's β already carries forward.
+    figarch_active = use_figarch and figarch_weights is not None
 
     # Naive prior enforcement (Phase 1.1): set μ=0
     if use_naive_prior:
@@ -646,6 +763,9 @@ def simulate_paths(
 
     log_prices = np.full(n_sims, np.log(S0))
     variances = np.full(n_sims, current_variance)
+    # FIX 5 (H3): persistent, decaying SVCJ variance-jump state (FIGARCH path).
+    # Carried from step t-1 and added on top of the ARCH(∞) base at step t.
+    vol_jump_state = np.zeros(n_sims)
 
     for step_idx, dt in enumerate(dt_schedule):
         # ---- Innovation Distribution ----
@@ -683,16 +803,21 @@ def simulate_paths(
             epsilon_squared = (step_sigma * z_t) ** 2  # (sigma * z)² = return²
 
             if use_figarch and figarch_weights is not None:
-                # FIGARCH(1,d,1): σ²_t = ω/(1-β) + Σ ψ_k · ε²_{t-k}
+                # FIGARCH(1,d,1): σ²_t = ω/(1-β) + Σ λ_k · ε²_{t-k}
                 # Shift past returns, insert current
                 past_eps_sq = np.roll(past_eps_sq, 1, axis=1)
                 past_eps_sq[:, 0] = epsilon_squared
-                # Weighted sum (ψ_0 = 0, so no contemporaneous ε² term)
+                # Weighted sum (weights[0] = 0, no contemporaneous ε² term)
                 figarch_component = np.sum(
                     past_eps_sq[:, :figarch_trunc_k] * figarch_weights[np.newaxis, :figarch_trunc_k],
                     axis=1
                 )
-                variances = omega / (1 - beta_val) + figarch_component
+                # FIX 5 (H3): add the vol-jump state carried from the PREVIOUS step.
+                # The FIGARCH recompute would otherwise overwrite (erase) any SVCJ
+                # variance jump every step. `vol_jump_state` is updated at the END of
+                # the SVCJ block below, so step t adds state_{t-1} here and writes
+                # state_t there — the correct read-then-write ordering.
+                variances = omega / (1 - beta_val) + figarch_component + vol_jump_state
             else:
                 # Standard GARCH(1,1)
                 variances = omega + alpha * epsilon_squared + beta_val * variances
@@ -717,16 +842,20 @@ def simulate_paths(
 
         jump_sizes = up_mag - down_mag  # log-return: up=positive, down=negative
 
-        # ---- SVCJ Volatility Jumps (Phase 1.3) ----
+        # ---- SVCJ Volatility Jumps (Phase 1.3 + FIX 5 H3 persistence) ----
         if use_svcj and svcj_mu_v > 0:
             # Eraker (2004) SVCJ: return and variance jump on the SAME Poisson
             # events (k) — contemporaneous, not an independent vol-jump process.
             mask_vol_jump = k > 0
 
+            # FIX 5 (H3) critical init: vol_jump_mag must be defined on EVERY step
+            # (including no-jump steps), or the vol_jump_state update below NameErrors
+            # / reuses a stale array from a prior jumping step.
+            vol_jump_mag = np.zeros(n_sims)
+
             if np.any(mask_vol_jump):
                 # Magnitude of the variance jump given k jumps in the step: sum of
                 # k exponential(mean=mu_v) draws = Gamma(k, scale=mu_v). Zero where k=0.
-                vol_jump_mag = np.zeros(n_sims)
                 vol_jump_mag[mask_vol_jump] = rng.gamma(
                     k[mask_vol_jump], scale=svcj_mu_v
                 )
@@ -739,10 +868,24 @@ def simulate_paths(
                 stochastic_residual = rng.normal(0, svcj_sigma_s, size=n_sims)
                 stochastic_residual[~mask_vol_jump] = 0.0
                 jump_sizes += correlated_adjustment + stochastic_residual
-                variances += vol_jump_mag  # Add vol jump to variance
 
-                # Ensure variance stays positive
-                variances = np.maximum(variances, 1e-12)
+                if not figarch_active:
+                    # GARCH path: β already persists the vol jump into future
+                    # variance, so add it inline as before (unchanged behavior).
+                    variances += vol_jump_mag
+                    variances = np.maximum(variances, 1e-12)
+
+            if figarch_active:
+                # FIGARCH path: persist the vol jump via a decaying state instead.
+                # The ARCH(∞) base recomputes variance from the ε² buffer each step
+                # (no β), so a one-shot inline add would be erased next step — the
+                # original H3 bug. Carry state_t = persist·state_{t-1} + mag_t, read
+                # at the top of the next step. Cap to keep the geometric accumulation
+                # finite over long horizons; assert finiteness as a safety net.
+                vol_jump_state = np.clip(
+                    svcj_persist * vol_jump_state + vol_jump_mag,
+                    0.0, VOL_JUMP_STATE_CAP,
+                )
 
         total_log_return = garch_ret + jump_sizes
         # Clip per-step return to prevent variance feedback cascade from
@@ -800,6 +943,10 @@ def calculate_probabilities(
     xgb_model=None,        # DirectionalXGB instance
     # --- Backtesting ---
     disable_staleness_check: bool = False,
+    # FIX 4 (H1): snapshot wall-clock for leak-free, deterministic regime refit
+    # gating during time-travel backtests. Keyword-only with a default, so existing
+    # callers are unaffected. None → live mode (regime detector uses real wall time).
+    as_of: Optional[datetime] = None,
 ):
     """
     Calculates probabilities for multiple strikes using hourly simulation.
@@ -894,8 +1041,11 @@ def calculate_probabilities(
             else:
                 daily_ret = hourly_to_daily_returns(hourly_path=hourly_csv)
 
-            # Fit/predict
-            regime_weights, dominant_regime = regime_detector.fit_predict(daily_ret)
+            # Fit/predict. FIX 4 (H1): thread `as_of` into the refit gate so a
+            # time-travel backtest never refits on real wall-clock time (which would
+            # both leak future data into the refit cadence and be non-deterministic).
+            # In live mode as_of is None → RegimeDetector.fit falls back to wall time.
+            regime_weights, dominant_regime = regime_detector.fit_predict(daily_ret, now=as_of)
             logger.info(f"Regime detection: dominant={dominant_regime}, weights={regime_weights}")
         except Exception as e:
             logger.warning(f"Regime detection failed ({e}); using default sideways regime")
@@ -995,22 +1145,22 @@ def calculate_probabilities(
         else:
             prob = get_contract_probability(paths, strike)
 
-        # ---- Phase 2.3: Directional XGBoost Modifier ----
+        # ---- Phase 2.3: Directional XGBoost Modifier (FIX 3 / H2: DISABLED) ----
+        # The old blend `prob = 0.7*prob + 0.3*p_xgb` mixed a STRIKE-SPECIFIC MC
+        # probability with a STRIKE-AGNOSTIC P(up), shifting every strike on the
+        # ladder by the same additive amount — which breaks monotonicity and
+        # corrupts the whole curve. It was also never wired (xgb_model always None)
+        # and, when called, returned 0.5 (no btc_returns passed). Hard-disable so it
+        # cannot silently corrupt probabilities. Re-enable only via a drift-shift
+        # design on the simulated distribution (see FIX 3 Step B), not a per-strike
+        # average.
         if use_xgb_direction and xgb_model is not None:
-            try:
-                # Get directional adjustment from XGBoost
-                direction_modifier = xgb_model.predict_direction_adjustment(
-                    S0=S0,
-                    hours_to_expiry=hours_to_expiry,
-                    macro_df=macro_df,
-                )
-                # Blend: p_final = 0.7 * p_model + 0.3 * p_xgb_modifier
-                # (weight moderate per Shelton OOS evidence: individual predictors weak)
-                xgb_weight = 0.3
-                prob = (1 - xgb_weight) * prob + xgb_weight * direction_modifier
-                prob = np.clip(prob, 0.01, 0.99)
-            except Exception as e:
-                logger.warning(f"XGBoost direction modifier failed ({e}); using unmodified probability")
+            raise NotImplementedError(
+                "XGBoost directional blend is disabled: linear per-strike blending of "
+                "a strike-agnostic P(up) is invalid (breaks ladder monotonicity). "
+                "Re-enable only via a drift-shift design (FIX 3 Step B). "
+                "Set use_xgb_direction=False."
+            )
 
         results[strike] = float(prob)
 
@@ -1093,7 +1243,8 @@ def load_calibrated_jumps(
         logger.info("Calibrating jump parameters from %s ...", hourly_csv)
         result: JumpCalibrationResult = calibrate_jumps(
             hourly_csv=hourly_csv,
-            detection_method="MAD",
+            # FIX 2 (M4): bipower default everywhere for backtest↔live parity.
+            detection_method="bipower",
         )
         calibrated = {
             "lam": result.lam,
@@ -1465,14 +1616,108 @@ if __name__ == "__main__":
         all_passed = False
 
     # -------------------------------------------------------------------------
-    # Test 7: FIGARCH Weights (Phase 2.5)
+    # Test 6b: SVCJ Vol Jumps UNDER FIGARCH (Phase 2.5 + FIX 5 / H3)
     # -------------------------------------------------------------------------
-    print("\n[Test 7] FIGARCH Weights...")
-    psi = _compute_figarch_weights(d=0.578, beta=0.85, trunc_k=100)
-    if psi[0] == 0.0 and abs(psi[1]) > abs(psi[-1]) * 10:
-        print(f"  PASS: FIGARCH psi_k correct (psi0={psi[0]:.6f}, psi1={psi[1]:.6f}, psi99={psi[-1]:.12f})")
+    # Regression guard for the H3 bug: under FIGARCH the variance recompute used to
+    # erase the SVCJ vol-jump add every step, so SVCJ ≈ plain return jump (no extra
+    # tail variance). With the persistent decaying vol_jump_state, SVCJ must now
+    # measurably increase terminal-return std. Uses an inflated mu_v=1e-4 (as in
+    # Test 6) so the lift is well above MC noise; at the calibrated default
+    # (2.5e-5) the effect can be below the noise floor and the test would flap.
+    print("\n[Test 6b] SVCJ Volatility Jumps under FIGARCH...")
+    _fig_weights = _compute_figarch_weights(d=0.3889, phi=0.3056, beta=0.4558, trunc_k=200)
+    test_figarch6 = {
+        'omega': 0.00001 / 24,
+        'beta': 0.4558,
+        'nu': 5.0,
+        'mu': 0.0,
+        'last_variance': 0.0004 / 24,
+        'use_figarch': True,
+        'figarch_weights': _fig_weights,
+        'figarch_d': 0.3889,
+        'figarch_phi': 0.3056,
+    }
+    paths_fig_no_svcj = simulate_paths(
+        S0=100000.0, garch_params=test_figarch6,
+        jump_params={'lambda': 25.0, 'crash_prob': 0.6, 'eta_up': 50.0, 'eta_down': 25.0,
+                     'mu_v': 0.0, 'rho_J': 0.0},
+        hours_to_expiry=720.0, n_sims=5000, seed=42,
+        use_svcj=False, use_figarch=True,
+    )
+    paths_fig_svcj = simulate_paths(
+        S0=100000.0, garch_params=test_figarch6,
+        jump_params={'lambda': 25.0, 'crash_prob': 0.6, 'eta_up': 50.0, 'eta_down': 25.0,
+                     'mu_v': 0.0001, 'rho_J': -0.3},
+        hours_to_expiry=720.0, n_sims=5000, seed=42,
+        use_svcj=True, use_figarch=True,
+    )
+    std_fig_svcj = np.std(np.log(paths_fig_svcj / 100000))
+    std_fig_no_svcj = np.std(np.log(paths_fig_no_svcj / 100000))
+    finite_ok = np.all(np.isfinite(paths_fig_svcj)) and np.all(paths_fig_svcj > 0)
+
+    if std_fig_svcj > std_fig_no_svcj * 1.03 and finite_ok:
+        print(f"  PASS: FIGARCH SVCJ vol={std_fig_svcj:.6f} > 1.03 * SVJ vol={std_fig_no_svcj:.6f} "
+              f"(vol jumps persist under FIGARCH)")
     else:
-        print(f"  FAIL: Unexpected FIGARCH weight pattern")
+        print(f"  FAIL: FIGARCH SVCJ vol={std_fig_svcj:.6f} <= 1.03 * SVJ vol={std_fig_no_svcj:.6f} "
+              f"or non-finite paths (finite_ok={finite_ok})")
+        all_passed = False
+
+    # -------------------------------------------------------------------------
+    # Test 7: FIGARCH(1,d,1) Weights vs arch library reference (Phase 2.5)
+    # -------------------------------------------------------------------------
+    print("\n[Test 7] FIGARCH(1,d,1) Weights...")
+    try:
+        from arch.univariate.recursions_python import figarch_weights_python
+        _HAS_ARCH_RECURSIONS = True
+    except ImportError:
+        _HAS_ARCH_RECURSIONS = False
+
+    # Test with params matching the fit result on our hourly BTC data
+    phi, d_val, beta = 0.3056, 0.3889, 0.4558
+    weights = _compute_figarch_weights(d_val, phi, beta, trunc_k=100)
+
+    # 1. weights[0] must be 0 (no contemporaneous eps^2 term)
+    if weights[0] == 0.0:
+        print(f"  PASS: weights[0]=0 (contemporaneous eps^2 excluded)")
+    else:
+        print(f"  FAIL: weights[0]={weights[0]:.6f} (must be 0)")
+        all_passed = False
+
+    # 2. lambda_1 (weights[1]) must be positive (B-M positivity)
+    if weights[1] > 0:
+        print(f"  PASS: lambda_1={weights[1]:+.6f} > 0 (B-M positivity satisfied)")
+    else:
+        print(f"  FAIL: lambda_1={weights[1]:+.6f} <= 0 (B-M positivity violated)")
+        all_passed = False
+
+    # 3. Hyperbolic decay: first weight dominates tail
+    if abs(weights[1]) > abs(weights[-1]) * 10:
+        print(f"  PASS: hyperbolic decay (lambda_1={weights[1]:.6f}, lambda_99={weights[-1]:.12f})")
+    else:
+        print(f"  FAIL: unexpected decay pattern")
+        all_passed = False
+
+    # 4. Validate against arch library reference implementation
+    if _HAS_ARCH_RECURSIONS:
+        ref_weights = figarch_weights_python(
+            np.array([phi, d_val, beta]), p=1, q=1, trunc_lag=99)
+        # our weights[1:] should match ref_weights[0:]
+        max_diff = np.max(np.abs(weights[1:] - ref_weights))
+        if max_diff < 1e-12:
+            print(f"  PASS: matches arch library reference (max diff={max_diff:.2e})")
+        else:
+            print(f"  FAIL: max diff vs arch library = {max_diff:.2e}")
+            all_passed = False
+    else:
+        print(f"  SKIP: arch.univariate.recursions_python not importable")
+
+    # 5. All weights must be non-negative
+    if np.all(weights >= -1e-10):
+        print(f"  PASS: all weights non-negative (min={weights.min():.8f})")
+    else:
+        neg = int(np.sum(weights < -1e-10))
+        print(f"  FAIL: {neg} negative weights")
         all_passed = False
 
     # -------------------------------------------------------------------------

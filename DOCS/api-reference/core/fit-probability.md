@@ -31,7 +31,7 @@ Fit logistic probability curves per expiry group. Models `P(above) = 1/(1 + exp(
 | `T_col` | str | Days-to-expiry column |
 | `fit_floor` | float/None | Floor for fitted probabilities |
 
-**Returns**: `pd.DataFrame` with added columns: `p_model_fit`, `p_rn_fit`, `logit_shift`.
+**Returns**: `pd.DataFrame` with added columns: `p_model_fit`, `p_market_fit` (alias `p_rn_fit`), `edge_vs_market_fit`, `edge_vs_rn_fit` — plus `p_model_cal` when outcome-based recalibration is enabled (`USE_CALIBRATED_PROB=True`).
 
 ### `fit_risk_neutral_curves(df, prob_col='p_real_mc', ...)`
 
@@ -60,10 +60,11 @@ Enrich batch results with live order book bid/ask prices from Polymarket CLOB.
 |--------|--------|-------------|
 | `p_real_mc` | MC simulation | Raw model probability |
 | `p_model_fit` | Logistic fit | Smoothed model probability curve |
-| `p_rn_fit` | Market fit | Risk-neutral (market-implied) probability curve |
+| `p_model_cal` | Calibration | `sigmoid(logit(p_model_fit) + B_bucket)` — only when `USE_CALIBRATED_PROB=True` |
+| `p_market_fit` | Market fit | Logistic fit to market price (formerly `p_rn_fit`; not risk-neutral) |
+| `p_rn_fit` | Market fit | Deprecated alias of `p_market_fit` (identical) |
 | `market_price` | Polymarket | Mid-market price |
-| `logit_shift` | Calibration | Logit-space calibration adjustment |
-| `edge` | Computed | `p_model_fit - market_price` |
+| `edge_vs_market_fit` | Computed | `p_model_fit - market_price` |
 
 ## CLI
 

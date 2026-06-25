@@ -14,7 +14,7 @@
 
 **Hansen Skewed-t**: Asymmetric student-t distribution (Hansen 1994). Parameter λ ∈ (-1,1) controls skew direction. Negative λ → left skew (crashes more likely). Optional in the pricing engine (`use_skewed_t=True`).
 
-**FIGARCH**: Fractionally Integrated GARCH. Captures long-memory in volatility (hyperbolic autocorrelation decay vs exponential in standard GARCH). Parameter d ≈ 0.578 for BTC (Siu 2025). Optional (`use_figarch=True`).
+**FIGARCH(1,d,1)**: Fractionally Integrated GARCH per Baillie, Bollerslev & Mikkelsen (1996). Captures long-memory in volatility (hyperbolic autocorrelation decay vs exponential in standard GARCH). Parameters phi, d, beta estimated jointly via arch library from hourly BTC returns. Optional (`use_figarch=True`).
 
 **Horizon Gating**: Scaling model complexity by time-to-expiry. T > 90d: naive prior only. T < 7d: full model (SVCJ + skewed-t + FIGARCH). Reduces over-parameterization of long-dated contracts.
 

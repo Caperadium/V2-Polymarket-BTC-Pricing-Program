@@ -125,7 +125,7 @@ def main():
                         help="Calibrate jump parameters from BTC data instead of using hardcoded defaults")
     parser.add_argument("--advanced-features", action="store_true", default=True,
                         dest="advanced_features",
-                        help="Enable SVCJ+skewed-t+FIGARCH+regime+XGBoost (default: on)")
+                        help="Enable SVCJ+skewed-t+FIGARCH+calibrated-jumps (default: on)")
     parser.add_argument("--no-advanced-features", action="store_false",
                         dest="advanced_features",
                         help="Disable all advanced features (plain GARCH+t+Kou baseline)")
@@ -149,18 +149,31 @@ def main():
         return
 
     logger.info(f"Data Loaded. S0: {S0}. Fitting GARCH...")
-    garch_params = fit_garch_model(hourly_returns)
+    # FIX 1 (C1): tell fit_garch_model to fit FIGARCH when advanced features are on,
+    # otherwise simulate_paths(use_figarch=True) silently falls back to GARCH because
+    # the returned dict carries no 'figarch_weights'. Matches the backtest path.
+    garch_params = fit_garch_model(hourly_returns, use_figarch=args.advanced_features)
     logger.info(f"Model Fitted: {garch_params}")
 
-    # Optionally calibrate jump parameters from data
+    # FIX 2 (M1): calibrate jump parameters by default when advanced features are on,
+    # so the LIVE jump source matches the BACKTEST (calibrated everywhere via bipower).
+    # `--recalibrate-jumps` forces a fresh fit (bypassing the 30-day cache).
+    # NOTE: load_calibrated_jumps returns 'lam'/'p_crash' keys; simulate_paths expects
+    # 'lambda'/'crash_prob'. Map them or the calibrated lambda/crash silently fall back
+    # to module defaults (a latent bug in the previous --recalibrate-jumps path).
     calibrated_jumps = None
-    if args.recalibrate_jumps:
-        from core.pricing.btc_pricing_engine import load_calibrated_jumps, build_regime_jump_params
-        calibrated_jumps = load_calibrated_jumps(
-            hourly_csv=hourly_csv, force_recalibrate=True,
+    if args.advanced_features or args.recalibrate_jumps:
+        from core.pricing.btc_pricing_engine import load_calibrated_jumps
+        cal = load_calibrated_jumps(
+            hourly_csv=hourly_csv, force_recalibrate=args.recalibrate_jumps,
         )
-        if calibrated_jumps.get("fit_converged"):
-            logger.info("Using data-calibrated jump parameters")
+        if cal.get("fit_converged"):
+            calibrated_jumps = {
+                "lambda": cal["lam"], "crash_prob": cal["p_crash"],
+                "eta_up": cal["eta_up"], "eta_down": cal["eta_down"],
+                "mu_v": cal["mu_v"], "rho_J": cal["rho_J"],
+            }
+            logger.info("Using data-calibrated jump parameters (live)")
 
     results = []
 

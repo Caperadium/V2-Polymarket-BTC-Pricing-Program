@@ -98,10 +98,13 @@ class SweepConfig:
     
     min_moneyness: float = 0.0
     """Minimum absolute moneyness to consider."""
-    
+
     max_moneyness: float = 0.05
     """Maximum absolute moneyness to consider."""
-    
+
+    moneyness_mode: str = "abs"
+    """Moneyness filter mode: 'abs' (|m|, symmetric) or 'signed' (raw m, OTM>0 / ITM<0)."""
+
     def to_strategy_params(self) -> Dict[str, Any]:
         """
         Convert to strategy_params dict expected by BacktestEngine.
@@ -139,9 +142,11 @@ class SweepConfig:
         if self.use_max_moneyness:
             params["max_moneyness"] = self.max_moneyness
             params["min_moneyness"] = self.min_moneyness
+            params["moneyness_mode"] = self.moneyness_mode
         else:
             params["max_moneyness"] = None
             params["min_moneyness"] = None
+            params["moneyness_mode"] = "abs"
             
         return params
     

@@ -64,6 +64,11 @@ class SignalDiagnostics:
         ("ITM (m < -5%)",       lambda d: d["_moneyness"] < -0.05),
     ]
 
+    # Minimum subset size for a tail-mispricing AUC to be reported. Matches the
+    # _run_breakdown threshold (10) — the longshot band is data-starved, so a
+    # higher bar would null out most sub-band cells.
+    TAIL_MIN_N = 10
+
     def __init__(self, all_priced_df: pd.DataFrame):
         self.raw_df = all_priced_df
         self.work: Optional[pd.DataFrame] = None
@@ -218,6 +223,103 @@ class SignalDiagnostics:
         return results
 
     # ------------------------------------------------------------------
+    # OTM tail-mispricing (favorite-longshot bias) test
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def _band_stats(cls, subset: pd.DataFrame) -> dict:
+        """Counts and AUCs for a subset, scoring by model_p and by edge.
+
+        Returns ``{n, pos, neg, auc_model, auc_edge}``. AUC is ``None`` when the
+        subset is too small (``< TAIL_MIN_N``) or one outcome class is absent —
+        ``roc_auc_score`` raises ``ValueError`` on a single class.
+
+        Scores are already oriented so higher ⇒ more likely ``_outcome == 1``;
+        no AUC inversion is applied (inverting would corrupt the deep-tail
+        signal-vs-anti-signal reading).
+        """
+        n = len(subset)
+        outcome = subset["_outcome"].values
+        pos = int(outcome.sum()) if n else 0
+        neg = int(n - pos)
+
+        def _auc(score_col: str) -> Optional[float]:
+            if n >= cls.TAIL_MIN_N and pos > 0 and neg > 0:
+                try:
+                    return float(roc_auc_score(outcome, subset[score_col].values))
+                except ValueError:
+                    return None
+            return None
+
+        return {
+            "n": int(n), "pos": pos, "neg": neg,
+            "auc_model": _auc("_model_prob"),
+            "auc_edge": _auc("_edge"),
+        }
+
+    def tail_mispricing_report(
+        self,
+        band: Tuple[float, float] = (0.05, 0.20),
+        sub_bands: Tuple[Tuple[float, float], ...] = (
+            (0.05, 0.10), (0.10, 0.15), (0.15, 0.20),
+        ),
+        otm_thresholds: Tuple[float, ...] = (0.0, 0.02),
+    ) -> dict:
+        """Favorite-longshot tail-mispricing AUC test.
+
+        Restricts to OTM contracts (moneyness above each threshold) inside a
+        longshot market-price band, then measures how well ``model_p`` — and the
+        ``model_p - market_p`` edge — rank the realized binary outcome. AUC ≈ 0.5
+        means the model adds nothing the market did not already encode; AUC > 0.54
+        means real residual signal. Stratified into sub-bands so a rising AUC
+        toward the 0.05 deep tail (the favorite-longshot prediction) is visible.
+
+        Returns ``{"available": False}`` when there is no usable data or no
+        moneyness column (the OTM restriction is meaningless without it).
+        """
+        if self.work is None or self.work.empty or not self._moneyness_available:
+            return {"available": False}
+
+        lo_band, hi_band = band
+        in_band = self.work[
+            (self.work["_market_price"] >= lo_band)
+            & (self.work["_market_price"] <= hi_band)
+        ]
+        if in_band.empty:
+            return {"available": False}
+
+        variants = []
+        for thr in otm_thresholds:
+            otm = in_band[in_band["_moneyness"] > thr]  # NaN moneyness -> dropped
+            label = "moneyness > 0" if thr == 0.0 else f"moneyness > +{thr * 100:.0f}%"
+
+            sub_rows = []
+            for i, (lo, hi) in enumerate(sub_bands):
+                last = i == len(sub_bands) - 1
+                # Half-open [lo, hi) except the last band is inclusive of hi, so
+                # the 0.20 ceiling isn't dropped and boundaries don't double-count.
+                if last:
+                    mask = (otm["_market_price"] >= lo) & (otm["_market_price"] <= hi)
+                else:
+                    mask = (otm["_market_price"] >= lo) & (otm["_market_price"] < hi)
+                sub_rows.append({
+                    "label": f"{lo:.2f}-{hi:.2f}", "lo": lo, "hi": hi,
+                    **self._band_stats(otm[mask]),
+                })
+
+            variants.append({
+                "label": label, "threshold": float(thr),
+                **self._band_stats(otm),
+                "sub_bands": sub_rows,
+            })
+
+        return {
+            "available": True,
+            "band": [lo_band, hi_band],
+            "variants": variants,
+        }
+
+    # ------------------------------------------------------------------
     # Full report
     # ------------------------------------------------------------------
 
@@ -247,6 +349,7 @@ class SignalDiagnostics:
                 "edge_difference": np.nan,
                 "dte_breakdown": [], "moneyness_breakdown": [],
                 "dte_available": False, "moneyness_available": False,
+                "tail_mispricing": {"available": False},
             }
 
         outcome = self.work["_outcome"].values
@@ -288,6 +391,7 @@ class SignalDiagnostics:
             "moneyness_breakdown": moneyness_breakdown,
             "dte_available": self._dte_available,
             "moneyness_available": self._moneyness_available,
+            "tail_mispricing": self.tail_mispricing_report(),
         }
 
     # ------------------------------------------------------------------
@@ -360,6 +464,28 @@ class SignalDiagnostics:
                     print(
                         f"  {row['label']}: n={n}, pos={row['pos']}, neg={row['neg']}, "
                         f"rho={row['rho']:.4f} (p={row['p']:.4f}), auc={row['auc']:.4f}"
+                    )
+
+        # OTM tail-mispricing (favorite-longshot) breakdown
+        tail = report.get("tail_mispricing", {})
+        if tail.get("available"):
+            lo, hi = tail["band"]
+            print(f"\nOTM TAIL MISPRICING (market price {lo:.2f}-{hi:.2f}):")
+            print("  AUC > 0.54 = residual signal beyond the market; "
+                  "should rise toward the 0.05 tail if favorite-longshot holds.")
+
+            def _fmt(a):
+                return f"{a:.4f}" if a is not None else "  n/a"
+
+            for v in tail["variants"]:
+                print(
+                    f"\n  [{v['label']}] n={v['n']}, pos={v['pos']}, neg={v['neg']}, "
+                    f"auc_model={_fmt(v['auc_model'])}, auc_edge={_fmt(v['auc_edge'])}"
+                )
+                for sb in v["sub_bands"]:
+                    print(
+                        f"    {sb['label']}: n={sb['n']}, pos={sb['pos']}, neg={sb['neg']}, "
+                        f"auc_model={_fmt(sb['auc_model'])}, auc_edge={_fmt(sb['auc_edge'])}"
                     )
 
         print("\n" + "=" * 60)

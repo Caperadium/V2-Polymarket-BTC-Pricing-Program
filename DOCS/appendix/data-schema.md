@@ -22,7 +22,9 @@
 | `market_price` | Polymarket mid-price at pricing time |
 | `p_real_mc` | Raw Monte Carlo probability |
 | `p_model_fit` | Logistic-fitted model probability |
-| `p_rn_fit` | Logistic-fitted risk-neutral probability |
+| `p_model_cal` | Calibrated model probability (only when `USE_CALIBRATED_PROB=True`; logit shift on `p_model_fit`) |
+| `p_market_fit` | Logistic fit to the **market price** (formerly `p_rn_fit`; NOT a risk-neutral model prob) |
+| `p_rn_fit` | Deprecated alias of `p_market_fit` (identical values, retained one release) |
 | `T_days` | Days to expiry |
 | `date` | Pricing date (UTC) |
 | `expiry_date` | Contract expiry date (UTC) |
@@ -112,9 +114,9 @@ The codebase resolves column names via precedence chains:
 
 | Semantic Column | Fallback Order |
 |----------------|----------------|
-| Model probability | `p_model_fit` → `p_real_mc` → `model_probability` |
+| Model probability | `p_model_fit` → `p_real_mc` → `model_probability` (prepend `p_model_cal` when `USE_CALIBRATED_PROB=True`) |
 | Market price | `market_price` → `market_pr` → `Polymarket_Price` |
 | Expiry | `expiry_key` (derived from `expiry_date`) → `T_days` as float |
 | DTE | `dte_days` → `t_days` → `T_days` |
 | Edge | Computed as `model_prob − market_price` (YES) or `market_price − model_prob` (NO) |
-| Risk-neutral prob | `p_rn_fit` > `risk_neutral_prob_fit` > `risk_neutral_prob` |
+| Market-fit prob | `p_market_fit` > `p_rn_fit` (deprecated alias) > `risk_neutral_prob_fit` > `risk_neutral_prob` |

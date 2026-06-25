@@ -75,13 +75,14 @@ def test_execute_trades_no_side_inversion():
     # `_execute_trades` calls `recommend_trades`.
     
     with patch("core.backtesting.backtest_engine.recommend_trades") as mock_reco_func, \
-         patch("core.backtesting.backtest_engine.recommendations_to_dataframe") as mock_to_df:
-             
+         patch("core.backtesting.backtest_engine.recommendations_to_dataframe") as mock_to_df, \
+         patch.object(engine, "_expiry_is_settleable", return_value=True):
+
         mock_to_df.return_value = mock_reco
-        
+
         # Create a dummy batch_df (content doesn't matter much as we mock the reco output)
         batch_df = pd.DataFrame({"dummy": [1]})
-        
+
         # Act
         current_time = pd.Timestamp("2024-12-30", tz="UTC")
         engine._execute_trades(batch_df, current_time)
@@ -126,8 +127,9 @@ def test_execute_trades_yes_side_normal():
     }])
     
     with patch("core.backtesting.backtest_engine.recommend_trades"), \
-         patch("core.backtesting.backtest_engine.recommendations_to_dataframe") as mock_to_df:
-        
+         patch("core.backtesting.backtest_engine.recommendations_to_dataframe") as mock_to_df, \
+         patch.object(engine, "_expiry_is_settleable", return_value=True):
+
         mock_to_df.return_value = mock_reco
         engine._execute_trades(pd.DataFrame(), pd.Timestamp("2024-12-30", tz="UTC"))
         

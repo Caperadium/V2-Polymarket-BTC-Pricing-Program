@@ -57,3 +57,6 @@ Journal Articles/
 
 # Logs
 *.log
+
+# Temporary artifacts
+temp/

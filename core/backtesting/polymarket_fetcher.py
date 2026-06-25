@@ -239,8 +239,25 @@ def _get_json(url: str, params: dict, session: requests.Session, timeout: int = 
 def _generate_date_slugs(
     start_date: Optional[datetime] = None,
     end_date: Optional[datetime] = None,
-) -> List[str]:
-    """Generate ``bitcoin-above-on-{month}-{day}`` slugs for a date range.
+) -> List[List[str]]:
+    """Generate Gamma event-slug *groups* (one per date) for a date range.
+
+    Polymarket uses two event-slug formats for the multi-day, daily-candle
+    ``bitcoin-above`` strike ladder (created ~7 days before its noon-ET expiry),
+    split at a mid-2026 transition:
+
+    * legacy:  ``bitcoin-above-on-{month}-{day}``          (deep history)
+    * current: ``bitcoin-above-on-{month}-{day}-{year}``   (newer dates)
+
+    Both are emitted per date and batched into a single Gamma ``/events`` call
+    (the ``slug`` query param accepts repeats), so call count stays one-per-day.
+    Only the legacy format responds for old dates and only the current format for
+    new dates; the overlap window returns the same contracts and is deduped
+    downstream by ``clobTokenId``.
+
+    Note: the bare ``-{year}`` slug is the daily product with a full price history.
+    The separate same-day flash markets (``…-{year}-12pm-et``, ``…-8pm-et``, etc.)
+    live only ~80 min and are intentionally NOT collected.
 
     Defaults to scanning from 2024-01-01 through yesterday.
     """
@@ -249,15 +266,19 @@ def _generate_date_slugs(
     if start_date is None:
         start_date = datetime(2024, 1, 1, tzinfo=timezone.utc)
 
-    slugs: List[str] = []
+    groups: List[List[str]] = []
     current = start_date
     while current <= end_date:
         month_name = current.strftime("%B").lower()
         day = current.day
-        slugs.append(f"bitcoin-above-on-{month_name}-{day}")
+        year = current.year
+        groups.append([
+            f"bitcoin-above-on-{month_name}-{day}",
+            f"bitcoin-above-on-{month_name}-{day}-{year}",
+        ])
         current += timedelta(days=1)
 
-    return slugs
+    return groups
 
 
 def fetch_closed_bitcoin_above_markets(
@@ -285,18 +306,20 @@ def fetch_closed_bitcoin_above_markets(
     if session is None:
         session = _build_session()
 
-    date_slugs = _generate_date_slugs(start_date, end_date)
-    total_slugs = len(date_slugs)
+    date_slug_groups = _generate_date_slugs(start_date, end_date)
+    total_slugs = len(date_slug_groups)
     seen_clob_ids: Set[str] = set()
     all_markets: List[dict] = []
 
     logger.info("Scanning %d date-slugs for bitcoin-above events...", total_slugs)
 
-    for idx, ds in enumerate(date_slugs):
+    for idx, ds_group in enumerate(date_slug_groups):
         try:
-            data = _get_json(GAMMA_EVENTS_URL, {"slug": ds}, session)
+            # ds_group holds the legacy + current slug formats for one date;
+            # the slug query param accepts repeats, so both are fetched at once.
+            data = _get_json(GAMMA_EVENTS_URL, {"slug": ds_group}, session)
         except Exception:
-            logger.debug("Gamma /events failed for slug '%s'", ds)
+            logger.debug("Gamma /events failed for slugs %s", ds_group)
             data = []
 
         # Progress callback every 100 slugs during discovery
@@ -372,6 +395,30 @@ def _extract_year_from_event(evt: dict) -> Optional[int]:
 # CLOB – daily price history
 # ---------------------------------------------------------------------------
 
+def _normalize_to_midnight(points: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Floor each point's ``date_utc`` to midnight UTC and dedup per day.
+
+    The backrunner aligns contract snapshots to midnight (CLOB daily-candle grid).
+    Raw points carry second-level jitter (00:00:1X-3X) and, on the fidelity=720
+    fallback, an extra 12:00 candle. Flooring + per-day dedup guarantees one
+    on-grid observation per day. When two points collapse to the same day we keep
+    the one whose ORIGINAL timestamp was closest to midnight (the intended candle).
+    """
+    best: Dict[Any, Dict[str, Any]] = {}
+    for r in points:
+        dt = r["date_utc"]
+        day = dt.replace(hour=0, minute=0, second=0, microsecond=0)
+        # distance from midnight, measured on a 24h circle (so 23:50 ≈ 10min, not 23h50)
+        secs = dt.hour * 3600 + dt.minute * 60 + dt.second
+        dist = min(secs, 86400 - secs)
+        prev = best.get(day)
+        if prev is None or dist < prev["_dist"]:
+            best[day] = {"date_utc": day, "price": r["price"], "_dist": dist}
+    out = [{"date_utc": v["date_utc"], "price": v["price"]} for v in best.values()]
+    out.sort(key=lambda r: r["date_utc"])
+    return out
+
+
 def fetch_price_history(
     clob_token_id: str,
     session: Optional[requests.Session] = None,
@@ -383,7 +430,11 @@ def fetch_price_history(
     1. Try ``interval=1d`` (native daily candles).
     2. If empty or error, fall back to ``interval=max&fidelity=720``
        (12‑hour candles) and filter to midnight UTC rows.
-    3. If still empty, return all fidelity=720 points as best‑effort.
+    3. If still empty, fall back to ALL fidelity=720 points as best‑effort.
+
+    The selected points are then floored to midnight UTC and deduped to one
+    on-grid observation per day (item A#1 / I), so every consumer sees the
+    midnight snapshot grid the backrunner assumes.
 
     Returns a list of ``{"date_utc": datetime, "price": float}`` dicts.
     """
@@ -394,25 +445,24 @@ def fetch_price_history(
     history = _fetch_price_history_raw(clob_token_id, interval="1d", session=session)
     parsed = _parse_history(history)
 
-    if parsed:
-        return parsed
+    if not parsed:
+        # --- attempt 2: fidelity=720 (12h), filter midnight ---
+        logger.debug("clobTokenId %s: 1d returned empty, trying fidelity=720", clob_token_id)
+        history = _fetch_price_history_raw(
+            clob_token_id, interval="max", fidelity=720, session=session
+        )
+        all_720 = _parse_history(history)
+        parsed = [r for r in all_720 if r["date_utc"].hour == 0]
 
-    # --- attempt 2: fidelity=720 (12h), filter midnight ---
-    logger.debug("clobTokenId %s: 1d returned empty, trying fidelity=720", clob_token_id)
-    history = _fetch_price_history_raw(
-        clob_token_id, interval="max", fidelity=720, session=session
-    )
-    midnight = [r for r in _parse_history(history) if r["date_utc"].hour == 0]
+        # --- attempt 3: best effort – ALL fidelity=720 points (off-grid) ---
+        if not parsed and all_720:
+            logger.debug(
+                "clobTokenId %s: no midnight points in fidelity=720; "
+                "flooring all to midnight (best-effort)", clob_token_id
+            )
+            parsed = all_720
 
-    if midnight:
-        return midnight
-
-    # --- attempt 3: best effort – return ALL fidelity=720 points ---
-    if _parse_history(history):
-        logger.debug("clobTokenId %s: no midnight points in fidelity=720; returning all", clob_token_id)
-        return _parse_history(history)
-
-    return []
+    return _normalize_to_midnight(parsed) if parsed else []
 
 
 def _fetch_price_history_raw(

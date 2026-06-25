@@ -32,7 +32,12 @@ For each expiry group, two logistic curves are fitted:
 | Curve | Source Data | Purpose |
 |-------|-------------|---------|
 | `p_model_fit` | MC probabilities (`p_real_mc`) | Smoothed model probability |
-| `p_rn_fit` | Market prices or risk-neutral probs | Smoothed market-implied probability |
+| `p_market_fit` (alias `p_rn_fit`) | Market prices or risk-neutral probs | Smoothed market-implied probability (fit to the **market price** — not a risk-neutral model prob; renamed from `p_rn_fit` per FIX 9) |
+
+!!! note "Known model risk (FIX 10)"
+    The fitted curve is a 2-parameter **symmetric** logistic with unweighted SSE,
+    so it cannot represent the skewed SVCJ/skewed-t wings and over-weights the
+    saturated 0/1 tails. It is a denoiser, not a full skewed risk-neutral density.
 
 The gap between these curves is the **edge**:
 
@@ -47,9 +52,10 @@ The processed CSV adds these columns:
 | Column | Description |
 |--------|-------------|
 | `p_model_fit` | Logistic-smoothed model probability |
-| `p_rn_fit` | Logistic-smoothed risk-neutral probability |
+| `p_model_cal` | Calibrated model probability (only when `USE_CALIBRATED_PROB=True`) |
+| `p_market_fit` | Logistic fit to market price (alias: `p_rn_fit`, deprecated) |
 | `edge_vs_market_fit` | Fitted model prob − market price |
-| `edge_vs_rn_fit` | Fitted model prob − fitted RN prob |
+| `edge_vs_rn_fit` | Fitted model prob − fitted market-curve prob |
 
 ## Fitting Process
 

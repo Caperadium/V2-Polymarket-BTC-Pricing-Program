@@ -231,13 +231,27 @@ class BaselBacktestResult:
 
 def _fit_garch_on_window(
     train_returns: np.ndarray,
+    use_figarch: bool = False,
 ) -> Optional[dict]:
     """
-    Fit GARCH(1,1) with Student-t errors on a training window.
+    Fit GARCH(1,1) (or FIGARCH(1,d,1)) with Student-t errors on a training window.
 
-    Returns dict with omega, alpha, beta, nu, mu, last_variance (hourly units),
-    or None if fit fails.
+    Returns dict with omega, beta, nu, mu, last_variance (hourly units) — plus
+    alpha (GARCH) or figarch_weights (FIGARCH) — or None if fit fails.
+
+    FIX 6 (C2): when use_figarch=True, route through fit_garch_model(use_figarch=True)
+    so the Basel MC validation tests the DEPLOYED FIGARCH variance variant rather than
+    the GARCH-only one. fit_garch_model already returns the figarch_weights the
+    simulator needs; without this the validator would silently validate GARCH.
     """
+    if use_figarch:
+        from core.pricing.btc_pricing_engine import fit_garch_model
+        try:
+            return fit_garch_model(pd.Series(train_returns), use_figarch=True)
+        except Exception as e:
+            logger.debug("FIGARCH fit failed: %s", e)
+            return None
+
     from arch import arch_model
 
     scaled = pd.Series(train_returns) * 100
@@ -389,6 +403,10 @@ def compute_mc_var(
     num_sims: int = 10000,
     seed: int = 42,
     use_jumps: bool = True,
+    use_figarch: bool = True,
+    use_svcj: bool = True,
+    use_skewed_t: bool = True,
+    use_naive_prior: bool = True,
 ) -> Dict[Tuple[int, float], np.ndarray]:
     """
     Compute VaR forecasts using full Monte Carlo simulation (GARCH + SVCJ).
@@ -448,7 +466,8 @@ def compute_mc_var(
     for t in range(min_training, n):
         if t == min_training or (t - last_refit_idx) >= refit_every:
             train_data = hourly_returns[:t]
-            garch_params = _fit_garch_on_window(train_data)
+            # FIX 6 (C2): fit the SAME variance variant the simulator will use.
+            garch_params = _fit_garch_on_window(train_data, use_figarch=use_figarch)
             if garch_params is not None:
                 last_refit_idx = t
                 # Use last price from training data as S0
@@ -473,15 +492,23 @@ def compute_mc_var(
         for h in horizons:
             if h <= 0:
                 continue
-            # Simulate paths
+            # Simulate paths. FIX 6 (C2): pass the deployed feature flags so the
+            # validator tests what is actually traded (FIGARCH + SVCJ + skewed-t +
+            # naive prior), not bare GARCH/Student-t.
             paths = simulate_paths(
                 sp["S0"], sp["garch"],
                 jump_params=sp["jumps"],
                 hours_to_expiry=h,
                 n_sims=num_sims,
+                seed=seed,
+                use_naive_prior=use_naive_prior,
+                use_svcj=use_svcj,
+                use_skewed_t=use_skewed_t,
+                use_figarch=use_figarch,
             )
-            # Log return of terminal prices
-            sim_returns = np.log(paths[:, -1] / sp["S0"])
+            # FIX 6 (C2): simulate_paths returns a 1-D array of TERMINAL prices, not a
+            # (n_sims, n_steps) matrix — `paths[:, -1]` raised IndexError. Use `paths`.
+            sim_returns = np.log(paths / sp["S0"])
 
             for a in alphas:
                 var_forecasts[(h, a)][t] = float(np.percentile(sim_returns, a * 100))
@@ -502,6 +529,10 @@ def run_basel_backtest(
     num_sims: int = 10000,
     seed: int = 42,
     use_jumps: bool = True,
+    use_figarch: bool = True,
+    use_svcj: bool = True,
+    use_skewed_t: bool = True,
+    use_naive_prior: bool = True,
 ) -> BaselBacktestResult:
     """
     Run Teng-style Basel backtest on BTC hourly returns.
@@ -547,6 +578,10 @@ def run_basel_backtest(
             num_sims=num_sims,
             seed=seed,
             use_jumps=use_jumps,
+            use_figarch=use_figarch,
+            use_svcj=use_svcj,
+            use_skewed_t=use_skewed_t,
+            use_naive_prior=use_naive_prior,
         )
     else:
         var_forecasts = compute_analytical_garch_var(
@@ -636,6 +671,9 @@ if __name__ == "__main__":
                        help="MC simulations per refit (MC mode only)")
     parser.add_argument("--no-jumps", action="store_true",
                        help="Disable SVCJ jumps in MC mode")
+    parser.add_argument("--garch-only", action="store_true",
+                       help="MC mode: validate the plain GARCH variant (disable "
+                            "FIGARCH/SVCJ/skewed-t) instead of the deployed config")
     args = parser.parse_args()
 
     # Load returns
@@ -646,6 +684,7 @@ if __name__ == "__main__":
 
     logger.info(f"Loaded {len(returns)} hourly returns from {args.input}")
 
+    _deployed = not args.garch_only
     result = run_basel_backtest(
         returns,
         horizons=[1, 14 * 24, 28 * 24],
@@ -654,6 +693,9 @@ if __name__ == "__main__":
         refit_every=args.refit_every,
         num_sims=args.num_sims,
         use_jumps=not args.no_jumps,
+        use_figarch=_deployed,
+        use_svcj=_deployed,
+        use_skewed_t=_deployed,
     )
 
     result.print_summary()

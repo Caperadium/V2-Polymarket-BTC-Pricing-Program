@@ -131,6 +131,271 @@ def calibrate_logit_shift(
     }
 
 
+# ---------- Outcome-based recalibration (FIX 7 / M2) ----------
+
+# Persisted shift table: one row per DTE bucket. Anchored to the project root
+# (core/pricing/ -> parents[2]) so writer (fit_calibration) and reader
+# (load_calibration_shift) resolve to the SAME file regardless of CWD — Streamlit
+# may launch from app/, which would otherwise split the read/write locations.
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+CALIBRATION_SHIFT_PATH = str(_PROJECT_ROOT / "DATA" / "calibration_shift.csv")
+# Minimum resolved observations per bucket before a fitted shift is trusted;
+# below this the bucket shift falls back to 0 (no shift). Plan risk note.
+CALIBRATION_MIN_OBS = 200
+# DTE bucket edges (days). Buckets: [0,2], (2,7], (7,30], (30,inf).
+_DTE_BUCKET_EDGES = [2.0, 7.0, 30.0]
+_DTE_BUCKET_LABELS = ["0-2", "2-7", "7-30", "30+"]
+
+
+def dte_bucket(dte_days: float) -> str:
+    """Map days-to-expiry to a calibration bucket label. NaN/negative → '0-2'."""
+    try:
+        d = float(dte_days)
+    except (TypeError, ValueError):
+        return _DTE_BUCKET_LABELS[0]
+    if not np.isfinite(d) or d <= _DTE_BUCKET_EDGES[0]:
+        return _DTE_BUCKET_LABELS[0]
+    for i, edge in enumerate(_DTE_BUCKET_EDGES[1:], start=1):
+        if d <= edge:
+            return _DTE_BUCKET_LABELS[i]
+    return _DTE_BUCKET_LABELS[-1]
+
+
+def fit_calibration(
+    all_priced_df: pd.DataFrame,
+    prob_col: str = "model_prob_used",
+    outcome_col: str = "outcome_yes",
+    dte_col: str = "dte_days",
+    time_col: str = "snapshot_time",
+    train_frac: float = 0.7,
+    output_path: str = CALIBRATION_SHIFT_PATH,
+    min_obs: int = CALIBRATION_MIN_OBS,
+) -> dict:
+    """
+    Fit a per-DTE-bucket logit shift on backtest history and persist it (FIX 7 A).
+
+    LEAK GUARD (mandatory): the shift B is fit ONLY on a *training span* of the
+    backtest (the earliest ``train_frac`` of snapshots by ``time_col``). It must be
+    APPLIED to the later (holdout) span — never fit and scored on the same outcomes,
+    which is in-sample and inflates apparent calibration. This function emits the
+    table; application happens in ``process_batch`` (Part B) and the holdout
+    reliability/Brier comparison is a separate diagnostic.
+
+    Args:
+        all_priced_df: BacktestEngine all-priced contracts with resolved outcomes.
+        prob_col: Model probability column (default 'model_prob_used').
+        outcome_col: Binary realized outcome column (default 'outcome_yes').
+        dte_col: Days-to-expiry column for bucketing.
+        time_col: Snapshot timestamp column for the walk-forward split.
+        train_frac: Fraction of the (time-sorted) span used to FIT B.
+        output_path: Where to persist the shift table CSV.
+        min_obs: Minimum resolved obs per bucket to trust a fitted B (else B=0).
+
+    Returns:
+        Dict mapping bucket label -> {B_fitted, B_ci_lower, B_ci_upper, n_obs,
+        n_train, applied (bool), fit_date}. Also writes the CSV.
+    """
+    out: dict = {}
+    if all_priced_df is None or all_priced_df.empty:
+        logger.info("fit_calibration: empty all_priced_df — no shift fit.")
+        return out
+
+    df = all_priced_df.copy()
+    needed = [prob_col, outcome_col, dte_col]
+    if any(c not in df.columns for c in needed):
+        logger.info(
+            "fit_calibration: missing columns %s — skipping.",
+            [c for c in needed if c not in df.columns],
+        )
+        return out
+
+    df[prob_col] = pd.to_numeric(df[prob_col], errors="coerce")
+    df[outcome_col] = pd.to_numeric(df[outcome_col], errors="coerce")
+    df = df[np.isfinite(df[prob_col]) & np.isfinite(df[outcome_col])]
+    if df.empty:
+        logger.info("fit_calibration: no finite (prob, outcome) rows.")
+        return out
+
+    # ---- Walk-forward split by time (leak guard) ----
+    if time_col in df.columns:
+        df["_t"] = pd.to_datetime(df[time_col], utc=True, errors="coerce")
+        df = df.sort_values("_t")
+        cutoff = df["_t"].quantile(train_frac)
+        train = df[df["_t"] <= cutoff]
+    else:
+        # No timestamp: fall back to row-order split (documented; weaker guard).
+        logger.warning(
+            "fit_calibration: no '%s' column — using row-order train split "
+            "(weaker leak guard).", time_col,
+        )
+        n_train = int(len(df) * train_frac)
+        train = df.iloc[:n_train]
+
+    df["_bucket"] = df[dte_col].apply(dte_bucket)
+    train = train.copy()
+    train["_bucket"] = train[dte_col].apply(dte_bucket)
+
+    fit_date = datetime.now(timezone.utc).isoformat()
+    rows = []
+    for bucket in _DTE_BUCKET_LABELS:
+        g = train[train["_bucket"] == bucket]
+        n_obs = len(g)
+        B, lo, hi, applied = 0.0, 0.0, 0.0, False
+        if n_obs >= min_obs:
+            shift = calibrate_logit_shift(g[prob_col].values, g[outcome_col].values)
+            if shift is not None:
+                B = float(shift["B_fitted"])
+                lo = float(shift["B_ci_lower"])
+                hi = float(shift["B_ci_upper"])
+                applied = True
+        else:
+            logger.info(
+                "fit_calibration bucket %s: only %d train obs (<%d) — shift=0.",
+                bucket, n_obs, min_obs,
+            )
+        entry = {
+            "bucket": bucket,
+            "B_fitted": B,
+            "B_ci_lower": lo,
+            "B_ci_upper": hi,
+            "n_obs": n_obs,
+            "applied": applied,
+            "fit_date": fit_date,
+            "train_frac": train_frac,
+        }
+        out[bucket] = entry
+        rows.append(entry)
+
+    try:
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(rows).to_csv(output_path, index=False)
+        logger.info("fit_calibration: wrote shift table to %s", output_path)
+    except Exception as exc:
+        logger.warning("fit_calibration: could not write %s (%s)", output_path, exc)
+
+    return out
+
+
+def load_calibration_shift(path: str = CALIBRATION_SHIFT_PATH) -> dict:
+    """Load the persisted per-bucket logit shift table. Returns {} if absent."""
+    p = Path(path)
+    if not p.exists():
+        return {}
+    try:
+        tbl = pd.read_csv(p)
+    except Exception:
+        return {}
+    shifts = {}
+    for _, r in tbl.iterrows():
+        # Only honor buckets whose fit was actually trusted (applied=True).
+        if bool(r.get("applied", False)):
+            shifts[str(r["bucket"])] = float(r["B_fitted"])
+    return shifts
+
+
+def apply_calibration_shift(p_model: np.ndarray, B: float) -> np.ndarray:
+    """p_cal = sigmoid(logit(clip(p_model)) + B). Identity when B==0."""
+    if not B:
+        return np.asarray(p_model, dtype=float)
+    eps = 1e-6
+    p = np.clip(np.asarray(p_model, dtype=float), eps, 1 - eps)
+    return expit(logit(p) + B)
+
+
+def calibration_holdout_report(
+    all_priced_df: pd.DataFrame,
+    prob_col: str = "model_prob_used",
+    outcome_col: str = "outcome_yes",
+    dte_col: str = "dte_days",
+    time_col: str = "snapshot_time",
+    train_frac: float = 0.7,
+    n_bins: int = 10,
+    min_holdout: int = 20,
+) -> Optional[dict]:
+    """
+    Walk-forward holdout calibration report (FIX 7 / M2 acceptance #6).
+
+    Fits per-DTE-bucket logit shifts on the EARLIEST ``train_frac`` of snapshots and
+    scores RAW vs CALIBRATED model probabilities on the LATER holdout span — the fit
+    never sees the holdout outcomes it is scored against. Returns the reliability-
+    diagram bins + Brier + ECE for both, so a UI can render the diagram and confirm
+    recalibrated ≤ raw. Returns None if the holdout is too small.
+
+    Returns:
+        {raw_brier, cal_brier, raw_ece, cal_ece, raw_bins (DataFrame),
+         cal_bins (DataFrame), n_holdout, n_train, per_bucket (list[dict])} or None.
+    """
+    from core.validation.calibration_metrics import (
+        brier_score, ece_score, reliability_bins,
+    )
+
+    if all_priced_df is None or all_priced_df.empty:
+        return None
+    need = [prob_col, outcome_col, dte_col]
+    if any(c not in all_priced_df.columns for c in need):
+        return None
+
+    df = all_priced_df.copy()
+    df[prob_col] = pd.to_numeric(df[prob_col], errors="coerce")
+    df[outcome_col] = pd.to_numeric(df[outcome_col], errors="coerce")
+    df = df[np.isfinite(df[prob_col]) & np.isfinite(df[outcome_col])]
+    if df.empty:
+        return None
+
+    # Walk-forward split by time (leak guard); fall back to row order if no time col.
+    if time_col in df.columns:
+        df["_t"] = pd.to_datetime(df[time_col], utc=True, errors="coerce")
+        df = df.sort_values("_t")
+        cutoff = df["_t"].quantile(train_frac)
+        train = df[df["_t"] <= cutoff]
+        holdout = df[df["_t"] > cutoff]
+    else:
+        n_train = int(len(df) * train_frac)
+        train = df.iloc[:n_train]
+        holdout = df.iloc[n_train:]
+
+    if len(holdout) < min_holdout:
+        return None
+
+    df["_bucket"] = df[dte_col].apply(dte_bucket)
+    train = train.copy(); train["_bucket"] = train[dte_col].apply(dte_bucket)
+    holdout = holdout.copy(); holdout["_bucket"] = holdout[dte_col].apply(dte_bucket)
+
+    # Fit B per bucket on TRAIN only.
+    per_bucket = []
+    bucket_B: dict = {}
+    for bucket in _DTE_BUCKET_LABELS:
+        g = train[train["_bucket"] == bucket]
+        B = 0.0
+        shift = (
+            calibrate_logit_shift(g[prob_col].values, g[outcome_col].values)
+            if len(g) >= 10 else None
+        )
+        if shift is not None:
+            B = float(shift["B_fitted"])
+        bucket_B[bucket] = B
+        per_bucket.append({"bucket": bucket, "B_fitted": B, "n_train": int(len(g))})
+
+    # Apply to HOLDOUT.
+    raw = holdout[prob_col].to_numpy(dtype=float)
+    y = holdout[outcome_col].to_numpy(dtype=float)
+    B_arr = holdout["_bucket"].map(bucket_B).fillna(0.0).to_numpy(dtype=float)
+    eps = 1e-6
+    cal = expit(logit(np.clip(raw, eps, 1 - eps)) + B_arr)
+
+    return {
+        "raw_brier": brier_score(raw, y),
+        "cal_brier": brier_score(cal, y),
+        "raw_ece": ece_score(raw, y, n_bins),
+        "cal_ece": ece_score(cal, y, n_bins),
+        "raw_bins": reliability_bins(raw, y, n_bins),
+        "cal_bins": reliability_bins(cal, y, n_bins),
+        "n_holdout": int(len(holdout)),
+        "n_train": int(len(train)),
+        "per_bucket": per_bucket,
+    }
+
+
 # ---------- Logistic model helpers ----------
 
 def logistic_raw(x: np.ndarray, a: float, b: float) -> np.ndarray:
@@ -175,6 +440,14 @@ def fit_logistic_to_points(
 
     - Rescales K by K_scale to improve numerical stability.
     - Returns None if not enough points or fit fails.
+
+    KNOWN MODEL RISK (FIX 10 / L4): this is a 2-parameter SYMMETRIC logistic and
+    cannot represent the skewed wings of an SVCJ/skewed-t risk-neutral density, and
+    `curve_fit` minimizes unweighted SSE on probabilities (over-weighting the
+    saturated 0/1 tails relative to the informative mid-strikes). It is a denoiser,
+    not a full skewed RND. If diagnostics show systematic wing mispricing, refit in
+    logit space or weight points by MC variance p(1-p)/n_sims. Left as documented
+    model risk until diagnostics justify the change.
     """
     mask = np.isfinite(strikes) & np.isfinite(probs)
     strikes = strikes[mask]
@@ -344,9 +617,23 @@ def process_batch(
 
     # Pre-allocate columns with NaN
     df["p_model_fit"] = np.nan
+    # FIX 9 (M3): `p_market_fit` is the logistic fit to the MARKET price (or to
+    # risk_neutral_prob when use_rn_prob=True) — it is NOT a risk-neutral MODEL
+    # probability. `p_rn_fit` is kept as a deprecated alias (identical values) for
+    # one release so existing readers/plots keep working.
+    df["p_market_fit"] = np.nan
     df["p_rn_fit"] = np.nan
     df["edge_vs_market_fit"] = np.nan
     df["edge_vs_rn_fit"] = np.nan
+
+    # FIX 7 (M2) Part B: outcome-based recalibration, GATED. We only write the
+    # `p_model_cal` column when the master flag is on AND a fitted shift table
+    # exists — column presence must NOT be the on/off switch (resolve_model_prob
+    # would otherwise silently start using it). p_model_fit is left untouched.
+    from core.strategy.common import USE_CALIBRATED_PROB
+    _cal_shifts = load_calibration_shift() if USE_CALIBRATED_PROB else {}
+    if _cal_shifts:
+        df["p_model_cal"] = np.nan
 
     for group_key, g in df.groupby(group_cols, observed=True):
         expiry_date = g["expiry_date"].iloc[0] if use_expiry_group else None
@@ -377,7 +664,14 @@ def process_batch(
 
         # Write back into df at the correct indices
         df.loc[g.index, "p_model_fit"] = p_model_fit
+        # FIX 9 (M3): primary name + deprecated alias (identical values).
+        df.loc[g.index, "p_market_fit"] = p_rn_fit
         df.loc[g.index, "p_rn_fit"] = p_rn_fit
+
+        # FIX 7 (M2) Part B: apply the DTE-bucket logit shift to p_model_fit.
+        if _cal_shifts:
+            B_bucket = _cal_shifts.get(dte_bucket(T_days), 0.0)
+            df.loc[g.index, "p_model_cal"] = apply_calibration_shift(p_model_fit, B_bucket)
 
         # Edges based on fitted curves
         market = g["market_price"].values.astype(float)

@@ -7,7 +7,7 @@ The V2 BTC Contract Pricing system automates the full lifecycle of trading Bitco
 ```
 ┌──────────────────┐    ┌──────────────────────┐    ┌─────────────────┐
 │   Data Layer     │───▶│   Pricing Engine v2  │───▶│  Curve Fitting  │
-│ (BTC + Macro)    │    │ (GARCH+SVCJ+FIGARCH) │    │   (Logistic)    │
+│ (BTC + Macro)    │    │ (GARCH+SVCJ+FIGARCH(1,d,1)) │    │   (Logistic)    │
 └──────────────────┘    └──────────┬───────────┘    └────────┬────────┘
                                    │                         │
                     ┌──────────────┼──────────────┐          │
@@ -41,7 +41,7 @@ BTC data flows into the pricing engine. Macro data feeds the regime detector and
 
 | File | Purpose | Phase |
 |------|---------|-------|
-| `btc_pricing_engine.py` | GARCH+SVCJ+Skewed-t+FIGARCH Monte Carlo simulator (v2, hourly) | 0–2.6 |
+| `btc_pricing_engine.py` | GARCH+SVCJ+Skewed-t+FIGARCH(1,d,1) Monte Carlo simulator (v2, hourly) | 0–2.6 |
 | `fit_probability_curves.py` | Logistic curve fitting per expiry, logit-shift calibration | Post |
 | `jump_calibration.py` | MAD-based Kou jump parameter estimation + SVCJ vol jump params | 0.5 |
 | `regime_detector.py` | 3-state HMM regime detection (bear/sideways/bull) | 1.2 |
@@ -145,7 +145,7 @@ The pricing engine is built in phases, each adding one capability. All phases ar
 | 1.5 | Horizon gating | (automatic) | Always active |
 | 2.3 | Directional XGBoost | `use_xgb_direction` | Opt-in |
 | 2.4 | Regime-conditional jumps | `regime_params` | With HMM |
-| 2.5 | FIGARCH long memory | `use_figarch` | Opt-in |
+| 2.5 | FIGARCH(1,d,1) long memory | `use_figarch` | Opt-in |
 | 2.6 | Vol gate interaction | `vol_gate_regime` | With vol gate |
 
 Phases 0–1.5 form the base model; 2.3–2.6 add cross-signal integration.

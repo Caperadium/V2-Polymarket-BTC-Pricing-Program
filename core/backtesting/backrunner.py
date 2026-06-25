@@ -145,10 +145,13 @@ def _process_one(item: Dict[str, Any]) -> Optional[str]:
     advanced_features: bool = item["advanced_features"]
 
     ts_dt = pd.Timestamp(ts_iso)
-    ts_date_dt = pd.Timestamp(ts_date_str)
 
     # ---- truncate intraday data ----
-    intraday_slice = _worker_intraday[_worker_intraday.index <= ts_dt]
+    # Strict '<': BTC bars are open-stamped (Binance klines), so a bar timestamped
+    # at ts_dt closes ~1 bar in the FUTURE relative to the snapshot instant. Using
+    # '<=' would leak that bar's forward close into S0. The close of the last bar
+    # strictly before ts_dt is exactly the price known AT the snapshot.
+    intraday_slice = _worker_intraday[_worker_intraday.index < ts_dt]
     if intraday_slice.empty:
         if s0_from_daily is None:
             logger.warning("Skipping %s: no intraday or daily data available", ts_str)
@@ -164,9 +167,12 @@ def _process_one(item: Dict[str, Any]) -> Optional[str]:
         )
         return None
 
-    hourly_slice = _worker_hourly[
-        _worker_hourly.index.tz_localize(None).normalize() <= ts_date_dt
-    ]
+    # Strict '<' at the exact snapshot timestamp (NOT end-of-day). Bars are
+    # open-stamped, so '<=' / a date-level cutoff would pull in the hours AFTER
+    # the midnight snapshot — a lookahead leak straight into the GARCH vol
+    # estimate (conditional variance is dominated by the most recent returns).
+    # This now matches the intraday cutoff above.
+    hourly_slice = _worker_hourly[_worker_hourly.index < ts_dt]
     if len(hourly_slice) < 500:
         logger.warning(
             "Skipping %s: insufficient hourly data (%d rows, need >=500)",
@@ -174,6 +180,64 @@ def _process_one(item: Dict[str, Any]) -> Optional[str]:
         )
         return None
     hourly_for_engine = hourly_slice.reset_index(drop=True)
+
+    # ---- FIX 2 (M1) + FIX 4 (H1): per-snapshot, LEAK-FREE jump calibration and
+    # regime detector, computed ONCE from the strict-`<` truncated hourly slice
+    # (never the full file). Shared across all expiry groups in this snapshot.
+    #
+    # Leak-critical: build the returns array from `hourly_for_engine['close']` and
+    # pass it as `returns=` to calibrate_jumps. NEVER pass `hourly_csv=` — that
+    # default reads the FULL DATA/btc_hourly.csv and would leak future bars.
+    jump_params: Optional[Dict[str, Any]] = None
+    regime_params: Optional[Dict[str, Any]] = None
+    detector = None
+    if advanced_features:
+        from core.pricing.jump_calibration import calibrate_jumps
+        from core.pricing.btc_pricing_engine import build_regime_jump_params
+        from core.pricing.regime_detector import RegimeDetector
+
+        h_col_map = {c.lower(): c for c in hourly_for_engine.columns}
+        h_close = h_col_map.get("close")
+        if h_close is not None:
+            returns_arr = (
+                np.log(
+                    hourly_for_engine[h_close]
+                    / hourly_for_engine[h_close].shift(1)
+                )
+                .dropna()
+                .to_numpy()
+            )
+            try:
+                # FIX 2 (also M4): bipower detection — less vol-cluster contamination.
+                cal = calibrate_jumps(returns=returns_arr, detection_method="bipower")
+                if cal.fit_converged:
+                    jump_params = {
+                        "lambda": cal.lam,
+                        "crash_prob": cal.p_crash,
+                        "eta_up": cal.eta_up,
+                        "eta_down": cal.eta_down,
+                        "mu_v": cal.mu_v,
+                        "rho_J": cal.rho_J,
+                    }
+                    # Per-regime jumps = calibrated base × literature multipliers.
+                    # Avoids calibrate_regime_jumps (whose synthetic-timestamp path
+                    # falls back to wall-clock — a leak in time-travel).
+                    regime_params = build_regime_jump_params(
+                        calibrated={**jump_params, "lam": cal.lam,
+                                    "p_crash": cal.p_crash, "rho_J": cal.rho_J,
+                                    "fit_converged": True}
+                    )
+            except Exception:
+                logger.debug("Jump calibration failed for %s", ts_str, exc_info=True)
+
+        # FIX 4 (H1): stateful HMM regime detector. calculate_probabilities fits it
+        # on the truncated daily returns with now=as_of (leak-free, deterministic)
+        # and caches across this snapshot's expiry groups. Constructed here so the
+        # cache is shared; a fresh detector per snapshot prevents cross-snapshot leak.
+        try:
+            detector = RegimeDetector()
+        except Exception:
+            detector = None
 
     # ---- validate contracts ----
     contracts_df = pd.DataFrame(contracts)
@@ -210,11 +274,21 @@ def _process_one(item: Dict[str, Any]) -> Optional[str]:
                 intraday_df=intraday_for_engine,
                 n_sims=n_sims,
                 seed=seed,
+                # FIX 2 (M1): calibrated jumps (leak-free, per-snapshot, bipower).
+                jump_params=jump_params,
                 use_svcj=advanced_features,
                 use_skewed_t=advanced_features,
                 use_figarch=advanced_features,
-                use_regime_switching=advanced_features,
-                use_xgb_direction=advanced_features,
+                # FIX 4 (H1): regime switching is now actually wired — detector
+                # injected, as_of threaded for leak-free deterministic refit gating,
+                # and per-regime calibrated jump params supplied.
+                use_regime_switching=(advanced_features and detector is not None),
+                regime_detector=detector,
+                regime_params=regime_params,
+                as_of=ts_dt,
+                # FIX 3 (H2): XGBoost directional blend hard-disabled (invalid
+                # per-strike blend of a strike-agnostic P(up)).
+                use_xgb_direction=False,
                 disable_staleness_check=True,
             )
 
@@ -227,6 +301,9 @@ def _process_one(item: Dict[str, Any]) -> Optional[str]:
                     "model_probability": probs.get(strike, np.nan),
                     "T_days": hours_to_expiry / 24.0,
                     "date": ts_dt,
+                    # Explicit snapshot timestamp so downstream batch loaders key
+                    # chronology off the data, not the parsed folder name.
+                    "batch_timestamp": ts_dt,
                     "expiry_date": expiry,
                 })
         except Exception:
@@ -235,11 +312,17 @@ def _process_one(item: Dict[str, Any]) -> Optional[str]:
                 ts_str, expiry, exc_info=True,
             )
 
-    # ---- save batch ----
+    # ---- save batch (atomic: temp + os.replace) ----
+    # A worker killed mid-write must NOT leave a truncated CSV that the
+    # idempotent `output_path.exists()` skip would treat as complete. Write to a
+    # unique temp file in the same dir, then atomically rename into place.
     if results:
         result_df = pd.DataFrame(results)
-        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-        result_df.to_csv(output_path, index=False)
+        out = Path(output_path)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        tmp = out.with_name(f".{out.stem}.{os.getpid()}.tmp")
+        result_df.to_csv(tmp, index=False)
+        os.replace(tmp, out)
 
     return ts_str
 
@@ -425,6 +508,15 @@ class BackrunnerEngine:
             n_total is the raw count of unique timestamps (used for progress
             denominator). work_items only includes processable timestamps.
         """
+        # ---- floor contract timestamps to midnight UTC (defensive) ----
+        # CLOB candle timestamps carry second-level jitter (00:00:1X-3X). Grouping
+        # on exact equality scatters an expiry's ~11 strikes across as many
+        # per-second "snapshots" (≈1.4 strikes each), starving the logistic curve
+        # fit. Flooring to the day collapses them to one midnight snapshot with the
+        # full strike ladder. Idempotent even if ingest already floors (item A#1).
+        market_df = market_df.copy()
+        market_df["date"] = pd.to_datetime(market_df["date"], utc=True).dt.floor("D")
+
         unique_timestamps = sorted(market_df["date"].unique())
         if limit:
             unique_timestamps = unique_timestamps[:limit]
@@ -619,7 +711,8 @@ class BackrunnerEngine:
         _worker_intraday = intraday_df
         _worker_hourly = hourly_df
 
-        completed = 0
+        # Seed with the already-cached count so Progress: X/n_total reaches 100%.
+        completed = n_total - len(work_items)
         for i, item in enumerate(work_items):
             try:
                 _process_one(item)
@@ -657,7 +750,8 @@ class BackrunnerEngine:
             len(work_items), workers,
         )
 
-        completed = 0
+        # Seed with the already-cached count so Progress: X/n_total reaches 100%.
+        completed = n_total - len(work_items)
 
         with ProcessPoolExecutor(
             max_workers=workers,
@@ -812,7 +906,7 @@ def main() -> int:
         action="store_true",
         default=True,
         dest="advanced_features",
-        help="Enable SVCJ+skewed-t+FIGARCH+regime+XGBoost (default: on)",
+        help="Enable SVCJ+skewed-t+FIGARCH+regime+calibrated-jumps (default: on)",
     )
     parser.add_argument(
         "--no-advanced-features",

@@ -48,6 +48,7 @@ from core.data.positions import (
 )
 from sweep_config import SweepConfig
 from core.pricing.btc_pricing_engine import calculate_probabilities
+from app.ui_filters import moneyness_filter_controls
 
 # Load default config for sidebar defaults
 _DEFAULTS = SweepConfig()
@@ -586,7 +587,7 @@ def make_prob_plot(g: pd.DataFrame, expiry_label: str) -> go.Figure:
             )
         )
 
-    rn_col = get_column(g, ["p_rn_fit", "risk_neutral_prob_fit", "risk_neutral_prob", "rn_prob_fit"])
+    rn_col = get_column(g, ["p_market_fit", "p_rn_fit", "risk_neutral_prob_fit", "risk_neutral_prob", "rn_prob_fit"])
     if rn_col:
         fig.add_trace(
             go.Scatter(
@@ -940,27 +941,11 @@ prob_threshold_no = st.sidebar.number_input(
     disabled=not use_prob_threshold,
     help="Trade NO when model probability <= this value.",
 )
-use_max_moneyness = st.sidebar.checkbox("Limit Moneyness", value=False)
-min_moneyness_value = st.sidebar.number_input(
-    "Min |Moneyness|",
-    min_value=0.0,
-    max_value=0.5,
-    value=0.0,
-    step=0.01,
-    format="%.2f",
-    disabled=not use_max_moneyness,
-    help="Only trade contracts where |moneyness| >= this value. Use to exclude ATM.",
-)
-max_moneyness_value = st.sidebar.number_input(
-    "Max |Moneyness|",
-    min_value=0.0,
-    max_value=0.5,
-    value=0.05,
-    step=0.01,
-    format="%.2f",
-    disabled=not use_max_moneyness,
-    help="Only trade contracts where |moneyness| <= this value. 0.05 = ±5% from spot.",
-)
+_mny = moneyness_filter_controls(st.sidebar, key_prefix="dash")
+use_max_moneyness = _mny["enabled"]
+min_moneyness_value = _mny["min_moneyness"]
+max_moneyness_value = _mny["max_moneyness"]
+moneyness_mode_value = _mny["mode"]
 available_bankroll = bankroll_sidebar + realized_pnl_total + open_unrealized_total
 stability_summary_df, stability_summary_error = try_load_dataframe(stability_summary_path)
 if stability_summary_df is not None:
@@ -1608,8 +1593,9 @@ with tabs[4]:
                 use_prob_threshold=use_prob_threshold,
                 prob_threshold_yes=prob_threshold_yes,
                 prob_threshold_no=prob_threshold_no,
-                max_moneyness=max_moneyness_value if use_max_moneyness else None,
-                min_moneyness=min_moneyness_value if use_max_moneyness else None,
+                max_moneyness=max_moneyness_value,
+                min_moneyness=min_moneyness_value,
+                moneyness_mode=moneyness_mode_value,
             )
         except ValueError as exc:
             st.warning(f"Auto recommendations unavailable: {exc}")
@@ -1839,8 +1825,9 @@ with tabs[6]:
                     "use_prob_threshold": use_prob_threshold,
                     "prob_threshold_yes": prob_threshold_yes,
                     "prob_threshold_no": prob_threshold_no,
-                    "max_moneyness": max_moneyness_value if use_max_moneyness else None,
-                    "min_moneyness": min_moneyness_value if use_max_moneyness else None,
+                    "max_moneyness": max_moneyness_value,
+                    "min_moneyness": min_moneyness_value,
+                    "moneyness_mode": moneyness_mode_value,
                 }
                 trades_bt, equity_bt, all_priced_bt = run_backtest(
                     daily_batches, initial_bankroll_bt, strategy_params, 

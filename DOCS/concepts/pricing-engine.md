@@ -2,7 +2,7 @@
 
 `core/pricing/btc_pricing_engine.py`
 
-The pricing engine computes **probability that BTC ends above a given strike price** at contract expiry. It uses a GARCH(1,1) + SVCJ (Kou Double Exponential Jump Diffusion with correlated volatility jumps) Monte Carlo simulator running on **hourly** steps, with optional Hansen skewed-t innovations and FIGARCH long-memory volatility.
+The pricing engine computes **probability that BTC ends above a given strike price** at contract expiry. It uses a FIGARCH(1,d,1) or GARCH(1,1) + SVCJ (Kou Double Exponential Jump Diffusion with correlated volatility jumps) Monte Carlo simulator running on **hourly** steps, with optional Hansen skewed-t innovations and FIGARCH(1,d,1) long-memory volatility.
 
 ## Phase Structure
 
@@ -20,7 +20,7 @@ The pricing engine is built incrementally across seven phases. Each phase is a t
 | 1.5 | Horizon gating | (automatic) | Always active |
 | 2.3 | Directional XGBoost | `use_xgb_direction=True` | Opt-in |
 | 2.4 | Regime-conditional jumps | `regime_params` dict | With HMM |
-| 2.5 | FIGARCH long memory | `use_figarch=True` | Opt-in |
+| 2.5 | FIGARCH(1,d,1) long memory [Baillie, Bollerslev & Mikkelsen 1996] | `use_figarch=True` | Opt-in |
 | 2.6 | Regime-vol gate interaction | `vol_gate_regime` param | With vol gate |
 
 ## Model Components
@@ -104,15 +104,16 @@ When enabled (`use_skewed_t=True`), student-t innovations are replaced with Hans
 # lam=0   → symmetric (reduces to standard Student-t)
 ```
 
-### 6. FIGARCH Long Memory (Optional)
+### 6. FIGARCH(1,d,1) Long Memory (Optional)
 
-When enabled (`use_figarch=True`), replaces the short-memory GARCH(1,1) variance recursion with FIGARCH(1,d,1):
+When enabled (`use_figarch=True`), replaces the short-memory GARCH(1,1) variance recursion with FIGARCH(1,d,1) per Baillie, Bollerslev & Mikkelsen (1996):
 
-$$\sigma_t^2 = \frac{\omega}{1-\beta} + \sum_{k=0}^{\infty} \lambda_k(d) \cdot \epsilon_{t-k}^2$$
+$$\sigma_t^2 = \frac{\omega}{1-\beta} + \sum_{k=1}^{\infty} \lambda_k \cdot \epsilon_{t-k}^2$$
 
-- **Fractional differencing parameter** d ≈ 0.578 (Siu 2025, from BTC empirical estimation)
-- **Binomial expansion weights**: λ₀(d)=d, λ_k(d) = ((k-d-1)/k) · λ_{k-1}(d), truncated at 100 lags
+- **Jointly estimated**: phi, d, beta fitted via `arch_model(vol='FIGARCH', p=1, q=1)` on hourly BTC returns
+- **ARCH(infinity) weights**: lambda_1=phi-beta+d, lambda_i=beta*lambda_{i-1}+(delta_i-phi*delta_{i-1}) where delta_i are the binomial coefficients of (1-L)^d
 - **Persistence**: FIGARCH captures long-range dependence in BTC volatility (hyperbolic decay vs exponential in GARCH)
+- **Positivity**: Joint estimation satisfies Bollerslev-Mikkelsen non-negativity constraints natively
 
 ### 9. Directional XGBoost Modifier (Phase 2.3)
 
@@ -206,7 +207,7 @@ All new features are backward-compatible via flags defaulting to `False`, except
 | `use_regime_switching` | `False` | 1.2 | Enable HMM regime detection |
 | `use_svcj` | `False` | 1.3 | Enable correlated volatility jumps |
 | `use_skewed_t` | `False` | 1.4 | Use Hansen skewed-t innovations |
-| `use_figarch` | `False` | 2.5 | Use FIGARCH long-memory variance |
+| `use_figarch` | `False` | 2.5 | Use FIGARCH(1,d,1) long-memory variance |
 | `use_xgb_direction` | `False` | 2.3 | Use XGBoost directional modifier |
 
 Non-boolean parameters:
@@ -283,7 +284,7 @@ Eight tests validate:
 4. **Variance Consistency** — Empirical/model variance ratio within ±15%
 5. **Naive Prior** — Zero-drift paths show smaller deviation than fitted-drift paths
 6. **SVCJ** — Volatility jumps add measurable variance vs plain SVJ
-7. **FIGARCH Weights** — Binomial expansion weights decay correctly (w₀=1, w₉₉ negative and small)
+7. **FIGARCH Weights** — ARCH(infinity) weights match arch library reference, weights[0]=0, lambda_1>0 (B-M positivity satisfied)
 8. **Skewed-t** — λ=-0.3 → negative skew, λ=+0.3 → positive skew, λ=0 → symmetric
 
 ## Data Dependencies

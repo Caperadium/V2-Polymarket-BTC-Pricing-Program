@@ -235,6 +235,13 @@ class RegimeDetector:
 
         train_data = daily_returns[-window:].reshape(-1, 1)
 
+        # hmmlearn's convergence monitor logs WARNING on EM log-likelihood
+        # oscillations at float-epsilon scale (~1e-15) — harmless numerical
+        # noise, not real non-convergence. Suppress so it doesn't pollute
+        # backtest subprocess output with false convergence alarms.
+        _hmmlearn_logger = logging.getLogger("hmmlearn")
+        _hmmlearn_prev = _hmmlearn_logger.level
+        _hmmlearn_logger.setLevel(logging.ERROR)
         try:
             model = hmm.GaussianHMM(
                 n_components=self.n_states,
@@ -254,6 +261,8 @@ class RegimeDetector:
                 model = self._model
             else:
                 return None
+        finally:
+            _hmmlearn_logger.setLevel(_hmmlearn_prev)
 
         self._model = model
         self._labels = self._label_states(model, train_data)

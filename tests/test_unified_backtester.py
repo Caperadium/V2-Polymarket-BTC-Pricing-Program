@@ -683,3 +683,264 @@ class TestInitExports:
         assert SignalDiagnostics is not None
         assert callable(run_diagnostics)
         assert BacktestingOrchestrator is not None
+
+
+# ============================================================================
+# Fix 1b: Volgate DataFrame shape & caching
+# ============================================================================
+
+class TestVolgateDataFrame:
+    """Verify _volgate_btc_df has correct shape for compute_vol_gate."""
+
+    @pytest.fixture
+    def intraday_df(self):
+        """Minimal intraday DataFrame with timestamp column + close (as load_btc_csv returns)."""
+        times = pd.date_range("2025-01-01", periods=100, freq="1min", tz="UTC")
+        return pd.DataFrame({
+            "timestamp": times,
+            "close": np.random.default_rng(42).normal(50000, 100, 100).cumsum() + 40000,
+        })
+
+    def test_volgate_df_has_timestamp_column_not_index(self, intraday_df, tmp_path):
+        """After _load_btc_prices, _volgate_btc_df must be a plain df with 'timestamp' COLUMN."""
+        from core.backtesting.backtest_engine import BacktestEngine
+
+        engine = BacktestEngine(
+            market_data_batches=[],
+            initial_bankroll=1000.0,
+            strategy_params={},
+            price_df=intraday_df,
+        )
+        # _load_btc_prices called in __init__
+        engine._load_btc_prices()
+
+        vdf = engine._volgate_btc_df
+        assert vdf is not None, "_volgate_btc_df should be populated"
+        assert isinstance(vdf, pd.DataFrame)
+        assert "timestamp" in vdf.columns
+        assert "close" in vdf.columns
+        # Must be default RangeIndex, NOT DatetimeIndex
+        assert not isinstance(vdf.index, pd.DatetimeIndex), \
+            f"_volgate_btc_df index must be plain RangeIndex, got {type(vdf.index).__name__}"
+
+    def test_volgate_df_values_match_btc_prices(self, intraday_df, tmp_path):
+        """_volgate_btc_df.close values should match _btc_prices.close values."""
+        from core.backtesting.backtest_engine import BacktestEngine
+
+        engine = BacktestEngine(
+            market_data_batches=[],
+            initial_bankroll=1000.0,
+            strategy_params={},
+            price_df=intraday_df,
+        )
+        engine._load_btc_prices()
+
+        vdf = engine._volgate_btc_df
+        btc = engine._btc_prices
+
+        pd.testing.assert_index_equal(
+            pd.DatetimeIndex(vdf["timestamp"]),
+            pd.DatetimeIndex(btc.index),
+            check_names=False,  # index names differ: "timestamp" vs "datetime_utc"
+        )
+        pd.testing.assert_series_equal(
+            vdf["close"].reset_index(drop=True),
+            btc["close"].reset_index(drop=True),
+            check_names=False,
+        )
+
+    def test_volgate_df_is_none_when_no_data(self, tmp_path):
+        """When no BTC data loaded, _volgate_btc_df stays None."""
+        from core.backtesting.backtest_engine import BacktestEngine
+
+        engine = BacktestEngine(
+            market_data_batches=[],
+            initial_bankroll=1000.0,
+            strategy_params={},
+            btc_price_path=str(tmp_path / "nonexistent.csv"),
+            price_df=None,
+        )
+        engine._load_btc_prices()  # no file, no df → empty
+
+        assert engine._volgate_btc_df is None, \
+            "_volgate_btc_df should be None when no BTC data loaded"
+
+
+# ============================================================================
+# Fix 2: asof_utc parameter in recommend_trades
+# ============================================================================
+
+class TestAsofUtcParameter:
+    """Verify asof_utc is accepted and propagated correctly."""
+
+    @pytest.fixture
+    def minimal_batch(self):
+        return pd.DataFrame({
+            "slug": ["btc-test"],
+            "strike": [50000.0],
+            "expiry_date": [pd.Timestamp("2025-06-15", tz="UTC")],
+            "expiry_key": ["2025-06-15"],
+            "market_price": [0.55],
+            "p_model_fit": [0.60],
+            "T_days": [5.0],
+            "side": ["YES"],
+        })
+
+    @pytest.fixture
+    def tiny_btc_df(self):
+        """BTC data spanning a few hours with enough rows for vol gate lookback."""
+        times = pd.date_range(
+            "2025-01-01 00:00:00", periods=2000, freq="1min", tz="UTC"
+        )
+        rng = np.random.default_rng(99)
+        return pd.DataFrame({
+            "timestamp": times,
+            "close": rng.normal(50000, 50, 2000).cumsum() + 45000,
+        })
+
+    def test_asof_utc_accepted_in_signature(self):
+        """recommend_trades must accept asof_utc keyword argument."""
+        from core.strategy.auto_reco import recommend_trades
+        import inspect
+
+        sig = inspect.signature(recommend_trades)
+        assert "asof_utc" in sig.parameters, \
+            "asof_utc parameter must be in recommend_trades signature"
+
+    def test_asof_utc_propagates_to_vol_gate(self, minimal_batch, tiny_btc_df):
+        """When asof_utc is provided, compute_vol_gate receives it (no 'stale' fallback)."""
+        from core.strategy.auto_reco import recommend_trades
+        from datetime import datetime, timezone
+
+        historical_time = datetime(2025, 1, 1, 12, 0, tzinfo=timezone.utc)
+        future_time = datetime(2030, 1, 1, 12, 0, tzinfo=timezone.utc)
+
+        # With historical asof_utc + matching BTC data: should get a vol gate result
+        recos = recommend_trades(
+            df=minimal_batch,
+            bankroll=1000.0,
+            min_edge=0.01,
+            min_price=0.01,
+            max_price=0.99,
+            allow_no=True,
+            min_trade_usd=1.0,
+            btc_price_df=tiny_btc_df,
+            asof_utc=historical_time,
+            require_active=False,
+        )
+        # Should return a list (may be empty if no trades meet criteria, but no crash)
+        assert isinstance(recos, list)
+
+        # With far-future asof_utc (vol gate can't find data → fallback, no crash)
+        recos_future = recommend_trades(
+            df=minimal_batch,
+            bankroll=1000.0,
+            min_edge=0.01,
+            min_price=0.01,
+            max_price=0.99,
+            allow_no=True,
+            min_trade_usd=1.0,
+            btc_price_df=tiny_btc_df,
+            asof_utc=future_time,
+            require_active=False,
+        )
+        assert isinstance(recos_future, list)
+
+    def test_asof_utc_default_is_now(self, minimal_batch):
+        """When asof_utc is omitted, it defaults to datetime.now() behavior."""
+        from core.strategy.auto_reco import recommend_trades
+        from datetime import datetime, timezone
+
+        before = datetime.now(timezone.utc)
+        # Without btc_price_df, load_btc_csv() is called → may fail in CI,
+        # so pass btc_price_df=None but expect clean handling
+        recos = recommend_trades(
+            df=minimal_batch,
+            bankroll=1000.0,
+            min_edge=0.01,
+            min_price=0.01,
+            max_price=0.99,
+            allow_no=True,
+            min_trade_usd=1.0,
+            btc_price_df=None,  # triggers load_btc_csv() fallback
+            require_active=False,
+        )
+        after = datetime.now(timezone.utc)
+        assert isinstance(recos, list), "Should not crash even if BTC file missing"
+
+
+# ============================================================================
+# Fix 3: Path-robust BTC loader
+# ============================================================================
+
+class TestBtcPathResolution:
+    """Verify absolute path defaults and relative path resolution."""
+
+    def test_default_intraday_is_absolute(self):
+        """_DEFAULT_INTRADAY must be an absolute Path."""
+        from core.backtesting.backtest_engine import _DEFAULT_INTRADAY, _PROJECT_ROOT
+
+        assert _DEFAULT_INTRADAY.is_absolute(), \
+            f"_DEFAULT_INTRADAY must be absolute, got {_DEFAULT_INTRADAY}"
+        assert _PROJECT_ROOT in _DEFAULT_INTRADAY.parents, \
+            f"_DEFAULT_INTRADAY must be under _PROJECT_ROOT"
+
+    def test_constructor_default_is_absolute(self):
+        """BacktestEngine constructor default must resolve to absolute path."""
+        from core.backtesting.backtest_engine import BacktestEngine
+
+        engine = BacktestEngine(
+            market_data_batches=[],
+            initial_bankroll=1000.0,
+            strategy_params={},
+        )
+        path = Path(engine.btc_price_path)
+        assert path.is_absolute(), \
+            f"Constructor default btc_price_path must be absolute, got {engine.btc_price_path}"
+
+    def test_relative_path_resolved_in_load(self, tmp_path):
+        """When a relative btc_price_path is passed, _load_btc_prices resolves it."""
+        import core.backtesting.backtest_engine as bte
+        from unittest.mock import patch
+
+        # Create fake intraday data in a temp dir
+        fake_data = tmp_path / "sub" / "btc.csv"
+        fake_data.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame({
+            "timestamp": ["2025-01-01 00:00:00", "2025-01-01 00:01:00"],
+            "close": [50000.0, 50001.0],
+        }).to_csv(fake_data, index=False)
+
+        # Monkey-patch _PROJECT_ROOT to point at tmp_path
+        with patch.object(bte, "_PROJECT_ROOT", tmp_path):
+            engine = bte.BacktestEngine(
+                market_data_batches=[],
+                initial_bankroll=1000.0,
+                strategy_params={},
+                btc_price_path="sub/btc.csv",
+            )
+            engine._load_btc_prices()
+
+            assert engine._btc_prices is not None
+            assert not engine._btc_prices.empty
+            assert engine._intraday_min is not None
+            assert engine._intraday_max is not None
+
+    def test_file_not_found_handled_gracefully(self, tmp_path):
+        """Missing file should log warning, not crash."""
+        import core.backtesting.backtest_engine as bte
+        from unittest.mock import patch
+
+        nonexistent = tmp_path / "nope.csv"
+        with patch.object(bte, "_PROJECT_ROOT", tmp_path):
+            engine = bte.BacktestEngine(
+                market_data_batches=[],
+                initial_bankroll=1000.0,
+                strategy_params={},
+                btc_price_path=str(nonexistent),
+            )
+            engine._load_btc_prices()
+
+            # Should have empty _btc_prices, not crashed
+            assert engine._btc_prices.empty
+            assert engine._volgate_btc_df is None

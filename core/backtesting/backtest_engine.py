@@ -34,6 +34,11 @@ except Exception:
     ET_ZONE = timezone(timedelta(hours=-5))
 
 from core.strategy.auto_reco import recommend_trades, recommendations_to_dataframe
+from core.strategy.common import resolve_model_prob, MODEL_PROB_CANDIDATES
+
+# Path resolution — robust regardless of CWD (Streamlit, scripts/, etc.)
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+_DEFAULT_INTRADAY = _PROJECT_ROOT / "DATA" / "btc_intraday_1m.csv"
 
 # Configure module logger
 logger = logging.getLogger(__name__)
@@ -94,7 +99,7 @@ class BacktestEngine:
         market_data_batches: List[pd.DataFrame],
         initial_bankroll: float,
         strategy_params: Dict,
-        btc_price_path: str = "DATA/btc_intraday_1m.csv",
+        btc_price_path: str = str(_DEFAULT_INTRADAY),
         price_df: Optional[pd.DataFrame] = None,
     ):
         self.batches = market_data_batches
@@ -105,11 +110,16 @@ class BacktestEngine:
 
         # Internal state
         self._btc_prices: Optional[pd.DataFrame] = None
+        self._volgate_btc_df: Optional[pd.DataFrame] = None  # timestamp COLUMN + close, for vol gate
+        self._btc_daily: Optional[pd.DataFrame] = None   # daily closes for spot fallback (not settlement)
+        self._intraday_min: Optional[pd.Timestamp] = None
+        self._intraday_max: Optional[pd.Timestamp] = None
         self._running_bankroll: float = initial_bankroll
         self._open_positions: List[OpenPosition] = []
         self._closed_trades: List[Dict] = []
         self._equity_snapshots: List[Dict] = []
         self._all_priced_contracts: List[Dict] = []  # Track ALL evaluated contracts
+        self._excluded_trade_ids: set = set()  # trades dropped for missing settlement
         self._trade_counter: int = 0
 
     def _load_btc_prices(self) -> None:
@@ -124,8 +134,10 @@ class BacktestEngine:
             df = self._price_df_provided.copy()
             logger.info(f"Using provided price DataFrame with {len(df)} rows")
         else:
-            # Load from file
+            # Load from file — resolve relative paths against project root
             path = Path(self.btc_price_path)
+            if not path.is_absolute():
+                path = _PROJECT_ROOT / path
             if not path.exists():
                 logger.warning(f"BTC price file not found: {path}")
                 self._btc_prices = pd.DataFrame()
@@ -173,11 +185,128 @@ class BacktestEngine:
 
             df["close"] = pd.to_numeric(df[close_col], errors="coerce")
             self._btc_prices = df[["close"]].copy()
-            logger.info(f"Loaded {len(self._btc_prices)} BTC price records")
+            if not self._btc_prices.empty:
+                self._intraday_min = self._btc_prices.index.min()
+                self._intraday_max = self._btc_prices.index.max()
+                # Deterministic vol-gate-ready frame: timestamp COLUMN + close
+                self._volgate_btc_df = pd.DataFrame({
+                    "timestamp": self._btc_prices.index,
+                    "close": self._btc_prices["close"].values,
+                })
+            logger.info(
+                f"Loaded {len(self._btc_prices)} BTC price records "
+                f"(coverage {self._intraday_min} → {self._intraday_max})"
+            )
 
         except Exception as e:
             logger.error(f"Failed to process BTC prices: {e}")
             self._btc_prices = pd.DataFrame()
+
+        # ---- daily closes (spot fallback only; settlement is intraday-only) ----
+        # Resolve relative paths against project root (same as intraday load above),
+        # not the CWD — under Streamlit the CWD is app/, which would yield app/DATA.
+        _intraday_path = Path(self.btc_price_path)
+        if not _intraday_path.is_absolute():
+            _intraday_path = _PROJECT_ROOT / _intraday_path
+        data_dir = _intraday_path.parent
+        self._btc_daily = self._load_close_csv(data_dir / "btc_daily.csv", "daily")
+
+    @staticmethod
+    def _load_close_csv(path: Path, label: str) -> pd.DataFrame:
+        """Load a ``date,close`` CSV into a UTC-indexed single-column frame."""
+        try:
+            if not path.exists():
+                logger.info("%s BTC file not found (%s)", label, path)
+                return pd.DataFrame()
+            d = pd.read_csv(path)
+            cols = {c.lower(): c for c in d.columns}
+            dcol = cols.get("date", cols.get("timestamp", cols.get("datetime")))
+            ccol = cols.get("close", cols.get("price"))
+            if dcol is None or ccol is None:
+                return pd.DataFrame()
+            d["datetime_utc"] = pd.to_datetime(d[dcol], utc=True, errors="coerce")
+            d["close"] = pd.to_numeric(d[ccol], errors="coerce")
+            d = d.dropna(subset=["datetime_utc", "close"]).set_index("datetime_utc").sort_index()
+            logger.info("Loaded %d %s BTC closes", len(d), label)
+            return d[["close"]].copy()
+        except Exception as e:
+            logger.warning("Failed to load %s BTC closes: %s", label, e)
+            return pd.DataFrame()
+
+    @staticmethod
+    def _nearest_close(frame: Optional[pd.DataFrame], target: pd.Timestamp,
+                       tol: pd.Timedelta) -> Optional[float]:
+        """Nearest close in *frame* to *target* within *tol*, else None."""
+        if frame is None or frame.empty:
+            return None
+        idx = frame.index.get_indexer([target], method="nearest")
+        if idx[0] < 0:
+            return None
+        nearest = frame.index[idx[0]]
+        if abs(nearest - target) <= tol:
+            return float(frame.iloc[idx[0]]["close"])
+        return None
+
+    def _settlement_price(self, settle_dt: pd.Timestamp) -> Tuple[Optional[float], Optional[str]]:
+        """BTC price at the 12:00-ET settlement instant, from 1-minute data only.
+
+        Settlement decides a YES/NO outcome against a strike, so it demands the
+        highest available time resolution: a coarser bar (hourly/daily) can land
+        on the wrong side of a near-the-money strike if BTC oscillated around it
+        within the bar. We therefore settle exclusively from the 1-minute intraday
+        series (tight ±5m tolerance to bridge the occasional missing bar). The
+        intraday history must cover the contract range — run
+        ``python core/data/data_fetcher.py`` to backfill. Returns (price, source)
+        or (None, None) when no 1m print is within tolerance.
+        """
+        p = self._nearest_close(self._btc_prices, settle_dt, pd.Timedelta(minutes=5))
+        if p is not None:
+            return p, "intraday"
+        return None, None
+
+    def _spot_as_of(self, dt: datetime) -> Optional[float]:
+        """Spot price known AT *dt*, leak-free, with a daily-close fallback.
+
+        Single source of truth for "spot at snapshot" used by moneyness/momentum,
+        consistent with the backrunner's S0 logic:
+          1. last intraday close STRICTLY BEFORE dt (bars open-stamped → the
+             close at/after dt is future), else
+          2. the most recent daily close STRICTLY BEFORE dt's day (prior-day
+             close ≈ the price at dt's midnight).
+        """
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        target = pd.Timestamp(dt).tz_convert("UTC")
+
+        if self._btc_prices is not None and not self._btc_prices.empty:
+            sl = self._btc_prices.index[self._btc_prices.index < target]
+            if len(sl) > 0:
+                return float(self._btc_prices.loc[sl[-1], "close"])
+
+        if self._btc_daily is not None and not self._btc_daily.empty:
+            day = target.normalize()
+            sl = self._btc_daily.index[self._btc_daily.index < day]
+            if len(sl) > 0:
+                return float(self._btc_daily.loc[sl[-1], "close"])
+
+        return None
+
+    def _expiry_is_settleable(self, expiry_date: pd.Timestamp) -> bool:
+        """True if 1-minute intraday data covers this expiry's 12:00-ET settlement.
+
+        Backtest reliability gate: only enter contracts we can later settle from a
+        real 1m print (settlement is intraday-only for strike-level precision).
+        Avoids the old force-refund-to-PnL-0 path that biased aggregates. Backfill
+        intraday (``data_fetcher.py``) to widen the tradeable/settleable range.
+        """
+        if self._intraday_min is None or self._intraday_max is None:
+            return False
+        try:
+            settle_dt = pd.Timestamp(self._get_expiry_datetime(expiry_date))
+        except Exception:
+            return False
+        tol = pd.Timedelta(minutes=5)
+        return (self._intraday_min - tol) <= settle_dt <= (self._intraday_max + tol)
 
     def _get_btc_price_at(
         self,
@@ -242,7 +371,7 @@ class BacktestEngine:
         self,
         expiry_date: pd.Timestamp,
         strike: float
-    ) -> Tuple[Optional[float], Optional[float]]:
+    ) -> Tuple[Optional[float], Optional[float], Optional[str]]:
         """
         Authoritative source for outcome resolution.
 
@@ -251,24 +380,25 @@ class BacktestEngine:
             strike: Contract strike price
 
         Returns:
-            Tuple of (outcome_yes, btc_price_at_settlement)
+            Tuple of (outcome_yes, btc_price_at_settlement, settlement_source)
             - outcome_yes: 1.0 if btc_price > strike (strict >), else 0.0
             - btc_price_at_settlement: BTC price at 12:00 ET on expiry day
-            - Both are None if price data is unavailable
+            - settlement_source: 'intraday' | 'hourly' | 'daily_coarse'
+            - All three are None if no price source covers the settlement instant
         """
         try:
-            expiry_dt_utc = self._get_expiry_datetime(expiry_date)
-            btc_price = self._get_btc_price_at(expiry_dt_utc)
+            expiry_dt_utc = pd.Timestamp(self._get_expiry_datetime(expiry_date))
+            btc_price, source = self._settlement_price(expiry_dt_utc)
 
             if btc_price is None:
-                return None, None
+                return None, None, None
 
             # Strict inequality: YES wins if btc_price > strike
             outcome_yes = 1.0 if btc_price > strike else 0.0
-            return outcome_yes, btc_price
+            return outcome_yes, btc_price, source
 
         except Exception:
-            return None, None
+            return None, None, None
 
     def _get_model_prob_col(self, df: pd.DataFrame) -> Optional[str]:
         """
@@ -319,33 +449,37 @@ class BacktestEngine:
                 continue
 
             # Use authoritative resolve_outcome_yes() for outcome determination
-            outcome_yes, btc_price = self.resolve_outcome_yes(pos_expiry, pos.strike)
+            outcome_yes, btc_price, settle_source = self.resolve_outcome_yes(pos_expiry, pos.strike)
 
             if outcome_yes is None:
-                # No price data - log warning and skip (keep position open for now)
-                # Or force settle if >2 days past expiry
+                # No intraday print at the 12:00-ET settlement instant. The entry
+                # gate (_expiry_is_settleable) should prevent this, so it is rare.
+                # Wait a short grace period for late-arriving data, then EXCLUDE
+                # the position: refund the stake to keep equity coherent, but do
+                # NOT record a fake PnL=0 settlement that would pollute win-rate /
+                # Sharpe / calibration. The trade is dropped from results entirely.
                 days_past = (current_time - pos_expiry).days
                 if days_past > 2:
-                    # Force settle as refund (return stake, PnL = 0)
                     logger.warning(
-                        f"Force settling {pos.slug} as refund (missing BTC price data)"
+                        "Excluding %s from results: no BTC settlement price "
+                        "(refunding stake $%.2f, no PnL recorded)",
+                        pos.slug, pos.stake,
                     )
-                    payout = pos.stake
-                    pnl = 0.0
-                    outcome_yes = np.nan
-                    btc_price = np.nan
+                    total_payout += pos.stake  # reverse the entry debit
+                    # mark its entry row (if any) as excluded for later pruning
+                    self._excluded_trade_ids.add(pos.trade_id)
+                    continue
                 else:
                     remaining.append(pos)
                     continue
+
+            # Calculate payout using resolved outcome
+            if pos.side.upper() == "YES":
+                payout = pos.size_shares * outcome_yes
             else:
-                # Calculate payout using resolved outcome
-                if pos.side.upper() == "YES":
-                    payout = pos.size_shares * outcome_yes
-                else:
-                    payout = pos.size_shares * (1.0 - outcome_yes)
+                payout = pos.size_shares * (1.0 - outcome_yes)
 
-                pnl = payout - pos.stake
-
+            pnl = payout - pos.stake
             total_payout += payout
 
             # Record closed trade
@@ -369,6 +503,7 @@ class BacktestEngine:
                 "pnl": pnl,
                 "settled": True,
                 "settlement_date": current_time,
+                "settlement_source": settle_source,
                 "trade_id": pos.trade_id,
                 "kelly_applied": pos.kelly_applied,
             })
@@ -392,10 +527,21 @@ class BacktestEngine:
         positions_df = _positions_to_df(self._open_positions)
 
         # --- Log ALL priced contracts BEFORE calling recommend_trades ---
-        model_prob_col = self._get_model_prob_col(batch_df)
-        if model_prob_col is not None:
+        # Row-level coalesce so a failed p_model_fit falls back to p_real_mc
+        # (mirrors the strategy path) — all_priced then reflects the prob the
+        # strategy actually used.
+        resolved_model_prob = resolve_model_prob(batch_df)
+        # Raw (never-calibrated) precedence, independent of USE_CALIBRATED_PROB, so
+        # the signed-edge panel can show a true raw-vs-calibrated comparison even
+        # when the backtest itself ran with the flag on (then resolved_model_prob
+        # above already equals p_model_cal). FIX 7/M2.
+        resolved_model_prob_raw = resolve_model_prob(
+            batch_df, candidates=MODEL_PROB_CANDIDATES
+        )
+        if resolved_model_prob.notna().any():
             # Get spot price at snapshot time for moneyness calculation
-            snapshot_spot = self._get_btc_price_at(current_time)
+            # (leak-free, with daily-close fallback for pre-intraday snapshots)
+            snapshot_spot = self._spot_as_of(current_time)
 
             # Determine market price column
             market_col = None
@@ -418,10 +564,10 @@ class BacktestEngine:
                     dte_col = col
                     break
 
-            for _, row in batch_df.iterrows():
+            for idx, row in batch_df.iterrows():
                 try:
                     strike = float(row.get("strike", np.nan))
-                    model_prob = float(row.get(model_prob_col, np.nan))
+                    model_prob = float(resolved_model_prob.loc[idx])
                     market_yes_price = float(row.get(market_col, np.nan)) if market_col else np.nan
                     expiry_key = str(row.get(expiry_key_col, "")) if expiry_key_col else ""
                     slug = str(row.get("slug", ""))
@@ -462,6 +608,16 @@ class BacktestEngine:
                         "spot_price": snapshot_spot if snapshot_spot is not None else np.nan,
                         "market_yes_price": market_yes_price,
                         "model_prob_used": model_prob,
+                        # Raw (never-calibrated) model prob — panel OFF state.
+                        "model_prob_raw": float(resolved_model_prob_raw.loc[idx]),
+                        # Carry the calibrated prob through (FIX 7/M2) so the
+                        # signed-edge panel's "Use M2-calibrated p" toggle can see
+                        # it. Only populated when the batch was fitted with
+                        # USE_CALIBRATED_PROB on + a trusted shift table; NaN otherwise.
+                        "p_model_cal": (
+                            pd.to_numeric(row.get("p_model_cal"), errors="coerce")
+                            if "p_model_cal" in batch_df.columns else np.nan
+                        ),
                         "expiry_key": expiry_key,
                         "slug": slug,
                         "moneyness": moneyness,
@@ -526,6 +682,7 @@ class BacktestEngine:
         # Moneyness filter
         params["max_moneyness"] = self.strategy_params.get("max_moneyness", None)
         params["min_moneyness"] = self.strategy_params.get("min_moneyness", None)
+        params["moneyness_mode"] = self.strategy_params.get("moneyness_mode", "abs")
 
         # Position size caps (critical for realistic backtesting)
         params["max_add_per_cycle_usd"] = self.strategy_params.get("max_add_per_cycle_usd", 50.0)
@@ -537,6 +694,8 @@ class BacktestEngine:
             bankroll=self._running_bankroll,
             positions_df=positions_df,
             current_open_positions=positions_df,
+            btc_price_df=self._volgate_btc_df,   # cached once; avoids per-call CSV reload
+            asof_utc=current_time,               # replay timestamp, not wall-clock now()
             **params
         )
 
@@ -626,6 +785,24 @@ class BacktestEngine:
                 # Skip HOLD or other actions
                 continue
 
+            # Reliability gate: only enter contracts we can later settle from a
+            # real intraday print at 12:00 ET. Pre-/post-coverage expiries are
+            # skipped here rather than force-refunded to PnL=0 at settlement
+            # (which silently biased every aggregate).
+            _raw_exp_gate = trade.get("expiry_date")
+            _exp_for_gate = (
+                expiry_key_str
+                if (pd.isna(_raw_exp_gate) or _raw_exp_gate is None
+                    or str(_raw_exp_gate) in ("", "NaT", "nan"))
+                else str(_raw_exp_gate)
+            )
+            try:
+                _exp_ts_gate = pd.to_datetime(_exp_for_gate)
+            except Exception:
+                _exp_ts_gate = pd.NaT
+            if pd.isna(_exp_ts_gate) or not self._expiry_is_settleable(_exp_ts_gate):
+                continue
+
             stake = float(
                 trade.get("suggested_stake",
                     trade.get("stake_dollars",
@@ -683,12 +860,12 @@ class BacktestEngine:
             # Compute moneyness and momentum for this trade
             trade_moneyness = np.nan
             momentum_6hr = np.nan
-            snapshot_spot_at_trade = self._get_btc_price_at(current_time)
+            snapshot_spot_at_trade = self._spot_as_of(current_time)
             if snapshot_spot_at_trade is not None and snapshot_spot_at_trade > 0:
                 if not np.isnan(strike):
                     trade_moneyness = (strike - snapshot_spot_at_trade) / snapshot_spot_at_trade
                 time_6h_ago = current_time - pd.Timedelta(hours=6)
-                spot_6h_ago = self._get_btc_price_at(time_6h_ago)
+                spot_6h_ago = self._spot_as_of(time_6h_ago)
                 if spot_6h_ago is not None and spot_6h_ago > 0:
                     momentum_6hr = float(np.log(snapshot_spot_at_trade / spot_6h_ago))
 
@@ -767,6 +944,7 @@ class BacktestEngine:
         self._closed_trades = []
         self._equity_snapshots = []
         self._all_priced_contracts = []  # Reset all priced contracts
+        self._excluded_trade_ids = set()
 
         # Sort batches chronologically by batch_timestamp or pricing_date
         sorted_batches = []
@@ -826,6 +1004,14 @@ class BacktestEngine:
 
         # Build output DataFrames
         trades_df = pd.DataFrame(self._closed_trades)
+        # Drop entry rows for positions excluded at settlement (no settlement
+        # price) so their stake-only rows don't masquerade as open/real trades.
+        if (
+            not trades_df.empty
+            and self._excluded_trade_ids
+            and "trade_id" in trades_df.columns
+        ):
+            trades_df = trades_df[~trades_df["trade_id"].isin(self._excluded_trade_ids)]
         if not trades_df.empty and "trade_id" in trades_df.columns:
             # Consolidate rows: keep last entry per trade_id (settled > unsettled)
             trades_df = trades_df.sort_values(["settled", "pricing_date"])
@@ -859,7 +1045,7 @@ class BacktestEngine:
 
         # Group by unique (expiry_date, strike) pairs for efficient resolution
         # Create a resolution lookup
-        resolution_cache: Dict[Tuple, Tuple[Optional[float], Optional[float]]] = {}
+        resolution_cache: Dict[Tuple, Tuple[Optional[float], Optional[float], Optional[str]]] = {}
 
         for idx, row in all_priced_df.iterrows():
             expiry = row["expiry_date"]
@@ -873,12 +1059,12 @@ class BacktestEngine:
 
             if cache_key not in resolution_cache:
                 # Resolve once per unique (expiry, strike) pair
-                outcome_yes, btc_price = self.resolve_outcome_yes(expiry, strike)
-                resolution_cache[cache_key] = (outcome_yes, btc_price)
+                resolution_cache[cache_key] = self.resolve_outcome_yes(expiry, strike)
 
-            outcome_yes, btc_price = resolution_cache[cache_key]
+            outcome_yes, btc_price, settle_source = resolution_cache[cache_key]
             all_priced_df.at[idx, "outcome_yes"] = outcome_yes if outcome_yes is not None else np.nan
             all_priced_df.at[idx, "btc_price_at_settlement"] = btc_price if btc_price is not None else np.nan
+            all_priced_df.at[idx, "settlement_source"] = settle_source
 
         return all_priced_df
 
@@ -893,8 +1079,10 @@ class BacktestEngine:
         from core.validation.calibration_metrics import run_calibration_report
         import tempfile, os
 
-        # Check we have model probabilities and outcomes
-        model_col = self._get_model_prob_col(all_priced_df)
+        # all_priced_df stores the strategy-used probability as 'model_prob_used'
+        # (it is NOT one of the p_model_fit/p_real_mc precedence names). Use it
+        # directly; the generic resolver would miss it and skip calibration.
+        model_col = "model_prob_used"
         if model_col not in all_priced_df.columns:
             logger.info("Calibration skipped: no model probability column found.")
             return
@@ -942,7 +1130,7 @@ def run_backtest(
     daily_batches: List[pd.DataFrame],
     initial_bankroll: float,
     strategy_params: Dict,
-    btc_price_path: str = "DATA/btc_intraday_1m.csv",
+    btc_price_path: str = str(_DEFAULT_INTRADAY),
     price_df: Optional[pd.DataFrame] = None,
     return_all_priced: bool = False,
 ) -> Union[Tuple[pd.DataFrame, pd.DataFrame], Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]]:

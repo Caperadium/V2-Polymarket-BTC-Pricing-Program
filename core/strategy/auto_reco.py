@@ -53,6 +53,9 @@ from core.strategy.common import (
     DeltaIntent,
     TradeRecommendation,
     RebalanceConfig,
+    resolve_model_prob,
+    filter_by_moneyness,
+    latest_spot_as_of,
 )
 
 # Debug state
@@ -412,14 +415,16 @@ def build_targets(
     data["expiry_key"] = _derive_expiry_key(data)
     
     price_col = _pick_column(data, ["market_price", "market_pr", "Polymarket_Price"])
-    model_col = _pick_column(data, ["p_model_fit", "p_real_mc", "model_probability", "Model_Prob"])
-    
-    if price_col is None or model_col is None:
+    # Value-level coalesce: a failed (all-NaN) p_model_fit no longer shadows a
+    # populated p_real_mc — each row falls back to the best available estimate.
+    model_prob = resolve_model_prob(data)
+
+    if price_col is None or model_prob.notna().sum() == 0:
         logger.error("Batch file missing market_price or model probability columns")
         return targets
-    
+
     data["market_price"] = pd.to_numeric(data[price_col], errors="coerce")
-    data["model_prob"] = pd.to_numeric(data[model_col], errors="coerce")
+    data["model_prob"] = model_prob
     data = data.dropna(subset=["market_price", "model_prob"])
     
     # Compute required edge thresholds
@@ -438,7 +443,17 @@ def build_targets(
         data = data[mask]
     
     data = data[data["model_prob"].between(config.min_model_prob, config.max_model_prob)]
-    
+
+    # Moneyness filter (signed or abs). No-op if no bounds or no moneyness column.
+    data = filter_by_moneyness(
+        data,
+        lower=config.min_moneyness,
+        upper=config.max_moneyness,
+        mode=config.moneyness_mode,
+    )
+    if data.empty:
+        return targets
+
     # Stability penalty
     if config.use_stability_penalty:
         data["stability_penalty"] = _compute_stability_penalty(data)
@@ -1095,7 +1110,9 @@ def recommend_trades(
     prob_threshold_no: float = 0.3,
     max_moneyness: Optional[float] = None,
     min_moneyness: Optional[float] = None,
+    moneyness_mode: str = "abs",
     btc_price_df: Optional[pd.DataFrame] = None,
+    asof_utc: Optional[datetime] = None,
     risk_off_targets_to_zero: bool = True,
     missing_target_policy: Literal["KEEP", "EXIT"] = "KEEP",
     return_all: bool = False,
@@ -1138,6 +1155,7 @@ def recommend_trades(
         max_dte=max_dte,
         max_moneyness=max_moneyness,
         min_moneyness=min_moneyness,
+        moneyness_mode=moneyness_mode,
         require_active=require_active,
         use_stability_penalty=use_stability_penalty,
         disable_staleness=disable_staleness,
@@ -1155,15 +1173,16 @@ def recommend_trades(
         max_reduce_per_cycle_usd=kwargs.get("max_reduce_per_cycle_usd", 200000.0),
     )
     
-    # Load BTC data for vol gate
+    # Load BTC data for vol gate (live path only; backtest passes btc_price_df in)
     if btc_price_df is None:
         btc_price_df = load_btc_csv()
-    
-    # Compute vol gate
-    now_utc = datetime.now(timezone.utc)
+
+    # Evaluate vol gate AS OF the relevant timestamp (replay time in backtest,
+    # wall-clock in live). Avoids "Data stale near <now>" when replaying history.
+    now_utc = asof_utc if asof_utc is not None else datetime.now(timezone.utc)
     if btc_price_df is not None and not btc_price_df.empty:
         vol_gate_result = compute_vol_gate(btc_price_df, now_utc)
-        logger.info(f"[VolGate] Regime={vol_gate_result.regime} Reason={vol_gate_result.reason}")
+        logger.debug(f"[VolGate] Regime={vol_gate_result.regime} Reason={vol_gate_result.reason}")
     else:
         # Fallback: normal regime
         vol_gate_result = VolGateResult(
@@ -1180,6 +1199,14 @@ def recommend_trades(
         )
         logger.warning("[VolGate] No BTC data - using fallback normal regime")
     
+    # Inject signed moneyness for the live path (backtest pre-injects its own
+    # leak-free per-snapshot column, which is preserved by the "only if missing" guard).
+    if "moneyness" not in df.columns and "strike" in df.columns:
+        spot = latest_spot_as_of(btc_price_df, now_utc)
+        if spot and spot > 0:
+            df = df.copy()
+            df["moneyness"] = (pd.to_numeric(df["strike"], errors="coerce") - spot) / spot
+
     # Compute current exposure
     combined_positions = positions_df
     if current_open_positions is not None and not current_open_positions.empty:
