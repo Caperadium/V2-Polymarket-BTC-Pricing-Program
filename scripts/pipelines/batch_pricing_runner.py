@@ -129,6 +129,13 @@ def main():
     parser.add_argument("--no-advanced-features", action="store_false",
                         dest="advanced_features",
                         help="Disable all advanced features (plain GARCH+t+Kou baseline)")
+    parser.add_argument("--use-xgb", action="store_true", default=False,
+                        dest="use_xgb",
+                        help="Enable XGBoost directional drift shift (default: off). "
+                             "Needs DATA/macro_daily.csv for the directional signal.")
+    parser.add_argument("--xgb-lambda", type=float, default=None,
+                        dest="xgb_tilt_lambda",
+                        help="XGB tilt strength lambda (default: engine XGB_TILT_LAMBDA=0.0).")
 
     args = parser.parse_args()
     
@@ -174,6 +181,44 @@ def main():
                 "mu_v": cal["mu_v"], "rho_J": cal["rho_J"],
             }
             logger.info("Using data-calibrated jump parameters (live)")
+
+    # FIX 3 (re-enabled): XGBoost directional drift setup (live). Per-DTE-bucket
+    # models trained once on the full live data (leak is not a concern live —
+    # "now" is the present), cached across dates. Off by default.
+    xgb_daily_ret = None
+    xgb_macro = None
+    xgb_model_cache = {}
+    if args.use_xgb:
+        from core.pricing.directional_xgb import DirectionalXGB, to_daily_log_return_series
+        from core.pricing.btc_pricing_engine import (
+            dte_bucket_horizon, apply_xgb_drift_shift, XGB_TILT_LAMBDA,
+        )
+        import os as _os
+        xgb_daily_ret = to_daily_log_return_series(pd.read_csv(hourly_csv))
+        macro_path = "DATA/macro_daily.csv"
+        if _os.path.exists(macro_path):
+            xgb_macro = pd.read_csv(macro_path, index_col=0)
+            xgb_macro.index = pd.to_datetime(xgb_macro.index, utc=True)
+            xgb_macro = xgb_macro.sort_index()
+        else:
+            logger.warning(
+                "XGB enabled but DATA/macro_daily.csv missing; running BTC-only "
+                "(directional signal expected weak — run core/data/macro_fetcher.py)."
+            )
+        _xgb_lam = XGB_TILT_LAMBDA if args.xgb_tilt_lambda is None else args.xgb_tilt_lambda
+
+        def _get_xgb_model(bucket_h):
+            if bucket_h in xgb_model_cache:
+                return xgb_model_cache[bucket_h]
+            model = None
+            try:
+                m = DirectionalXGB()
+                if m.train_from_slice(xgb_daily_ret, xgb_macro, int(round(bucket_h))):
+                    model = m
+            except Exception:
+                logger.warning("XGB train failed (bucket %sd)", bucket_h, exc_info=True)
+            xgb_model_cache[bucket_h] = model
+            return model
 
     results = []
 
@@ -282,7 +327,24 @@ def main():
                                use_svcj=args.advanced_features,
                                use_skewed_t=args.advanced_features,
                                use_figarch=args.advanced_features)
-        
+
+        # FIX 3 (re-enabled): XGBoost directional drift shift on the terminal
+        # distribution (strike-agnostic, monotonicity-preserving). Per-DTE bucket.
+        if args.use_xgb and xgb_daily_ret is not None:
+            bucket_h = dte_bucket_horizon(hours_to_expiry / 24.0)
+            if bucket_h is not None:
+                _m = _get_xgb_model(bucket_h)
+                if _m is not None:
+                    _p_up = _m.predict_direction_adjustment(
+                        S0=S0, hours_to_expiry=hours_to_expiry,
+                        btc_returns=xgb_daily_ret, macro_df=xgb_macro,
+                        horizon_days=int(round(bucket_h)),
+                    )
+                    paths, _dH, _meta = apply_xgb_drift_shift(paths, S0, _p_up, _xgb_lam)
+                    if _meta.get("applied"):
+                        logger.info("XGB drift: p_up=%.3f dH=%.4f (bucket %.0fd)",
+                                    _p_up, _dH, bucket_h)
+
         # Grade each contract
         for c in contracts:
             strike = c['strike']

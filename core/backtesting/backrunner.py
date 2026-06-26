@@ -60,6 +60,7 @@ FITTED_DIR = OUTPUT_ROOT / "fitted"
 _worker_daily: Optional[pd.DataFrame] = None
 _worker_intraday: Optional[pd.DataFrame] = None
 _worker_hourly: Optional[pd.DataFrame] = None
+_worker_macro: Optional[pd.DataFrame] = None
 
 
 def _init_worker(data_dir: str) -> None:
@@ -80,7 +81,7 @@ def _init_worker(data_dir: str) -> None:
     os.environ["OPENBLAS_NUM_THREADS"] = "1"
     os.environ["NUMEXPR_NUM_THREADS"] = "1"
 
-    global _worker_daily, _worker_intraday, _worker_hourly
+    global _worker_daily, _worker_intraday, _worker_hourly, _worker_macro
 
     data_path = Path(data_dir)
 
@@ -116,6 +117,13 @@ def _init_worker(data_dir: str) -> None:
             hourly_df["datetime"] = pd.to_datetime(hourly_df[h_date_col], utc=True)
             _worker_hourly = hourly_df.set_index("datetime").sort_index()
 
+    # --- macro (optional; only needed for XGB directional drift) ---
+    macro_path = data_path / "macro_daily.csv"
+    if macro_path.exists():
+        macro_df = pd.read_csv(macro_path, index_col=0)
+        macro_df.index = pd.to_datetime(macro_df.index, utc=True)
+        _worker_macro = macro_df.sort_index()
+
 
 def _process_one(item: Dict[str, Any]) -> Optional[str]:
     """Process a single timestamp — runs in worker process.
@@ -132,7 +140,9 @@ def _process_one(item: Dict[str, Any]) -> Optional[str]:
         ts_str on success (batch CSV written), None on skip/failure.
     """
     # Lazy import inside worker so it picks up BLAS-suppressed env
-    from core.pricing.btc_pricing_engine import calculate_probabilities
+    from core.pricing.btc_pricing_engine import (
+        calculate_probabilities, dte_bucket_horizon,
+    )
 
     ts_str: str = item["ts_str"]
     ts_iso: str = item["ts_iso"]
@@ -143,6 +153,8 @@ def _process_one(item: Dict[str, Any]) -> Optional[str]:
     seed: int = item["seed"]
     n_sims: int = item["n_sims"]
     advanced_features: bool = item["advanced_features"]
+    use_xgb: bool = item.get("use_xgb", False)
+    xgb_tilt_lambda = item.get("xgb_tilt_lambda", None)
 
     ts_dt = pd.Timestamp(ts_iso)
 
@@ -239,6 +251,45 @@ def _process_one(item: Dict[str, Any]) -> Optional[str]:
         except Exception:
             detector = None
 
+    # ---- XGB directional drift (FIX 3 re-enabled, C2-a per-DTE-bucket) ----
+    # Per-snapshot leak-free setup, mirroring the jump/regime discipline above.
+    # The daily-return series and macro slice are derived from the strict-`<`
+    # truncated data; one XGB model is trained per DTE bucket and cached for this
+    # snapshot (snapshots are daily, so this is the per-(date,bucket) cache, D2).
+    xgb_daily_ret = None
+    xgb_macro_slice = None
+    xgb_model_cache: Dict[float, Any] = {}
+    if use_xgb:
+        from core.pricing.directional_xgb import (
+            DirectionalXGB, to_daily_log_return_series,
+        )
+        xgb_daily_ret = to_daily_log_return_series(hourly_for_engine)
+        if _worker_macro is not None and not _worker_macro.empty:
+            # Leak guard: macro rows strictly before the snapshot instant.
+            xgb_macro_slice = _worker_macro[_worker_macro.index < ts_dt]
+            if xgb_macro_slice.empty:
+                xgb_macro_slice = None
+        if xgb_macro_slice is None:
+            logger.warning(
+                "XGB enabled but no leak-free macro available at %s; running "
+                "BTC-only (directional signal expected weak — plan §8.1).", ts_str,
+            )
+
+    def _get_xgb_model(bucket_h: float):
+        """Train-or-fetch the cached per-bucket XGB model for this snapshot."""
+        if bucket_h in xgb_model_cache:
+            return xgb_model_cache[bucket_h]
+        model = None
+        try:
+            m = DirectionalXGB()
+            if m.train_from_slice(xgb_daily_ret, xgb_macro_slice, int(round(bucket_h))):
+                model = m
+        except Exception:
+            logger.debug("XGB train failed (bucket %.0fd) at %s", bucket_h, ts_str,
+                         exc_info=True)
+        xgb_model_cache[bucket_h] = model
+        return model
+
     # ---- validate contracts ----
     contracts_df = pd.DataFrame(contracts)
     if contracts_df.empty:
@@ -246,6 +297,25 @@ def _process_one(item: Dict[str, Any]) -> Optional[str]:
 
     # ---- group by expiry_date and price each group ----
     results: List[Dict[str, Any]] = []
+
+    # Per-snapshot dedup: all expiry groups below share the SAME truncated hourly
+    # slice, so the GARCH/FIGARCH MLE and S0 are identical across them. Fit/derive
+    # once and reuse via these caches (passed into every calculate_probabilities
+    # call). `snapshot_garch_cache` is keyed inside the engine on the effective
+    # use_figarch flag (post horizon-gate), so the FIGARCH↔GARCH choice stays
+    # correct. Case-insensitive 'close' lookup REQUIRED: the populated intraday
+    # frame keeps raw CSV casing ("Close": Timestamp,Open,High,Low,Close,Volume),
+    # while the daily-fallback frame above uses lowercase "close" — mirrors
+    # load_and_prep_data's {c.lower(): c} map so S0 matches byte-for-byte.
+    snapshot_garch_cache: Dict[bool, Any] = {}
+    _close_col = {c.lower(): c for c in intraday_for_engine.columns}.get("close")
+    try:
+        snapshot_s0 = (
+            float(intraday_for_engine[_close_col].iloc[-1])
+            if _close_col is not None else None
+        )
+    except Exception:
+        snapshot_s0 = None  # let calculate_probabilities derive it per group
 
     for expiry, group in contracts_df.groupby("expiry_date"):
         try:
@@ -265,6 +335,13 @@ def _process_one(item: Dict[str, Any]) -> Optional[str]:
             continue
 
         group_strikes = group["strike"].unique().tolist()
+
+        # FIX 3 (re-enabled): pick the per-DTE-bucket XGB model for this expiry.
+        xgb_model = None
+        if use_xgb:
+            bucket_h = dte_bucket_horizon(hours_to_expiry / 24.0)
+            if bucket_h is not None and xgb_daily_ret is not None:
+                xgb_model = _get_xgb_model(bucket_h)
 
         try:
             probs = calculate_probabilities(
@@ -286,10 +363,17 @@ def _process_one(item: Dict[str, Any]) -> Optional[str]:
                 regime_detector=detector,
                 regime_params=regime_params,
                 as_of=ts_dt,
-                # FIX 3 (H2): XGBoost directional blend hard-disabled (invalid
-                # per-strike blend of a strike-agnostic P(up)).
-                use_xgb_direction=False,
+                # FIX 3 (H2 re-enabled): XGBoost directional DRIFT shift (not the old
+                # invalid per-strike blend). Per-DTE-bucket model + leak-free macro.
+                use_xgb_direction=(use_xgb and xgb_model is not None),
+                xgb_model=xgb_model,
+                xgb_tilt_lambda=xgb_tilt_lambda,
+                macro_df=xgb_macro_slice,
                 disable_staleness_check=True,
+                # Per-snapshot dedup: fit GARCH/FIGARCH + derive S0 once, reuse
+                # across this snapshot's expiry groups (byte-identical output).
+                garch_cache=snapshot_garch_cache,
+                s0_override=snapshot_s0,
             )
 
             for _, row in group.iterrows():
@@ -349,6 +433,8 @@ class BackrunnerEngine:
         unfitted_dir: Optional[Path] = None,
         fitted_dir: Optional[Path] = None,
         progress_callback: Optional[Callable[[str, int, int], None]] = None,
+        use_xgb: bool = False,
+        xgb_tilt_lambda: Optional[float] = None,
     ):
         self.n_sims = n_sims
         self.seed = seed
@@ -356,6 +442,10 @@ class BackrunnerEngine:
         self.unfitted_dir = unfitted_dir or UNFITTED_DIR
         self.fitted_dir = fitted_dir or FITTED_DIR
         self._progress = progress_callback
+        # FIX 3 re-enabled: XGBoost directional drift. Default OFF → byte-identical
+        # to pre-XGB backtests. xgb_tilt_lambda=None → engine module default (0.0).
+        self.use_xgb = use_xgb
+        self.xgb_tilt_lambda = xgb_tilt_lambda
 
     # ------------------------------------------------------------------
     # BTC data loading
@@ -611,6 +701,8 @@ class BackrunnerEngine:
                 "seed": item_seed,
                 "n_sims": self.n_sims,
                 "advanced_features": self.advanced_features,
+                "use_xgb": self.use_xgb,
+                "xgb_tilt_lambda": self.xgb_tilt_lambda,
             })
 
         logger.info(
@@ -706,10 +798,19 @@ class BackrunnerEngine:
         logger.info("Processing %d timestamps (serial mode)...", len(work_items))
 
         # Populate worker globals from already-loaded data
-        global _worker_daily, _worker_intraday, _worker_hourly
+        global _worker_daily, _worker_intraday, _worker_hourly, _worker_macro
         _worker_daily = daily_df
         _worker_intraday = intraday_df
         _worker_hourly = hourly_df
+
+        # Macro (optional, XGB only) — serial path loads it directly since it is
+        # not among the passed-in DataFrames.
+        if self.use_xgb and _worker_macro is None:
+            macro_path = DATA_DIR / "macro_daily.csv"
+            if macro_path.exists():
+                m = pd.read_csv(macro_path, index_col=0)
+                m.index = pd.to_datetime(m.index, utc=True)
+                _worker_macro = m.sort_index()
 
         # Seed with the already-cached count so Progress: X/n_total reaches 100%.
         completed = n_total - len(work_items)
@@ -915,6 +1016,22 @@ def main() -> int:
         help="Disable all advanced features (plain GARCH+t+Kou baseline)",
     )
     parser.add_argument(
+        "--use-xgb",
+        action="store_true",
+        default=False,
+        dest="use_xgb",
+        help="Enable XGBoost directional drift shift (default: off). Needs "
+             "DATA/macro_daily.csv for the directional signal (plan §8.1).",
+    )
+    parser.add_argument(
+        "--xgb-lambda",
+        type=float,
+        default=None,
+        dest="xgb_tilt_lambda",
+        help="XGB tilt strength lambda (default: engine XGB_TILT_LAMBDA=0.0). "
+             "Set during calibration sweeps.",
+    )
+    parser.add_argument(
         "--workers",
         type=int,
         default=None,
@@ -947,6 +1064,8 @@ def main() -> int:
         n_sims=args.n_sims,
         seed=args.seed,
         advanced_features=args.advanced_features,
+        use_xgb=args.use_xgb,
+        xgb_tilt_lambda=args.xgb_tilt_lambda,
     )
 
     # Load data

@@ -1,5 +1,7 @@
 # CLAUDE.md
 
+STOP! BEFORE PROCEEDING READ THIS DOCUMENT COMPLETELY!
+
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Common Commands
@@ -36,6 +38,9 @@ streamlit run app/pages/polymarket_console.py
 # Signal diagnostics (Spearman + AUC between edge and outcomes)
 python core/backtesting/diagnostics.py path/to/all_priced.csv
 python core/strategy/signal_diagnostics.py path/to/all_priced.csv  # deprecation shim
+
+# Favorite-longshot-bias walkforward (model-free; gap+Wilson CI + buy-NO PnL per window)
+python scripts/backtesting/walkforward_flb.py --bankroll 1000 --stake 10
 
 # Edge distribution plots
 python diagnostics/edge_dist_plot.py
@@ -90,7 +95,8 @@ mkdocs serve
 │   ├── backtesting/
 │   │   ├── backtest_engine.py    #   Deprecation shim → core.backtesting.backtest_engine
 │   │   ├── backtest_montecarlo_sim.py # Shuffle tests (expiry-only & decile-conditioned)
-│   │   └── prob_backrunner_engine.py  # Deprecation shim → core.backtesting.backrunner
+│   │   ├── prob_backrunner_engine.py  # Deprecation shim → core.backtesting.backrunner
+│   │   └── walkforward_flb.py     #   Standalone favorite-longshot-bias walkforward (gap+Wilson CI, buy-NO PnL)
 │   ├── pipelines/
 │   │   ├── run_full_pipeline.py  #   Full pipeline: fetch → price → fit
 │   │   └── batch_pricing_runner.py   # Live Polymarket batch pricing
@@ -139,7 +145,7 @@ FIGARCH(1,d,1)/GARCH(1,1) + Skewed-t/Student-t + SVCJ (Kou Double Exponential wi
 - **Jump drift correction**: Expected jump drift subtracted from mean (legacy log-mean compensator by default)
 - **SVCJ persistence (FIX 5/H3)**: Under FIGARCH the vol jump is carried by a decaying `vol_jump_state` (the ARCH(∞) base has no β to persist it); under GARCH β persists it inline. State capped by `VOL_JUMP_STATE_CAP`, decay `SVCJ_PERSIST∈(0,1)`.
 - **Regime switching (FIX 4/H1)**: Wired and leak-free — pass `regime_detector` + `as_of`; the HMM refit gate uses `as_of` (snapshot time), never wall-clock, so time-travel backtests are deterministic and leak-free.
-- **XGBoost directional blend (FIX 3/H2)**: REMOVED from the hot path. `calculate_probabilities(use_xgb_direction=True, xgb_model=...)` raises `NotImplementedError` (the old per-strike blend of a strike-agnostic P(up) corrupted the ladder).
+- **XGBoost directional drift shift (FIX 3/H2, RE-ENABLED)**: The old per-strike additive blend (`0.7·p_mc + 0.3·p_xgb`) corrupted the ladder (added a strike-agnostic P(up) onto strike-specific probs → broke monotonicity) and was removed. It is now re-enabled as a **distribution-level drift shift**: `apply_xgb_drift_shift()` converts the XGBoost P(up) into a single, strike-agnostic constant shift of the simulated terminal paths (`paths *= exp(Δ_H)`), applied **once before** the per-strike loop, so the ladder stays monotone by construction. `Δ_H` is solved by **empirical-CDF inversion** (`Δ_H = −quantile(log_ret, 1−p_target)`, exact on the non-Gaussian distribution), where `p_target = 0.5 + λ·(p_up−0.5)`. Controls: `XGB_TILT_LAMBDA` (λ, default **0.0** = inert; production value set by calibration), `XGB_MAX_SHIFT_FRAC` cap, `XGB_P_BASE_GUARD` (skip deep-skew snapshots), `XGB_DTE_BUCKETS` (per-DTE-bucket models {≤7,7–14,14–30}d, train horizon = bucket midpoint). **Skipped under `martingale_anchor=True`** (the tilt is a physical-measure view) and **gated to DTE ≤30d**. Off by default everywhere: engine `use_xgb_direction=False`; backrunner/live behind `--use-xgb` (+ `--xgb-lambda`). Needs `DATA/macro_daily.csv` for real directional signal (BTC-only features degrade toward neutral). Per-snapshot, leak-free in backtest (`backrunner` trains per (UTC-date, bucket) on the strict-`<` truncated daily returns + `< snapshot_time` macro slice). IS/OOS: walk-forward, NOT frozen (only M2 is frozen).
 - **Jumps (FIX 2/M1)**: Data-calibrated everywhere (live + backtest) via Lee-Mykland bipower detection (`jump_calibration.calibrate_jumps`, default `detection_method="bipower"`); in backtest, calibrated per-snapshot on the leak-free truncated slice (`returns=`, never `hourly_csv=`).
 
 ### Column Name Precedence Conventions
@@ -168,7 +174,7 @@ Consolidates previously scattered backtesting logic into a single module. The or
 - `ContractPriceStore` — Disk-backed CSV store for historical Polymarket contract prices (7-column schema: `slug, clobTokenId, date, price, resolution, strike, expiry_date`). Deduplication on `(clobTokenId, date)` composite key.
 - `polymarket_fetcher.py` — Fetches closed `bitcoin-above` markets from Gamma API (`/markets?closed=true`) and daily price candles from CLOB API (`/prices-history`). Handles stale-data refresh (re-fetches unresolved contracts with >1 day gap) and rate limiting (200ms delay, exponential backoff on 429).
 - `batch_loader.py` — Canonical batch CSV normalization (`model_probability → p_model_fit`, timestamp parsing). Extracted from duplicated dashboard copies.
-- `BackrunnerEngine` — Time-travel MC pricing loop. At each historical timestamp, truncates BTC data, runs `calculate_probabilities()` for active contracts, writes batch CSVs to `unfitted_dir`. Disk-native streaming (no in-memory accumulation). Idempotent (skips existing files). Per snapshot it computes **leak-free calibrated jump params** (bipower, from the truncated slice via `returns=`) and constructs a **leak-free regime detector** (`as_of=ts` threads into the HMM refit gate); both shared across the snapshot's expiry groups. XGBoost is off (FIX 3).
+- `BackrunnerEngine` — Time-travel MC pricing loop. At each historical timestamp, truncates BTC data, runs `calculate_probabilities()` for active contracts, writes batch CSVs to `unfitted_dir`. Disk-native streaming (no in-memory accumulation). Idempotent (skips existing files). Per snapshot it computes **leak-free calibrated jump params** (bipower, from the truncated slice via `returns=`) and constructs a **leak-free regime detector** (`as_of=ts` threads into the HMM refit gate); both shared across the snapshot's expiry groups. The **GARCH/FIGARCH fit and S0 are also shared across expiry groups**: `_process_one` passes a per-snapshot `garch_cache` (dict keyed on the effective post-horizon-gate `use_figarch` flag) and a precomputed `s0_override` into every `calculate_probabilities` call, so the FIGARCH MLE and data load run once per snapshot instead of once per expiry group (byte-identical output — same slice ⇒ same fit). XGBoost is off (FIX 3).
 - `BacktestEngine` — Chronological backtest: sorts batches → settles expired positions → executes trades via `recommend_trades()`. Tracks all priced contracts for shuffle tests. Moved from `scripts/backtesting/`.
 - `SignalDiagnostics` — Spearman/AUC between edge and outcome, with DTE and moneyness breakdowns. Returns structured dict for dashboard consumption. Absorbed from `core/strategy/signal_diagnostics.py`. Also exposes `tail_mispricing_report()` (under report key `"tail_mispricing"`): a favorite–longshot test that, within the OTM price band (default 0.05–0.20), reports AUC of `model_p` and of the `model_p − market_p` edge vs realized outcome, for two OTM filters (`moneyness > 0` and `> +2%`), stratified into 0.05–0.10 / 0.10–0.15 / 0.15–0.20 sub-bands. Rendered on the dashboard Backtest tab.
 - `BacktestingOrchestrator` — Single entry point chaining all stages. `run_full()` returns dict: `{new_records, unfitted_dir, fitted_dir, trades_df, equity_df, all_priced_df, diagnostics, calibration}`. The `calibration` entry (FIX 7/M2) is the per-DTE-bucket logit-shift table fit walk-forward from backtest outcomes and persisted to `DATA/calibration_shift.csv`; it does NOT change edges unless `USE_CALIBRATED_PROB` is flipped on.
@@ -348,3 +354,5 @@ All temporary artifacts — test scripts, summaries, test results, plans, review
 4. Flag uncertainty explicitly. If you're unsure about something, see point 1 above. If it makes sense to do so, conduct a small, localised and low-risk experiment and bring the hypothesis and results to me to discuss. Confidence without certainty causes more damage than admitting a gap.
 
 5. I'm always open to ideas on better ways to do things. Please don't hesitate to suggest a better way, or one that has long lasting impact over a tactical change. (as a few examples)
+
+Do not use non ASCII characters

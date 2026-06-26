@@ -536,14 +536,14 @@ def _render_signed_edge_panel(all_priced_df: pd.DataFrame) -> None:
                  help=f"{counts['n_dedup_removed']} snapshot-duplicate rows collapsed via dedup")
 
     N_MIN = 200
-    if len(filtered_df) < N_MIN:
+    low_sample = len(filtered_df) < N_MIN
+    if low_sample:
         st.warning(
             f"N = {len(filtered_df)} — below {N_MIN} minimum for reliable calibration inference. "
-            "Plots and table shown as exploratory view; summary metrics suppressed."
+            "Metrics, plots, and table are shown as a LOW-CONFIDENCE exploratory view: "
+            "Wilson intervals are wide and Brier/BSS/ECE/calibration are unstable at this N. "
+            "Interpret accordingly."
         )
-        suppress_metrics = True
-    else:
-        suppress_metrics = False
 
     if filtered_df.empty:
         st.info("No contracts match current filters.")
@@ -551,28 +551,28 @@ def _render_signed_edge_panel(all_priced_df: pd.DataFrame) -> None:
 
     bins_df = _compute_edge_bins(filtered_df)
 
-    if not suppress_metrics:
-        m = _panel_metrics(filtered_df)
-        st.subheader("📊 Panel Metrics")
-        mc1, mc2, mc3, mc4, mc5 = st.columns(5)
-        mc1.metric("Brier (model)",  f"{m.get('brier_model', np.nan):.4f}")
-        mc2.metric("Brier (market)", f"{m.get('brier_market', np.nan):.4f}")
-        mc3.metric("BSS vs. market", f"{m.get('bss', np.nan):.4f}",
-                   help="Positive = model beats market. Decision-critical number.")
-        mc4.metric("ECE",            f"{m.get('ece', np.nan):.4f}")
-        mc5.metric("n / n_yes / n_no",
-                   f"{m.get('n',0)} / {m.get('n_yes',0)} / {m.get('n_no',0)}")
+    # Metrics always shown (even below N_MIN — the warning above flags low confidence).
+    m = _panel_metrics(filtered_df)
+    st.subheader("📊 Panel Metrics" + ("  ⚠️ low-confidence (N < %d)" % N_MIN if low_sample else ""))
+    mc1, mc2, mc3, mc4, mc5 = st.columns(5)
+    mc1.metric("Brier (model)",  f"{m.get('brier_model', np.nan):.4f}")
+    mc2.metric("Brier (market)", f"{m.get('brier_market', np.nan):.4f}")
+    mc3.metric("BSS vs. market", f"{m.get('bss', np.nan):.4f}",
+               help="Positive = model beats market. Decision-critical number.")
+    mc4.metric("ECE",            f"{m.get('ece', np.nan):.4f}")
+    mc5.metric("n / n_yes / n_no",
+               f"{m.get('n',0)} / {m.get('n_yes',0)} / {m.get('n_no',0)}")
 
-        slope    = m.get("cal_slope", np.nan)
-        slope_se = m.get("cal_slope_se", np.nan)
-        intcpt   = m.get("cal_intercept", np.nan)
-        intcpt_se = m.get("cal_intercept_se", np.nan)
-        st.caption(
-            f"Calibration logistic regression on logit(model_p): "
-            f"slope = {slope:.3f} ± {slope_se:.3f}, "
-            f"intercept = {intcpt:.3f} ± {intcpt_se:.3f}. "
-            "Calibrated target: slope=1, intercept=0."
-        )
+    slope    = m.get("cal_slope", np.nan)
+    slope_se = m.get("cal_slope_se", np.nan)
+    intcpt   = m.get("cal_intercept", np.nan)
+    intcpt_se = m.get("cal_intercept_se", np.nan)
+    st.caption(
+        f"Calibration logistic regression on logit(model_p): "
+        f"slope = {slope:.3f} ± {slope_se:.3f}, "
+        f"intercept = {intcpt:.3f} ± {intcpt_se:.3f}. "
+        "Calibrated target: slope=1, intercept=0."
+    )
 
     pcol1, pcol2 = st.columns(2)
     valid_bins = bins_df[bins_df["n"] > 0]
@@ -829,6 +829,23 @@ if BACKTEST_MODE == "🌐 Live Fetch from Polymarket":
         help=f"Parallel processes for MC backrun (1 = serial). This {_cpu}-core "
              f"machine defaults to {default_worker_count()}.",
     )
+    # FIX 3 re-enabled: XGBoost directional drift shift (backrun-time, Mode A only).
+    use_xgb = st.sidebar.checkbox(
+        "Use XGBoost directional drift",
+        value=False,
+        help="Per-snapshot, leak-free directional tilt of the MC distribution. "
+             "Needs DATA/macro_daily.csv for real signal (BTC-only ≈ neutral).",
+    )
+    xgb_lambda = None
+    if use_xgb:
+        xgb_lambda = st.sidebar.slider(
+            "XGB tilt λ", 0.0, 0.5, 0.15, 0.05,
+            help="Tilt strength toward the XGBoost P(up). 0 = no effect. "
+                 "Calibrate via the §8 grid before trusting.",
+        )
+        if not (PROJECT_ROOT / "DATA" / "macro_daily.csv").exists():
+            st.sidebar.caption("⚠️ DATA/macro_daily.csv missing — running BTC-only "
+                               "(weak signal). Run core/data/macro_fetcher.py.")
 
 if BACKTEST_MODE == "🌐 Live Fetch from Polymarket":
     # Live Fetch main panel
@@ -904,6 +921,8 @@ if BACKTEST_MODE == "🌐 Live Fetch from Polymarket":
             orch = BacktestingOrchestrator(
                 n_sims=n_sims,
                 initial_bankroll=initial_bankroll,
+                use_xgb=use_xgb,
+                xgb_tilt_lambda=xgb_lambda,
                 strategy_params={
                     "kelly_fraction": kelly_fraction,
                     "min_edge": min_edge,
@@ -1240,19 +1259,24 @@ if "bt_trades" in st.session_state and "bt_equity" in st.session_state:
         # Effect size (ρ / AUC) is the meaningful discriminator.
         if isoos_suppress:
             st.info(
-                "Small-sample window — overall ρ / AUC / mean-edge summary suppressed. "
-                "Breakdowns and tables below still shown."
+                "Small-sample window — overall ρ / AUC / mean-edge shown as a "
+                "LOW-CONFIDENCE exploratory view (below the N=200 reliability "
+                "threshold). Interpret with caution; breakdowns and tables below "
+                "still shown."
             )
-        else:
-            col1, col2, col3 = st.columns(3)
-            col1.metric("Spearman ρ", f"{diag.get('spearman_rho', 0):.4f}")
-            col2.metric("AUC", f"{diag.get('auc', 0.5):.4f}")
-            col3.metric("Observations", f"{diag.get('n_observations', 0)}")
+        # Metrics always shown (even small-sample — the banner above flags low confidence).
+        # AUC can be None when only one outcome class is present; format defensively.
+        _auc = diag.get("auc")
+        _auc_str = f"{_auc:.4f}" if _auc is not None else "n/a"
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Spearman ρ", f"{diag.get('spearman_rho', 0):.4f}")
+        col2.metric("AUC", _auc_str)
+        col3.metric("Observations", f"{diag.get('n_observations', 0)}")
 
-            col1, col2, col3 = st.columns(3)
-            col1.metric("Mean Edge (Winners)", f"{diag.get('mean_edge_winners', 0):.4f}")
-            col2.metric("Mean Edge (Losers)", f"{diag.get('mean_edge_losers', 0):.4f}")
-            col3.metric("Edge Difference", f"{diag.get('edge_difference', 0):.4f}")
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Mean Edge (Winners)", f"{diag.get('mean_edge_winners', 0):.4f}")
+        col2.metric("Mean Edge (Losers)", f"{diag.get('mean_edge_losers', 0):.4f}")
+        col3.metric("Edge Difference", f"{diag.get('edge_difference', 0):.4f}")
 
         # Column renames so headers are self-explanatory rather than raw dict keys.
         # "pos"/"neg" are counts of contracts that resolved YES/NO within each bin;

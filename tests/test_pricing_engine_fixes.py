@@ -123,28 +123,33 @@ def test_fix2_calibrate_jumps_is_leak_free_with_returns_arg(tmp_path, monkeypatc
 
 
 # ===========================================================================
-# FIX 3 (H2) — XGBoost directional blend hard-disabled
+# FIX 3 (H2) — XGBoost directional drift shift (RE-ENABLED).
+# The old per-strike additive blend was removed; the engine now applies a single
+# distribution drift shift. A malformed model must degrade gracefully (no raise),
+# and the dedicated suite tests/test_xgb_drift_shift.py covers the math.
 # ===========================================================================
 
 @needs_data
-def test_fix3_xgb_direction_raises_when_model_passed():
+def test_fix3_xgb_malformed_model_degrades_gracefully():
     from core.pricing.btc_pricing_engine import calculate_probabilities
 
-    class DummyModel:
+    class DummyModel:  # lacks predict_direction_adjustment
         pass
 
-    with pytest.raises(NotImplementedError):
-        calculate_probabilities(
-            strikes=[100000.0],
-            hours_to_expiry=48.0,
-            hourly_df=_hourly_df(before="2026-05-01"),
-            intraday_df=_intraday_df(before="2026-05-01"),
-            n_sims=500,
-            seed=1,
-            use_xgb_direction=True,
-            xgb_model=DummyModel(),
-            disable_staleness_check=True,
-        )
+    # Must NOT raise — the engine catches the failure and uses unshifted paths.
+    res = calculate_probabilities(
+        strikes=[100000.0],
+        hours_to_expiry=48.0,
+        hourly_df=_hourly_df(before="2026-05-01"),
+        intraday_df=_intraday_df(before="2026-05-01"),
+        n_sims=500,
+        seed=1,
+        use_xgb_direction=True,
+        xgb_model=DummyModel(),
+        disable_staleness_check=True,
+    )
+    assert 0.0 <= res[100000.0] <= 1.0
+    assert res["_meta"]["xgb_applied"] is False
 
 
 @needs_data

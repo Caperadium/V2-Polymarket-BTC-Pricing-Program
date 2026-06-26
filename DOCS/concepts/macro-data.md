@@ -8,7 +8,7 @@ Based on: Köse et al. (2025) — Gold-BTC correlation via TFT, Kim et al. (2025
 
 ## Why It Matters
 
-Post-2019, BTC price behavior has become increasingly correlated with traditional macro assets. The 2020 institutional adoption wave and 2024 ETF approvals strengthened these linkages. Macro features improve both regime detection accuracy and directional prediction:
+Post-2019, BTC price behavior has become increasingly correlated with traditional macro assets. The 2020 institutional adoption wave and 2024 ETF approvals strengthened these linkages. The research rationale below motivates macro as a regime / directional input — but see the **Status** note under [Data Flow](#data-flow): on this project's 1–7 DTE data macro has not yet earned a live role (regime detection is BTC-only; the XGBoost tilt is off).
 
 - **Gold**: Köse et al. (2025) TFT model assigns Gold attention weight 0.85 — the strongest macro signal for BTC direction
 - **DXY**: Dollar strength inversely correlated with BTC in risk-on/risk-off regimes
@@ -87,18 +87,33 @@ Yahoo Finance API
       ▼
 macro_fetcher.py ──▶ DATA/macro_daily.csv
       │
-      ├──▶ regime_detector.py (HMM features)
-      │
-      └──▶ directional_xgb.py (XGBoost features)
+      └──▶ directional_xgb.py (XGBoost features only)
               │
               ▼
-         btc_pricing_engine.py (Phase 2.3 blend)
+         btc_pricing_engine.py (drift-shift, λ-gated)
 ```
+
+> **Status (verified 2026-06).** Macro feeds **only** the directional XGBoost. The HMM
+> `regime_detector.py` is **univariate BTC daily returns** (`fit()` reshapes to one
+> column) and does **not** consume macro — an earlier version of this diagram wrongly
+> showed a `regime_detector` arm. And because the XGBoost tilt is off for the traded
+> **1–7 DTE** band (`XGB_TILT_LAMBDA=0`, no OOS skill — see
+> [Directional XGBoost › Empirical Validation](directional-xgb.md#empirical-validation-this-projects-data)),
+> macro is currently **fetched but unused in production pricing**. Keep it for
+> re-validation / future regime-feature work, not as a live input.
 
 ## File Format
 
-`DATA/macro_daily.csv` — CSV with date index, columns: `gold`, `gold_ret`, `dxy`, `dxy_ret`, `vix`, `spx_ret`.
+`DATA/macro_daily.csv` — CSV with date index, columns: `gold`, `dxy`, `vix`, `spx`, `gold_ret`, `dxy_ret`, `vix_ret`, `spx_ret`, `vix_regime`, `dxy_trend`.
 
 Dates in UTC, resampled to daily frequency.
+
+> **The BTC-macro correlation columns (`btc_gold_corr_30d`, `btc_dxy_corr_30d`) are
+> NOT in this file.** `fetch_macro_data()` (which writes the CSV) cannot — it has no
+> BTC data; only `merge_with_btc()` computes them, and the XGBoost pipeline does not
+> call it. Instead `directional_xgb.build_features` computes those correlations
+> on-the-fly from the date-joined BTC returns + `gold_ret`/`dxy_ret` (leak-safe,
+> past-only rolling window). Must be **fetched before any backtest** — like BTC data,
+> the fetch is manual (`python core/data/macro_fetcher.py`), not auto-triggered.
 
 See [Macro Fetcher API Reference](../api-reference/core/macro-fetcher.md) for function signatures and parameters.

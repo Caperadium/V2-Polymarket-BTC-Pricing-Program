@@ -10,8 +10,12 @@ the M2 logit-shift ``B`` (``fit_probability_curves.fit_calibration``). Every
 BTC-return-process component (GARCH/FIGARCH, jump calibration, regime HMM) and the
 per-expiry logistic fit are already fit per-snapshot on strictly ``< snapshot_time``
 truncated slices by the backrunner — they are walk-forward leak-free and are NOT
-frozen at the cutoff. XGBoost is excluded (dead in the hot path; when re-enabled it
-lives per-snapshot in the backrunner, covered by the verifier's BTC arm).
+frozen at the cutoff. XGBoost (FIX 3, re-enabled as a per-snapshot directional
+drift shift, C2-a) is in the SAME walk-forward category: the backrunner trains it
+per snapshot on the strict-``<`` truncated daily returns + a ``< snapshot_time``
+macro slice, so it is also NOT frozen at the cutoff and is NOT a pooled component.
+Its leak surface (BTC returns + macro truncation) is covered by the verifier's BTC
+arm, which also re-applies the macro truncation rule.
 
 Leak model (§9): the M2 "label" is a contract's *outcome*, timestamped at its
 *settlement* (12:00 ET on expiry), NOT its pricing time. So:
@@ -664,7 +668,12 @@ def verify_oos_leak_free(
 
 
 def _load_btc_max_index(data_dir: Optional[Path]) -> Dict[str, pd.DatetimeIndex]:
-    """Load UTC datetime indexes for BTC CSVs (verification BTC arm only)."""
+    """Load UTC datetime indexes for BTC + macro CSVs (verification BTC arm only).
+
+    Includes ``macro_daily.csv`` (XGB directional source, FIX 3): the backrunner
+    truncates it with the same strict ``<`` rule as BTC, so the arm asserts the
+    truncated macro slice holds no row ``>= snapshot_time``.
+    """
     data_dir = Path(data_dir) if data_dir else (_PROJECT_ROOT / "DATA")
     out: Dict[str, pd.DatetimeIndex] = {}
     for name, fname in (("hourly", "btc_hourly.csv"),
@@ -679,4 +688,12 @@ def _load_btc_max_index(data_dir: Optional[Path]) -> Dict[str, pd.DatetimeIndex]
         if tcol is None:
             continue
         out[name] = pd.DatetimeIndex(pd.to_datetime(d[tcol], utc=True, errors="coerce")).dropna()
+
+    # macro is date-INDEXED (index_col=0), not a column — load separately.
+    mp = data_dir / "macro_daily.csv"
+    if mp.exists():
+        m = pd.read_csv(mp, index_col=0)
+        out["macro"] = pd.DatetimeIndex(
+            pd.to_datetime(m.index, utc=True, errors="coerce")
+        ).dropna()
     return out

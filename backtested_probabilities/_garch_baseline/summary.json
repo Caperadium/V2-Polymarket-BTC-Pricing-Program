@@ -1,0 +1,27 @@
+{
+  "model": "GARCH-baseline (FIGARCH inactive), layered settlement",
+  "n_sims": 15000,
+  "n_fitted_batches": 288,
+  "trades": 348,
+  "settled": 348,
+  "trade_settlement_source": {
+    "nan": 185,
+    "hourly": 128,
+    "intraday": 35
+  },
+  "total_pnl": 479.25,
+  "win_rate_pct": 34.8,
+  "final_bankroll": 1479.25,
+  "all_priced": 18159,
+  "outcomes_resolved": 18159,
+  "all_priced_settlement_source": {
+    "hourly": 13469,
+    "intraday": 4690
+  },
+  "diag_n_obs": 18159,
+  "spearman_rho": -0.24213641745027495,
+  "spearman_p": 1.4830459932849803e-240,
+  "auc": 0.35932686573008626,
+  "mean_edge_winners": -0.002837387566307406,
+  "mean_edge_losers": 0.015243624967260018
+}

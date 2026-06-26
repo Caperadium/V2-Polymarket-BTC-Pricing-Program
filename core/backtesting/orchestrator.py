@@ -55,10 +55,15 @@ class BacktestingOrchestrator:
         unfitted_dir: Optional[Path] = None,
         fitted_dir: Optional[Path] = None,
         progress_callback: Optional[Callable[[str, int, int], None]] = None,
+        use_xgb: bool = False,
+        xgb_tilt_lambda: Optional[float] = None,
     ):
         self.n_sims = n_sims
         self.seed = seed
         self.advanced_features = advanced_features
+        # FIX 3 re-enabled: XGBoost directional drift, off by default.
+        self.use_xgb = use_xgb
+        self.xgb_tilt_lambda = xgb_tilt_lambda
         self.strategy_params = strategy_params or {}
         self.initial_bankroll = initial_bankroll
         self.btc_price_path = btc_price_path
@@ -152,6 +157,8 @@ class BacktestingOrchestrator:
                 unfitted_dir=self.unfitted_dir,
                 fitted_dir=self.fitted_dir,
                 progress_callback=self._progress,
+                use_xgb=self.use_xgb,
+                xgb_tilt_lambda=self.xgb_tilt_lambda,
             )
 
         # Load BTC data
@@ -278,6 +285,8 @@ class BacktestingOrchestrator:
                 unfitted_dir=self.unfitted_dir,
                 fitted_dir=self.fitted_dir,
                 progress_callback=self._progress,
+                use_xgb=self.use_xgb,
+                xgb_tilt_lambda=self.xgb_tilt_lambda,
             )
         return self._backrunner.run_curve_fitting()
 

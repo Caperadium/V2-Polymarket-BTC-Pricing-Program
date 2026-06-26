@@ -107,6 +107,31 @@ HOURS_PER_YEAR = 365 * 24  # Hours in a year, for annual→hourly scaling
 DRIFT_CLAMP_MULT = 0.25    # Max drift = ±0.25 * sigma_hourly
 
 # ==============================================================================
+# XGBOOST DIRECTIONAL DRIFT-SHIFT (FIX 3 / H2 re-enable — drift-shift design)
+# The XGBoost P(up) is converted into a SINGLE strike-agnostic shift of the
+# simulated terminal distribution (NOT a per-strike additive blend, which broke
+# ladder monotonicity — the reason the old design was disabled). Applied once
+# per expiry group, every strike re-derived from the shifted paths, so the
+# ladder stays monotone by construction. See temp/xgb_activation_plan.md §2.
+# ==============================================================================
+XGB_TILT_LAMBDA = 0.0       # Tilt strength toward p_up. DEFAULT 0.0 = inert even
+                            # if the flag is flipped outside the --use-xgb plumbing.
+                            # Production value set by calibration (plan §8 grid).
+XGB_P_FLOOR = 0.15          # Clip raw p_up below before mapping
+XGB_P_CEIL = 0.85           # Clip raw p_up above before mapping
+XGB_P_TARGET_FLOOR = 0.02   # Clip target P(up) below
+XGB_P_TARGET_CEIL = 0.98    # Clip target P(up) above
+XGB_MAX_SHIFT_FRAC = 0.5    # Cap |Δ_H| at this fraction of empirical sigma_H
+XGB_SIGMA_H_FLOOR = 1e-6    # sigma_H below this → skip shift (numeric guard)
+XGB_P_BASE_GUARD = 0.02     # base P(up) within this of 0 or 1 → skip shift
+                            # (deep-skew snapshot; shift would be noise, not signal)
+# DTE buckets for per-horizon XGB models (C2-a). Right-open intervals in DAYS;
+# a contract at exactly an edge falls into the higher bucket. >30d is gated off.
+# Train horizon = bucket midpoint (4 / 11 / 22d) so the forward-shifted training
+# target matches the contracts each model serves.
+XGB_DTE_BUCKETS = [(0.0, 7.0), (7.0, 14.0), (14.0, 30.0)]
+
+# ==============================================================================
 # HORIZON GATING (Phase 1.5)
 # ==============================================================================
 HORIZON_SHORT_DAYS = 7        # <7d: full model
@@ -911,6 +936,111 @@ def get_contract_probability(paths: np.ndarray, strike_price: float):
     return np.mean(paths >= strike_price)
 
 
+def dte_bucket_horizon(days_to_expiry: float) -> Optional[float]:
+    """
+    Map days-to-expiry to the XGB DTE-bucket training/forecast horizon (C2-a).
+
+    Returns the bucket midpoint in days (4 / 11 / 22 for the default buckets), or
+    None if the horizon falls outside all buckets (>30d → XGB gated off).
+
+    Buckets are right-open in the lower edge / left-closed in the upper, matching
+    XGB_DTE_BUCKETS; a contract exactly on an interior edge lands in the higher
+    bucket (e.g. 7.0d → 7–14 bucket).
+    """
+    for lo, hi in XGB_DTE_BUCKETS:
+        # left-closed on lo for the first bucket (0), interior edges go to the
+        # higher bucket so use (lo <= d < hi) but skip when d == lo and lo is an
+        # interior edge already covered by the previous bucket's hi — the loop
+        # order (ascending) naturally assigns d==edge to the bucket whose lo==edge.
+        if lo <= days_to_expiry < hi:
+            return (lo + hi) / 2.0
+    return None
+
+
+def apply_xgb_drift_shift(
+    paths: np.ndarray,
+    S0: float,
+    p_up: float,
+    lam: float,
+    *,
+    p_floor: float = XGB_P_FLOOR,
+    p_ceil: float = XGB_P_CEIL,
+    target_floor: float = XGB_P_TARGET_FLOOR,
+    target_ceil: float = XGB_P_TARGET_CEIL,
+    max_shift_frac: float = XGB_MAX_SHIFT_FRAC,
+    sigma_h_floor: float = XGB_SIGMA_H_FLOOR,
+    p_base_guard: float = XGB_P_BASE_GUARD,
+):
+    """
+    Shift the simulated terminal distribution toward an XGBoost directional view.
+
+    Strike-agnostic, monotonicity-preserving (FIX 3 Step B drift-shift). A single
+    constant multiplicative shift `paths * exp(Δ_H)` moves the whole terminal
+    distribution; every strike read off the shifted paths stays monotone in the
+    strike by construction. See temp/xgb_activation_plan.md §2.
+
+    Δ_H is solved by EMPIRICAL-CDF inversion (exact on the actual non-Gaussian
+    distribution): find the constant `c` such that mean(log_ret + c >= 0) == p_target,
+    i.e. c = -quantile(log_ret, 1 - p_target). This hits p_target exactly, unlike a
+    Gaussian-probit approximation.
+
+    Args:
+        paths: Terminal price array S_T (shape [n_sims]).
+        S0: Spot price (defines "up" as S_T >= S0).
+        p_up: XGBoost P(up) over the horizon (0-1). 0.5 = neutral.
+        lam: Tilt strength λ_xgb in [0,1]. 0 = no shift.
+        p_floor/p_ceil: clip raw p_up before mapping.
+        target_floor/target_ceil: clip the target P(up).
+        max_shift_frac: cap |Δ_H| at this fraction of empirical sigma_H.
+        sigma_h_floor: sigma_H at/below this → identity (numeric guard).
+        p_base_guard: base P(up) within this of 0/1 → identity (deep-skew guard).
+
+    Returns:
+        (paths_shifted, delta_H, meta) where meta = {p_base, p_target, sigma_H,
+        delta_H, applied}. Identity (delta_H=0, applied=False) on any short-circuit.
+    """
+    meta = {"p_base": np.nan, "p_target": np.nan, "sigma_H": np.nan,
+            "delta_H": 0.0, "applied": False}
+
+    # Short-circuit: neutral signal or knob off.
+    if lam == 0.0 or p_up == 0.5 or paths is None or len(paths) == 0 or S0 <= 0:
+        return paths, 0.0, meta
+
+    log_ret = np.log(paths / S0)
+    sigma_H = float(np.std(log_ret))
+    p_base = float(np.mean(paths >= S0))
+    meta["sigma_H"] = sigma_H
+    meta["p_base"] = p_base
+
+    # Numeric / deep-skew guards.
+    if sigma_H <= sigma_h_floor:
+        return paths, 0.0, meta
+    if p_base <= p_base_guard or p_base >= (1.0 - p_base_guard):
+        return paths, 0.0, meta
+
+    # Target probability: linear tilt toward the (clipped) XGB view.
+    p_up_clipped = float(np.clip(p_up, p_floor, p_ceil))
+    p_target = 0.5 + lam * (p_up_clipped - 0.5)
+    p_target = float(np.clip(p_target, target_floor, target_ceil))
+    meta["p_target"] = p_target
+
+    # Empirical-CDF inversion: c such that mean(log_ret + c >= 0) == p_target.
+    # mean(log_ret >= -c) == p_target  ⇒  -c = quantile(log_ret, 1 - p_target).
+    delta_H = float(-np.quantile(log_ret, 1.0 - p_target))
+
+    # Safety cap relative to empirical horizon vol.
+    cap = max_shift_frac * sigma_H
+    delta_H = float(np.clip(delta_H, -cap, cap))
+
+    if delta_H == 0.0:
+        return paths, 0.0, meta
+
+    paths_shifted = paths * np.exp(delta_H)
+    meta["delta_H"] = delta_H
+    meta["applied"] = True
+    return paths_shifted, delta_H, meta
+
+
 # ==============================================================================
 # HIGH-LEVEL WRAPPER — Phase 1-2 Orchestration
 # ==============================================================================
@@ -941,12 +1071,22 @@ def calculate_probabilities(
     # --- External dependencies ---
     regime_detector=None,  # RegimeDetector instance
     xgb_model=None,        # DirectionalXGB instance
+    xgb_tilt_lambda: float = None,  # tilt strength; None → module XGB_TILT_LAMBDA
     # --- Backtesting ---
     disable_staleness_check: bool = False,
     # FIX 4 (H1): snapshot wall-clock for leak-free, deterministic regime refit
     # gating during time-travel backtests. Keyword-only with a default, so existing
     # callers are unaffected. None → live mode (regime detector uses real wall time).
     as_of: Optional[datetime] = None,
+    # Per-snapshot dedup (backtest): a backrunner snapshot prices several expiry
+    # groups off an identical hourly slice, so the GARCH/FIGARCH MLE and S0 are
+    # identical across groups. `garch_cache` is a caller-owned dict keyed on the
+    # effective (post-horizon-gate) use_figarch flag; `s0_override` is the
+    # precomputed S0. Both default None → behavior unchanged (load + fit every
+    # call). When supplied, the fit (and load, on a cache hit) runs once per
+    # snapshot instead of once per expiry group.
+    garch_cache: Optional[dict] = None,
+    s0_override: Optional[float] = None,
 ):
     """
     Calculates probabilities for multiple strikes using hourly simulation.
@@ -1012,20 +1152,37 @@ def calculate_probabilities(
         logger.debug(f"Short horizon T={days_to_expiry:.1f}d: using full model configuration")
 
     # ---- Load Data & Fit Model ----
-    hourly_returns, S0 = load_and_prep_data(
-        hourly_csv=hourly_csv,
-        intraday_csv=intraday_csv,
-        hourly_df=hourly_df,
-        intraday_df=intraday_df,
-        training_start_date=training_start_date,
-        disable_staleness_check=disable_staleness_check,
-    )
+    # Per-snapshot dedup: this block runs AFTER the horizon gate above has
+    # finalized `use_figarch`, so a cache keyed on that flag mirrors the
+    # FIGARCH↔GARCH choice exactly (incl. the deterministic FIGARCH→GARCH
+    # convergence fallback — same slice ⇒ same returned dict). `hourly_returns`
+    # only feeds the fit, so the load is skipped entirely on a cache hit with S0
+    # supplied. Defaults (None) reproduce the original load-then-fit behavior.
+    need_fit = not (garch_cache is not None and use_figarch in garch_cache)
 
-    garch_params = fit_garch_model(
-        hourly_returns,
-        training_start_date=training_start_date,
-        use_figarch=use_figarch,
-    )
+    if need_fit or s0_override is None:
+        hourly_returns, S0_loaded = load_and_prep_data(
+            hourly_csv=hourly_csv,
+            intraday_csv=intraday_csv,
+            hourly_df=hourly_df,
+            intraday_df=intraday_df,
+            training_start_date=training_start_date,
+            disable_staleness_check=disable_staleness_check,
+        )
+        S0 = s0_override if s0_override is not None else S0_loaded
+    else:
+        S0 = s0_override
+
+    if need_fit:
+        garch_params = fit_garch_model(
+            hourly_returns,
+            training_start_date=training_start_date,
+            use_figarch=use_figarch,
+        )
+        if garch_cache is not None:
+            garch_cache[use_figarch] = garch_params
+    else:
+        garch_params = garch_cache[use_figarch]
 
     # ---- Regime Detection (Phase 1.2) ----
     regime_weights = {"bear": 0.0, "sideways": 1.0, "bull": 0.0}
@@ -1136,6 +1293,50 @@ def calculate_probabilities(
         )
         weights_array = None
 
+    # ---- Phase 2.3: Directional XGBoost drift shift (FIX 3 / H2 re-enabled) ----
+    # The XGBoost P(up) is applied ONCE to the assembled terminal distribution
+    # (strike-agnostic), BEFORE the per-strike loop, so every strike is re-derived
+    # from the shifted paths and the ladder stays monotone by construction. This
+    # replaces the old invalid per-strike additive blend. Physical-measure view:
+    # skipped under martingale_anchor; gated to DTE buckets (≤30d). See
+    # apply_xgb_drift_shift / temp/xgb_activation_plan.md §2.
+    xgb_p_up = np.nan
+    xgb_delta_H = 0.0
+    xgb_applied = False
+    if use_xgb_direction and xgb_model is not None:
+        bucket_h = dte_bucket_horizon(days_to_expiry)
+        if martingale_anchor:
+            logger.warning(
+                "XGB drift skipped: incompatible with martingale_anchor=True "
+                "(directional tilt is a physical-measure view)."
+            )
+        elif bucket_h is None:
+            logger.debug("XGB drift skipped: DTE %.2fd outside buckets", days_to_expiry)
+        else:
+            try:
+                from core.pricing.directional_xgb import to_daily_log_return_series
+                # C1: derive a leak-free DATE-INDEXED daily-returns series
+                # UNCONDITIONALLY (not the regime-only `daily_ret` at ~1170).
+                if hourly_df is not None:
+                    daily_ret_xgb = to_daily_log_return_series(hourly_df)
+                else:
+                    daily_ret_xgb = to_daily_log_return_series(pd.read_csv(hourly_csv))
+                p_up = xgb_model.predict_direction_adjustment(
+                    S0=S0,  # no-op in the model (no price feature); API symmetry
+                    hours_to_expiry=hours_to_expiry,
+                    btc_returns=daily_ret_xgb,
+                    macro_df=macro_df,
+                    horizon_days=int(round(bucket_h)),
+                )
+                lam = XGB_TILT_LAMBDA if xgb_tilt_lambda is None else xgb_tilt_lambda
+                paths, xgb_delta_H, xgb_meta = apply_xgb_drift_shift(
+                    paths, S0, p_up, lam
+                )
+                xgb_p_up = p_up
+                xgb_applied = xgb_meta.get("applied", False)
+            except Exception:
+                logger.warning("XGB drift shift failed; using unshifted paths", exc_info=True)
+
     # ---- Compute Probabilities ----
     results = {}
     for strike in strikes:
@@ -1144,23 +1345,6 @@ def calculate_probabilities(
             prob = np.average(paths >= strike, weights=weights_array)
         else:
             prob = get_contract_probability(paths, strike)
-
-        # ---- Phase 2.3: Directional XGBoost Modifier (FIX 3 / H2: DISABLED) ----
-        # The old blend `prob = 0.7*prob + 0.3*p_xgb` mixed a STRIKE-SPECIFIC MC
-        # probability with a STRIKE-AGNOSTIC P(up), shifting every strike on the
-        # ladder by the same additive amount — which breaks monotonicity and
-        # corrupts the whole curve. It was also never wired (xgb_model always None)
-        # and, when called, returned 0.5 (no btc_returns passed). Hard-disable so it
-        # cannot silently corrupt probabilities. Re-enable only via a drift-shift
-        # design on the simulated distribution (see FIX 3 Step B), not a per-strike
-        # average.
-        if use_xgb_direction and xgb_model is not None:
-            raise NotImplementedError(
-                "XGBoost directional blend is disabled: linear per-strike blending of "
-                "a strike-agnostic P(up) is invalid (breaks ladder monotonicity). "
-                "Re-enable only via a drift-shift design (FIX 3 Step B). "
-                "Set use_xgb_direction=False."
-            )
 
         results[strike] = float(prob)
 
@@ -1178,6 +1362,9 @@ def calculate_probabilities(
         'use_skewed_t': use_skewed_t,
         'use_figarch': use_figarch,
         'use_xgb_direction': use_xgb_direction,
+        'xgb_p_up': xgb_p_up,
+        'xgb_delta_H': xgb_delta_H,
+        'xgb_applied': xgb_applied,
         'horizon_gate_active': days_to_expiry > HORIZON_MEDIUM_DAYS,
     }
 
