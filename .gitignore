@@ -1,5 +1,6 @@
 # Data files
 *.csv
+*.bak
 *.png
 *.jpg
 *.jpeg
@@ -60,3 +61,9 @@ Journal Articles/
 
 # Temporary artifacts
 temp/
+
+# Backtest/data outputs (regenerated artifacts)
+backtested_probabilities/
+DATA/is_oos_cache/
+DATA/*.json
+backtested_probabilities/**/*.json
