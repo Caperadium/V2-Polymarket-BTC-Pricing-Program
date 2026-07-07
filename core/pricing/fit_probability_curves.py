@@ -102,17 +102,34 @@ def calibrate_logit_shift(
     chi2_crit = 3.841
 
     def _find_bound(lower: bool) -> float:
-        """Find B where LR stat hits chi2_crit. Search outward from fitted B."""
-        step = 0.5 if lower else -0.5
+        """Find B where LR stat hits chi2_crit. Search outward from fitted B,
+        then bisect between the last inside point and the first outside point."""
+        step = -0.5 if lower else 0.5
+        inside = B_fitted
         B = B_fitted + step
+        crossed = False
         for _ in range(50):
             ll = -neg_loglik(B)
             if 2 * (ll_fitted - ll) >= chi2_crit:
-                return B
+                crossed = True
+                break
+            inside = B
             B += step
             if abs(B) > 5.0:
                 break
-        return B  # Bound not found within search range
+        if not crossed:
+            return B  # Bound not found within search range
+        outside = B
+        for _ in range(30):
+            mid = 0.5 * (inside + outside)
+            ll = -neg_loglik(mid)
+            if 2 * (ll_fitted - ll) >= chi2_crit:
+                outside = mid
+            else:
+                inside = mid
+            if abs(outside - inside) < 1e-4:
+                break
+        return outside
 
     B_ci_lower = _find_bound(lower=True)
     B_ci_upper = _find_bound(lower=False)

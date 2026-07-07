@@ -440,6 +440,11 @@ def compute_mc_var(
 
     last_sim_params: Optional[dict] = None
     last_refit_idx: int = -1
+    # VaR values computed at the last successful refit. Between refits the sim
+    # params AND the seed are unchanged, so simulate_paths would return
+    # identical paths at every t — recomputing per hour is pure waste (~500x).
+    # Fill these forward instead; output is byte-identical to the per-t loop.
+    last_var_values: Optional[Dict[Tuple[int, float], float]] = None
 
     # Pre-calibrate jumps on all data for efficiency
     try:
@@ -482,40 +487,43 @@ def compute_mc_var(
                     "garch": garch_params,
                     "jumps": effective_jumps,
                 }
-                if t % (refit_every * 5) == 0:
-                    logger.info(
-                        "MC refit at obs %d/%d: S0=%.2f, use_jumps=%s",
-                        t, n, S0, effective_jumps is not None,
+                sp = last_sim_params
+                last_var_values = {}
+                for h in horizons:
+                    if h <= 0:
+                        continue
+                    # Simulate paths. FIX 6 (C2): pass the deployed feature flags so the
+                    # validator tests what is actually traded (FIGARCH + SVCJ + skewed-t +
+                    # naive prior), not bare GARCH/Student-t.
+                    paths = simulate_paths(
+                        sp["S0"], sp["garch"],
+                        jump_params=sp["jumps"],
+                        hours_to_expiry=h,
+                        n_sims=num_sims,
+                        seed=seed,
+                        use_naive_prior=use_naive_prior,
+                        use_svcj=use_svcj,
+                        use_skewed_t=use_skewed_t,
+                        use_figarch=use_figarch,
                     )
+                    # FIX 6 (C2): simulate_paths returns a 1-D array of TERMINAL prices, not a
+                    # (n_sims, n_steps) matrix — `paths[:, -1]` raised IndexError. Use `paths`.
+                    sim_returns = np.log(paths / sp["S0"])
 
-        if last_sim_params is None:
+                    for a in alphas:
+                        last_var_values[(h, a)] = float(
+                            np.percentile(sim_returns, a * 100)
+                        )
+                logger.info(
+                    "MC refit at obs %d/%d: S0=%.2f, use_jumps=%s",
+                    t, n, S0, effective_jumps is not None,
+                )
+
+        if last_var_values is None:
             continue
 
-        sp = last_sim_params
-
-        for h in horizons:
-            if h <= 0:
-                continue
-            # Simulate paths. FIX 6 (C2): pass the deployed feature flags so the
-            # validator tests what is actually traded (FIGARCH + SVCJ + skewed-t +
-            # naive prior), not bare GARCH/Student-t.
-            paths = simulate_paths(
-                sp["S0"], sp["garch"],
-                jump_params=sp["jumps"],
-                hours_to_expiry=h,
-                n_sims=num_sims,
-                seed=seed,
-                use_naive_prior=use_naive_prior,
-                use_svcj=use_svcj,
-                use_skewed_t=use_skewed_t,
-                use_figarch=use_figarch,
-            )
-            # FIX 6 (C2): simulate_paths returns a 1-D array of TERMINAL prices, not a
-            # (n_sims, n_steps) matrix — `paths[:, -1]` raised IndexError. Use `paths`.
-            sim_returns = np.log(paths / sp["S0"])
-
-            for a in alphas:
-                var_forecasts[(h, a)][t] = float(np.percentile(sim_returns, a * 100))
+        for key, value in last_var_values.items():
+            var_forecasts[key][t] = value
 
     return var_forecasts
 
