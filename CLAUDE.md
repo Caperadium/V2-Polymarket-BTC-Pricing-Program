@@ -51,6 +51,12 @@ python core/pricing/btc_pricing_engine.py
 # Vol gate (standalone risk signal)
 python core/strategy/vol_gate.py --file DATA/btc_intraday_1m.csv
 
+# Rolling-window model evaluation (Brier + VaR)
+python core/validation/rolling_evaluator.py --window-days 90 --step-days 7 --horizons 1,14,28 --max-windows 40
+
+# Bayesian posterior estimation for pricing parameters
+python core/pricing/bayesian_estimation.py --strikes 90000,100000 --hours 336 --n-posterior 50
+
 # Run tests
 python -m pytest tests/ -v
 
@@ -84,13 +90,18 @@ mkdocs serve
 │   │   └── positions.py          #   CSV-based position ledger
 │   ├── pricing/
 │   │   ├── btc_pricing_engine.py #   GARCH+Student-t+Jump MC simulator
-│   │   └── fit_probability_curves.py # Logistic curve fitting
-│   └── strategy/
-│       ├── auto_reco.py          #   3-stage trade recommendation pipeline
-│       ├── BH_auto_reco.py       #   Previous auto_reco (pre-refactor backup)
-│       ├── common.py             #   Shared types, constants (TargetPosition, TargetRole)
-│       ├── vol_gate.py           #   BTC volatility risk gate
-│       └── signal_diagnostics.py #   Deprecation shim → core.backtesting.diagnostics
+│   │   ├── bayesian_estimation.py #  GARCH/jump posterior distributions + credible bands
+│   │   ├── fit_probability_curves.py # Logistic curve fitting
+│   │   ├── jump_calibration.py   #   Kou jump params + SVCJ vol-jump estimation
+│   │   └── regime_detector.py    #   3-state HMM regime switching
+│   ├── strategy/
+│   │   ├── auto_reco.py          #   3-stage trade recommendation pipeline
+│   │   ├── BH_auto_reco.py       #   Previous auto_reco (pre-refactor backup)
+│   │   ├── common.py             #   Shared types, constants (TargetPosition, TargetRole)
+│   │   ├── vol_gate.py           #   BTC volatility risk gate
+│   │   └── signal_diagnostics.py #   Deprecation shim → core.backtesting.diagnostics
+│   └── validation/
+│       └── rolling_evaluator.py  #   Rolling-window model evaluation (Brier + VaR)
 ├── scripts/                      # Executable scripts & pipelines
 │   ├── backtesting/
 │   │   ├── backtest_engine.py    #   Deprecation shim → core.backtesting.backtest_engine
@@ -139,7 +150,7 @@ mkdocs serve
 ### Core Pricing Engine (`core/pricing/btc_pricing_engine.py`)
 
 FIGARCH(1,d,1)/GARCH(1,1) + Skewed-t/Student-t + SVCJ (Kou Double Exponential with correlated volatility jumps) Monte Carlo simulator, regime-conditional via a 3-state HMM. The high-level entry point is `calculate_probabilities()` which accepts strikes and days-to-expiry, returns `{strike: probability}` dict. Key design decisions:
-- **Measure (FIX 9/M3)**: Default is the *physical* measure, *median*-anchored (μ=0 naive prior + jump-drift compensator, no diffusion convexity correction) — NOT risk-neutral. `martingale_anchor=True` is the risk-neutral switch.
+- **Measure (FIX 9/M3)**: Default is the *physical* measure, log-mean anchored (E[log S_T] = log S0); the median coincides only for a symmetric log distribution. Uses μ=0 naive prior + jump-drift compensator, no diffusion convexity correction — NOT risk-neutral. `martingale_anchor=True` corrects the jump compensator only; the diffusion Jensen term is NOT subtracted.
 - **Structural mean drift**: Uses long-term fitted GARCH mean (mu) with per-path clamping to ±0.25 × path-specific sigma_day
 - **Multi-jump aggregation**: Poisson compound jumps per day, Gamma-distributed magnitudes
 - **Jump drift correction**: Expected jump drift subtracted from mean (legacy log-mean compensator by default)

@@ -3120,8 +3120,16 @@
 <td>Logistic-fitted model probability</td>
 </tr>
 <tr>
+<td><code>p_model_cal</code></td>
+<td>Calibrated model probability (only when <code>USE_CALIBRATED_PROB=True</code>; logit shift on <code>p_model_fit</code>)</td>
+</tr>
+<tr>
+<td><code>p_market_fit</code></td>
+<td>Logistic fit to the <strong>market price</strong> (formerly <code>p_rn_fit</code>; NOT a risk-neutral model prob)</td>
+</tr>
+<tr>
 <td><code>p_rn_fit</code></td>
-<td>Logistic-fitted risk-neutral probability</td>
+<td>Deprecated alias of <code>p_market_fit</code> (identical values, retained one release)</td>
 </tr>
 <tr>
 <td><code>T_days</code></td>
@@ -3394,7 +3402,7 @@
 <tbody>
 <tr>
 <td>Model probability</td>
-<td><code>p_model_fit</code> → <code>p_real_mc</code> → <code>model_probability</code></td>
+<td><code>p_model_fit</code> → <code>p_real_mc</code> → <code>model_probability</code> (prepend <code>p_model_cal</code> when <code>USE_CALIBRATED_PROB=True</code>)</td>
 </tr>
 <tr>
 <td>Market price</td>
@@ -3413,8 +3421,8 @@
 <td>Computed as <code>model_prob − market_price</code> (YES) or <code>market_price − model_prob</code> (NO)</td>
 </tr>
 <tr>
-<td>Risk-neutral prob</td>
-<td><code>p_rn_fit</code> &gt; <code>risk_neutral_prob_fit</code> &gt; <code>risk_neutral_prob</code></td>
+<td>Market-fit prob</td>
+<td><code>p_market_fit</code> &gt; <code>p_rn_fit</code> (deprecated alias) &gt; <code>risk_neutral_prob_fit</code> &gt; <code>risk_neutral_prob</code></td>
 </tr>
 </tbody>
 </table>

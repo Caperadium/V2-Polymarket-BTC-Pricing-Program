@@ -770,10 +770,10 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#6-figarch-long-memory-optional" class="md-nav__link">
+  <a href="#6-figarch1d1-long-memory-optional" class="md-nav__link">
     <span class="md-ellipsis">
       
-        6. FIGARCH Long Memory (Optional)
+        6. FIGARCH(1,d,1) Long Memory (Optional)
       
     </span>
   </a>
@@ -3171,10 +3171,10 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#6-figarch-long-memory-optional" class="md-nav__link">
+  <a href="#6-figarch1d1-long-memory-optional" class="md-nav__link">
     <span class="md-ellipsis">
       
-        6. FIGARCH Long Memory (Optional)
+        6. FIGARCH(1,d,1) Long Memory (Optional)
       
     </span>
   </a>
@@ -3387,7 +3387,7 @@
 
 <h1 id="pricing-engine-v2">Pricing Engine (v2)<a class="headerlink" href="#pricing-engine-v2" title="Permanent link">&para;</a></h1>
 <p><code>core/pricing/btc_pricing_engine.py</code></p>
-<p>The pricing engine computes <strong>probability that BTC ends above a given strike price</strong> at contract expiry. It uses a GARCH(1,1) + SVCJ (Kou Double Exponential Jump Diffusion with correlated volatility jumps) Monte Carlo simulator running on <strong>hourly</strong> steps, with optional Hansen skewed-t innovations and FIGARCH long-memory volatility.</p>
+<p>The pricing engine computes <strong>probability that BTC ends above a given strike price</strong> at contract expiry. It uses a FIGARCH(1,d,1) or GARCH(1,1) + SVCJ (Kou Double Exponential Jump Diffusion with correlated volatility jumps) Monte Carlo simulator running on <strong>hourly</strong> steps, with optional Hansen skewed-t innovations and FIGARCH(1,d,1) long-memory volatility.</p>
 <h2 id="phase-structure">Phase Structure<a class="headerlink" href="#phase-structure" title="Permanent link">&para;</a></h2>
 <p>The pricing engine is built incrementally across seven phases. Each phase is a toggleable feature flag:</p>
 <table>
@@ -3462,7 +3462,7 @@
 </tr>
 <tr>
 <td>2.5</td>
-<td>FIGARCH long memory</td>
+<td>FIGARCH(1,d,1) long memory [Baillie, Bollerslev &amp; Mikkelsen 1996]</td>
 <td><code>use_figarch=True</code></td>
 <td>Opt-in</td>
 </tr>
@@ -3490,6 +3490,7 @@
 <p>Hourly log returns from <code>DATA/btc_hourly.csv</code> (5yr Binance 1h klines) are scaled ×100 for numerical stability, then fit with:</p>
 <p>$$\sigma_t^2 = \omega + \alpha \cdot \epsilon_{t-1}^2 + \beta \cdot \sigma_{t-1}^2$$</p>
 <p>The <code>arch</code> library provides the fitting via <code>arch_model(returns, vol='Garch', p=1, q=1, dist='t')</code>.</p>
+<p><strong>Jump-filtered fit (default)</strong>: <code>fit_garch_model(..., filter_jumps=True)</code> first winsorizes detected jump-bar returns to +/- 3x the local bipower sigma (<code>filter_jump_returns</code>), so the GARCH/FIGARCH fit sees approximately the diffusion component only. Without this, total variance double-counts the jump contribution (the simulator adds a calibrated jump process on top). <code>filter_jumps=False</code> is kept for A/B comparison.</p>
 <p><strong>Output parameters</strong>: <code>omega</code>, <code>alpha</code>, <code>beta</code>, <code>nu</code> (degrees of freedom), <code>mu</code> (mean), <code>last_variance</code> — all in <strong>hourly log-return units</strong>.</p>
 <h3 id="2-naive-prior-default-on">2. Naive Prior (Default On)<a class="headerlink" href="#2-naive-prior-default-on" title="Permanent link">&para;</a></h3>
 <p>Per Baquero/Shelton (2024/2026), OOS evidence shows zero-drift GARCH outperforms fitted-drift:</p>
@@ -3497,7 +3498,7 @@
 <li><strong>On</strong> (<code>use_naive_prior=True</code>, default): Enforces μ=0 in GARCH fitting. Prices drift only through jump compensation.</li>
 <li><strong>Off</strong> (<code>use_naive_prior=False</code>): Uses fitted GARCH mean with per-path clamping to ±0.25 × path-specific sigma_hourly.</li>
 </ul>
-<p>The jump drift correction (expected jump drift subtracted from drift) maintains approximate risk-neutrality regardless of prior choice.</p>
+<p>The jump drift correction (expected jump drift subtracted from drift) makes the default distribution log-mean anchored (E[log S_T] = log S0); the median coincides only for a symmetric log distribution. This is the PHYSICAL measure, NOT risk-neutral. <code>martingale_anchor=True</code> corrects the JUMP compensator only -- the diffusion Jensen term (~ +sigma^2/2 per step, roughly +1% at 30 days at 50% annualized vol) is NOT subtracted, and Student-t exponential moments are finite only due to the per-step return clip.</p>
 <h3 id="3-kou-double-exponential-jump-diffusion">3. Kou Double Exponential Jump Diffusion<a class="headerlink" href="#3-kou-double-exponential-jump-diffusion" title="Permanent link">&para;</a></h3>
 <p>Jumps follow a compound Poisson process with asymmetric exponential magnitudes:</p>
 <table>
@@ -3539,7 +3540,7 @@
 <p>Per Eraker et al. (2004) and Teng et al. (2025). When enabled (<code>use_svcj=True</code>):</p>
 <ul>
 <li><strong>Shared Poisson driver</strong>: Same Poisson process drives both return jumps AND volatility jumps</li>
-<li><strong>Return-vol correlation</strong> (<code>rho_J</code>): Jump sizes are coupled — <code>jump_sizes += rho_J * vol_jump_mag</code></li>
+<li><strong>Return-vol coupling</strong> (<code>rho_j_slope</code>): Jump sizes are coupled -- <code>jump_sizes += rho_j_slope * vol_jump_mag</code>, where <code>rho_j_slope</code> is the calibrated OLS slope of jump return on vol-jump delta (units: return per unit variance jump, sanity-capped; default 0.0 = term off). <code>rho_J</code> (the Pearson correlation) is diagnostics/reporting only -- used directly as a slope it was ~5 orders of magnitude too small to matter</li>
 <li><strong>Vol jump magnitudes</strong>: Drawn from exponential distribution with mean <code>mu_v</code></li>
 <li><strong>Calibration</strong>: Parameters estimated from historical data via <code>core/pricing/jump_calibration.py</code></li>
 </ul>
@@ -3556,13 +3557,14 @@
 <span class="c1"># lam=+0.3 → positive skew (right tail heavier)</span>
 <span class="c1"># lam=0   → symmetric (reduces to standard Student-t)</span>
 </code></pre></div>
-<h3 id="6-figarch-long-memory-optional">6. FIGARCH Long Memory (Optional)<a class="headerlink" href="#6-figarch-long-memory-optional" title="Permanent link">&para;</a></h3>
-<p>When enabled (<code>use_figarch=True</code>), replaces the short-memory GARCH(1,1) variance recursion with FIGARCH(1,d,1):</p>
-<p>$$\sigma_t^2 = \frac{\omega}{1-\beta} + \sum_{k=0}^{\infty} \lambda_k(d) \cdot \epsilon_{t-k}^2$$</p>
+<h3 id="6-figarch1d1-long-memory-optional">6. FIGARCH(1,d,1) Long Memory (Optional)<a class="headerlink" href="#6-figarch1d1-long-memory-optional" title="Permanent link">&para;</a></h3>
+<p>When enabled (<code>use_figarch=True</code>), replaces the short-memory GARCH(1,1) variance recursion with FIGARCH(1,d,1) per Baillie, Bollerslev &amp; Mikkelsen (1996):</p>
+<p>$$\sigma_t^2 = \frac{\omega}{1-\beta} + \sum_{k=1}^{\infty} \lambda_k \cdot \epsilon_{t-k}^2$$</p>
 <ul>
-<li><strong>Fractional differencing parameter</strong> d ≈ 0.578 (Siu 2025, from BTC empirical estimation)</li>
-<li><strong>Binomial expansion weights</strong>: λ₀(d)=d, λ_k(d) = ((k-d-1)/k) · λ_{k-1}(d), truncated at 100 lags</li>
+<li><strong>Jointly estimated</strong>: phi, d, beta fitted via <code>arch_model(vol='FIGARCH', p=1, q=1)</code> on hourly BTC returns</li>
+<li><strong>ARCH(infinity) weights</strong>: lambda_1=phi-beta+d, lambda_i=beta<em>lambda_{i-1}+(delta_i-phi</em>delta_{i-1}) where delta_i are the binomial coefficients of (1-L)^d</li>
 <li><strong>Persistence</strong>: FIGARCH captures long-range dependence in BTC volatility (hyperbolic decay vs exponential in GARCH)</li>
+<li><strong>Positivity</strong>: Joint estimation satisfies Bollerslev-Mikkelsen non-negativity constraints natively</li>
 </ul>
 <h3 id="9-directional-xgboost-modifier-phase-23">9. Directional XGBoost Modifier (Phase 2.3)<a class="headerlink" href="#9-directional-xgboost-modifier-phase-23" title="Permanent link">&para;</a></h3>
 <p>When enabled (<code>use_xgb_direction=True</code>), an XGBoost classifier provides a directional P(up) signal that is blended with the base MC probability:</p>
@@ -3628,7 +3630,7 @@
 <tbody>
 <tr>
 <td>T &gt; 90 days</td>
-<td>Naive prior only (μ=0, GARCH+Student-t, no jumps)</td>
+<td>Naive prior (μ=0, GARCH+Student-t); Kou return jumps retained, SVCJ/skew/FIGARCH/regime/XGB disabled</td>
 </tr>
 <tr>
 <td>30 &lt; T ≤ 90 days</td>
@@ -3702,7 +3704,7 @@
 <td><code>use_figarch</code></td>
 <td><code>False</code></td>
 <td>2.5</td>
-<td>Use FIGARCH long-memory variance</td>
+<td>Use FIGARCH(1,d,1) long-memory variance</td>
 </tr>
 <tr>
 <td><code>use_xgb_direction</code></td>
@@ -3857,7 +3859,7 @@
 <li><strong>Variance Consistency</strong> — Empirical/model variance ratio within ±15%</li>
 <li><strong>Naive Prior</strong> — Zero-drift paths show smaller deviation than fitted-drift paths</li>
 <li><strong>SVCJ</strong> — Volatility jumps add measurable variance vs plain SVJ</li>
-<li><strong>FIGARCH Weights</strong> — Binomial expansion weights decay correctly (w₀=1, w₉₉ negative and small)</li>
+<li><strong>FIGARCH Weights</strong> — ARCH(infinity) weights match arch library reference, weights[0]=0, lambda_1&gt;0 (B-M positivity satisfied)</li>
 <li><strong>Skewed-t</strong> — λ=-0.3 → negative skew, λ=+0.3 → positive skew, λ=0 → symmetric</li>
 </ol>
 <h2 id="data-dependencies">Data Dependencies<a class="headerlink" href="#data-dependencies" title="Permanent link">&para;</a></h2>

@@ -454,6 +454,10 @@ def compute_mc_var(
                 "eta_down": cal_jumps["eta_down"],
                 "mu_v": cal_jumps["mu_v"],
                 "rho_J": cal_jumps["rho_J"],
+                # FIX 4 (M1) consistency: SVCJ return-vol regression slope actually
+                # used in simulate_paths (rho_J above is reporting-only). Keeps this
+                # caller aligned with backrunner/live pipelines.
+                "rho_j_slope": cal_jumps.get("rho_j_slope", 0.0),
                 "sigma_s": cal_jumps.get("sigma_s", 0.01),
             }
             logger.info("MC mode: using calibrated jumps (lam=%.1f/yr)", cal_jumps["lam"])

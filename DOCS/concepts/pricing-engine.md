@@ -48,6 +48,8 @@ $$\sigma_t^2 = \omega + \alpha \cdot \epsilon_{t-1}^2 + \beta \cdot \sigma_{t-1}
 
 The `arch` library provides the fitting via `arch_model(returns, vol='Garch', p=1, q=1, dist='t')`.
 
+**Jump-filtered fit (default)**: `fit_garch_model(..., filter_jumps=True)` first winsorizes detected jump-bar returns to +/- 3x the local bipower sigma (`filter_jump_returns`), so the GARCH/FIGARCH fit sees approximately the diffusion component only. Without this, total variance double-counts the jump contribution (the simulator adds a calibrated jump process on top). `filter_jumps=False` is kept for A/B comparison.
+
 **Output parameters**: `omega`, `alpha`, `beta`, `nu` (degrees of freedom), `mu` (mean), `last_variance` — all in **hourly log-return units**.
 
 ### 2. Naive Prior (Default On)
@@ -57,7 +59,7 @@ Per Baquero/Shelton (2024/2026), OOS evidence shows zero-drift GARCH outperforms
 - **On** (`use_naive_prior=True`, default): Enforces μ=0 in GARCH fitting. Prices drift only through jump compensation.
 - **Off** (`use_naive_prior=False`): Uses fitted GARCH mean with per-path clamping to ±0.25 × path-specific sigma_hourly.
 
-The jump drift correction (expected jump drift subtracted from drift) maintains approximate risk-neutrality regardless of prior choice.
+The jump drift correction (expected jump drift subtracted from drift) makes the default distribution log-mean anchored (E[log S_T] = log S0); the median coincides only for a symmetric log distribution. This is the PHYSICAL measure, NOT risk-neutral. `martingale_anchor=True` corrects the JUMP compensator only -- the diffusion Jensen term (~ +sigma^2/2 per step, roughly +1% at 30 days at 50% annualized vol) is NOT subtracted, and Student-t exponential moments are finite only due to the per-step return clip.
 
 ### 3. Kou Double Exponential Jump Diffusion
 
@@ -83,7 +85,7 @@ expected_jump_drift = lam_hourly * ((1 - p_crash)/eta_up - p_crash/eta_down)
 Per Eraker et al. (2004) and Teng et al. (2025). When enabled (`use_svcj=True`):
 
 - **Shared Poisson driver**: Same Poisson process drives both return jumps AND volatility jumps
-- **Return-vol correlation** (`rho_J`): Jump sizes are coupled — `jump_sizes += rho_J * vol_jump_mag`
+- **Return-vol coupling** (`rho_j_slope`): Jump sizes are coupled -- `jump_sizes += rho_j_slope * vol_jump_mag`, where `rho_j_slope` is the calibrated OLS slope of jump return on vol-jump delta (units: return per unit variance jump, sanity-capped; default 0.0 = term off). `rho_J` (the Pearson correlation) is diagnostics/reporting only -- used directly as a slope it was ~5 orders of magnitude too small to matter
 - **Vol jump magnitudes**: Drawn from exponential distribution with mean `mu_v`
 - **Calibration**: Parameters estimated from historical data via `core/pricing/jump_calibration.py`
 
@@ -169,7 +171,7 @@ Model complexity scales with time-to-expiry to avoid over-parameterization of lo
 
 | Horizon | Model Configuration |
 |---------|--------------------|
-| T > 90 days | Naive prior only (μ=0, GARCH+Student-t, no jumps) |
+| T > 90 days | Naive prior (μ=0, GARCH+Student-t); Kou return jumps retained, SVCJ/skew/FIGARCH/regime/XGB disabled |
 | 30 < T ≤ 90 days | Naive prior + simplified (GARCH+t, Kou jumps, no SVCJ/FIGARCH/skewed-t) |
 | 7 < T ≤ 30 days | Intermediate (all features enabled except skewed-t) |
 | T ≤ 7 days | **Full model** (SVCJ, skewed-t, FIGARCH all enabled) |

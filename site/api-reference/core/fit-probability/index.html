@@ -3091,7 +3091,7 @@
 </tr>
 </tbody>
 </table>
-<p><strong>Returns</strong>: <code>pd.DataFrame</code> with added columns: <code>p_model_fit</code>, <code>p_rn_fit</code>, <code>logit_shift</code>.</p>
+<p><strong>Returns</strong>: <code>pd.DataFrame</code> with added columns: <code>p_model_fit</code>, <code>p_market_fit</code> (alias <code>p_rn_fit</code>), <code>edge_vs_market_fit</code>, <code>edge_vs_rn_fit</code> — plus <code>p_model_cal</code> when outcome-based recalibration is enabled (<code>USE_CALIBRATED_PROB=True</code>).</p>
 <h3 id="fit_risk_neutral_curvesdf-prob_colp_real_mc"><code>fit_risk_neutral_curves(df, prob_col='p_real_mc', ...)</code><a class="headerlink" href="#fit_risk_neutral_curvesdf-prob_colp_real_mc" title="Permanent link">&para;</a></h3>
 <p>Fit risk-neutral probability curves from market prices. Extracts implied probability from market mid-price for each strike, then fits the same logistic functional form.</p>
 <h3 id="logit_shift_calibrationfitted_probs-market_probs-floor001-cap099"><code>logit_shift_calibration(fitted_probs, market_probs, floor=0.01, cap=0.99)</code><a class="headerlink" href="#logit_shift_calibrationfitted_probs-market_probs-floor001-cap099" title="Permanent link">&para;</a></h3>
@@ -3151,9 +3151,19 @@
 <td>Smoothed model probability curve</td>
 </tr>
 <tr>
+<td><code>p_model_cal</code></td>
+<td>Calibration</td>
+<td><code>sigmoid(logit(p_model_fit) + B_bucket)</code> — only when <code>USE_CALIBRATED_PROB=True</code></td>
+</tr>
+<tr>
+<td><code>p_market_fit</code></td>
+<td>Market fit</td>
+<td>Logistic fit to market price (formerly <code>p_rn_fit</code>; not risk-neutral)</td>
+</tr>
+<tr>
 <td><code>p_rn_fit</code></td>
 <td>Market fit</td>
-<td>Risk-neutral (market-implied) probability curve</td>
+<td>Deprecated alias of <code>p_market_fit</code> (identical)</td>
 </tr>
 <tr>
 <td><code>market_price</code></td>
@@ -3161,12 +3171,7 @@
 <td>Mid-market price</td>
 </tr>
 <tr>
-<td><code>logit_shift</code></td>
-<td>Calibration</td>
-<td>Logit-space calibration adjustment</td>
-</tr>
-<tr>
-<td><code>edge</code></td>
+<td><code>edge_vs_market_fit</code></td>
 <td>Computed</td>
 <td><code>p_model_fit - market_price</code></td>
 </tr>

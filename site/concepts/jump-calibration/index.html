@@ -3113,11 +3113,11 @@
 
 <h1 id="jump-calibration">Jump Calibration<a class="headerlink" href="#jump-calibration" title="Permanent link">&para;</a></h1>
 <p><code>core/pricing/jump_calibration.py</code></p>
-<p>Historical jump calibration from threshold exceedances on BTC hourly returns. Estimates Kou double-exponential parameters and SVCJ volatility jump parameters without requiring MCMC — uses MAD-based jump detection + MLE.</p>
+<p>Historical jump calibration from threshold exceedances on BTC hourly returns. Estimates Kou double-exponential parameters and SVCJ volatility jump parameters without requiring MCMC -- uses Lee-Mykland bipower jump detection (pipeline default) or MAD detection, plus MLE.</p>
 <p>Based on: Teng et al. (2025), Qiao et al. (2025), Eraker et al. (2004).</p>
 <h2 id="why-it-matters">Why It Matters<a class="headerlink" href="#why-it-matters" title="Permanent link">&para;</a></h2>
 <p>The pricing engine's jump parameters (λ, p_crash, η_up, η_down) must be grounded in empirical BTC behavior. Literature defaults (Teng 2025) provide reasonable starting points, but calibration to actual BTC data captures regime shifts and improves multi-day VaR performance.</p>
-<p>SVCJ vol jump parameters (μ_v, ρ_J) are essential for the correlated volatility jump model validated in Phase 1. Without them, the model is SVJ-equivalent and fails Basel backtests at horizons ≥ 14 days.</p>
+<p>SVCJ vol jump parameters (μ_v, ρ_J, rho_j_slope) are essential for the correlated volatility jump model validated in Phase 1. Without them, the model is SVJ-equivalent and fails Basel backtests at horizons ≥ 14 days.</p>
 <h2 id="detection-methods">Detection Methods<a class="headerlink" href="#detection-methods" title="Permanent link">&para;</a></h2>
 <h3 id="mad-median-absolute-deviation">MAD (Median Absolute Deviation)<a class="headerlink" href="#mad-median-absolute-deviation" title="Permanent link">&para;</a></h3>
 <div class="highlight"><pre><span></span><code><span class="n">detect_jumps_mad</span><span class="p">(</span><span class="n">returns</span><span class="p">,</span> <span class="n">mad_multiplier</span><span class="o">=</span><span class="mf">3.0</span><span class="p">)</span>
@@ -3127,15 +3127,14 @@
 <li>Compute MAD = median(|r_t - median|)</li>
 <li>Flag as jump when |r_t - median| &gt; 3.0 × MAD</li>
 </ul>
-<p>Fast, robust to outliers. Default method. MAD multiplier configurable.</p>
+<p>Fast, robust to outliers. Kept as an alternative (<code>detection_method="MAD"</code>); bipower is the pipeline default. MAD multiplier configurable.</p>
 <h3 id="bipower-variation-barndorff-nielsen-shephard">Bipower Variation (Barndorff-Nielsen &amp; Shephard)<a class="headerlink" href="#bipower-variation-barndorff-nielsen-shephard" title="Permanent link">&para;</a></h3>
 <div class="highlight"><pre><span></span><code><span class="n">detect_jumps_bipower</span><span class="p">(</span><span class="n">returns</span><span class="p">,</span> <span class="n">significance</span><span class="o">=</span><span class="mf">0.01</span><span class="p">)</span>
 </code></pre></div>
 <ul>
 <li>Less sensitive to volatility clustering than MAD</li>
-<li>Tests realized variance vs bipower variation ratio</li>
-<li>Under null of no jumps, test statistic ~ N(0,1)</li>
-<li>If global test rejects, identifies individual jumps via rolling std threshold</li>
+<li>Lee-Mykland (2008) local test: each return is compared against a local bipower sigma estimated over a trailing window that ends at t-1 -- the contemporaneous return is excluded, so a jump cannot inflate its own detection threshold</li>
+<li><code>return_sigma=True</code> additionally returns the local sigma array (used by the SVCJ vol-jump estimator and the jump-filtered GARCH fit)</li>
 </ul>
 <h2 id="parameter-estimation">Parameter Estimation<a class="headerlink" href="#parameter-estimation" title="Permanent link">&para;</a></h2>
 <h3 id="kou-double-exponential-parameters">Kou Double-Exponential Parameters<a class="headerlink" href="#kou-double-exponential-parameters" title="Permanent link">&para;</a></h3>
@@ -3168,10 +3167,11 @@
 </table>
 <p>Parameters clamped to [5, 200] for eta, [5, 100] for lam.</p>
 <h3 id="svcj-vol-jump-parameters">SVCJ Vol Jump Parameters<a class="headerlink" href="#svcj-vol-jump-parameters" title="Permanent link">&para;</a></h3>
-<p>Estimated from variance dynamics around detected jump events:</p>
+<p>Estimated from variance dynamics around detected jump events (shared helper <code>_estimate_vol_jump_params</code>). The rolling-variance INPUT replaces each jump bar's squared return with the local diffusion variance (bipower sigma_local^2, or the median non-jump squared return as fallback), removing the mechanical J^2/window inflation of the post-jump window:</p>
 <ul>
-<li><strong>μ_v</strong>: Mean of positive variance changes at jump times (hourly variance units). Clamped to [10⁻⁶, 10⁻³].</li>
-<li><strong>ρ_J</strong>: Correlation coefficient between return jump sizes and contemporaneous vol changes. Clamped to [-0.5, 0.5].</li>
+<li><strong>μ_v</strong>: Censored-at-zero mean of variance changes over ALL jump events (zeros included; conservative, biased low -- the old mean-of-positive-deltas-only was biased high). Hourly variance units, clamped to [10⁻⁶, 10⁻³].</li>
+<li><strong>ρ_J</strong>: Pearson correlation between return jump sizes and vol changes. Clamped to [-0.5, 0.5]. <strong>Diagnostics/reporting only</strong> -- no longer used in the return equation.</li>
+<li><strong>rho_j_slope</strong>: OLS slope of jump return on vol-jump delta (units: return per unit variance jump), sanity-capped so <code>|rho_j_slope| * mu_v &lt;= 0.5 * mean(|jump_returns|)</code>; 0.0 when var(dv)=0 or fewer than 10 events. This is the coefficient the SVCJ return-jump adjustment in <code>simulate_paths</code> actually uses (default 0.0 = term off).</li>
 </ul>
 <h3 id="literature-fallback">Literature Fallback<a class="headerlink" href="#literature-fallback" title="Permanent link">&para;</a></h3>
 <p>When too few jumps detected (&lt; 10), reverts to Teng (2025) reference values:</p>
@@ -3188,8 +3188,10 @@
     <span class="n">eta_up</span><span class="p">:</span> <span class="nb">float</span>            <span class="c1"># Positive jump size decay (1/mean)</span>
     <span class="n">eta_down</span><span class="p">:</span> <span class="nb">float</span>          <span class="c1"># Negative jump size decay (1/mean)</span>
     <span class="n">mu_v</span><span class="p">:</span> <span class="nb">float</span>              <span class="c1"># Mean volatility jump size (hourly variance units)</span>
-    <span class="n">rho_J</span><span class="p">:</span> <span class="nb">float</span>             <span class="c1"># Return-vol jump correlation</span>
+    <span class="n">rho_J</span><span class="p">:</span> <span class="nb">float</span>             <span class="c1"># Return-vol jump Pearson correlation (diagnostics only)</span>
     <span class="n">lam_v</span><span class="p">:</span> <span class="nb">float</span>             <span class="c1"># Vol jump intensity (defaults to lam)</span>
+    <span class="n">rho_j_slope</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">0.0</span> <span class="c1"># OLS return-per-variance-jump slope used by SVCJ</span>
+                             <span class="c1"># return-jump adjustment (sanity-capped; 0.0 = off)</span>
     <span class="n">n_jumps_detected</span><span class="p">:</span> <span class="nb">int</span>    <span class="c1"># Number of jumps detected</span>
     <span class="n">n_obs</span><span class="p">:</span> <span class="nb">int</span>               <span class="c1"># Total observations</span>
     <span class="n">jump_threshold</span><span class="p">:</span> <span class="nb">float</span>    <span class="c1"># Detection threshold value</span>

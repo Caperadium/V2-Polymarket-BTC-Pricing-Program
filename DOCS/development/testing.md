@@ -33,6 +33,12 @@ python core/pricing/regime_detector.py --input DATA/btc_hourly.csv
 # Basel backtest (runs multi-horizon VaR on historical data)
 python core/validation/basel_backtest.py --input DATA/btc_hourly.csv
 
+# Rolling-window evaluation (Brier vs naive baseline + VaR exceedances)
+python core/validation/rolling_evaluator.py --window-days 90 --step-days 7 --horizons 1,14,28 --max-windows 40
+
+# Bayesian posterior estimation (GARCH MH sampler + conjugate jump posteriors)
+python core/pricing/bayesian_estimation.py --strikes 90000,100000 --hours 336 --n-posterior 50
+
 # Macro fetcher (downloads to DATA/macro_daily.csv)
 python core/data/macro_fetcher.py --period 5y
 

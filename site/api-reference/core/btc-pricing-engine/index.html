@@ -1547,10 +1547,10 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#fit_garch_modelhourly_returns-use_naive_priortrue" class="md-nav__link">
+  <a href="#fit_garch_modelhourly_returns-use_naive_priortrue-filter_jumpstrue" class="md-nav__link">
     <span class="md-ellipsis">
       
-        fit_garch_model(hourly_returns, use_naive_prior=True)
+        fit_garch_model(hourly_returns, use_naive_prior=True, filter_jumps=True)
       
     </span>
   </a>
@@ -1591,10 +1591,10 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#_compute_figarch_weightsd-trunc_k100" class="md-nav__link">
+  <a href="#_compute_figarch_weightsd-phi-beta-trunc_k1000" class="md-nav__link">
     <span class="md-ellipsis">
       
-        _compute_figarch_weights(d, trunc_k=100)
+        _compute_figarch_weights(d, phi, beta, trunc_k=1000)
       
     </span>
   </a>
@@ -2994,10 +2994,10 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#fit_garch_modelhourly_returns-use_naive_priortrue" class="md-nav__link">
+  <a href="#fit_garch_modelhourly_returns-use_naive_priortrue-filter_jumpstrue" class="md-nav__link">
     <span class="md-ellipsis">
       
-        fit_garch_model(hourly_returns, use_naive_prior=True)
+        fit_garch_model(hourly_returns, use_naive_prior=True, filter_jumps=True)
       
     </span>
   </a>
@@ -3038,10 +3038,10 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#_compute_figarch_weightsd-trunc_k100" class="md-nav__link">
+  <a href="#_compute_figarch_weightsd-phi-beta-trunc_k1000" class="md-nav__link">
     <span class="md-ellipsis">
       
-        _compute_figarch_weights(d, trunc_k=100)
+        _compute_figarch_weights(d, phi, beta, trunc_k=1000)
       
     </span>
   </a>
@@ -3105,7 +3105,7 @@
 
 <h1 id="btc-pricing-engine-v2">BTC Pricing Engine (v2)<a class="headerlink" href="#btc-pricing-engine-v2" title="Permanent link">&para;</a></h1>
 <p><code>core/pricing/btc_pricing_engine.py</code></p>
-<p>GARCH(1,1) + SVCJ (Kou Jump Diffusion with correlated volatility jumps) Monte Carlo simulator on hourly steps. Optional Hansen skewed-t innovations, FIGARCH long memory, and regime-conditional pricing via 3-state HMM.</p>
+<p>FIGARCH(1,d,1) + SVCJ (Kou Jump Diffusion with correlated volatility jumps) Monte Carlo simulator on hourly steps. Optional Hansen skewed-t innovations, FIGARCH long memory, and regime-conditional pricing via 3-state HMM.</p>
 <h2 id="functions">Functions<a class="headerlink" href="#functions" title="Permanent link">&para;</a></h2>
 <h3 id="calculate_probabilitiesstrikes-hours_to_expiry"><code>calculate_probabilities(strikes, hours_to_expiry, ...)</code><a class="headerlink" href="#calculate_probabilitiesstrikes-hours_to_expiry" title="Permanent link">&para;</a></h3>
 <p>High-level entry point. Horizon-gated, regime-weighted probability computation.</p>
@@ -3114,16 +3114,16 @@
 <p>Monte Carlo path simulator. Returns <code>np.ndarray</code> of <code>(n_sims,)</code> terminal prices.</p>
 <h3 id="load_and_prep_datahourly_csv-training_start_datenone"><code>load_and_prep_data(hourly_csv, training_start_date=None)</code><a class="headerlink" href="#load_and_prep_datahourly_csv-training_start_datenone" title="Permanent link">&para;</a></h3>
 <p>Load hourly data, compute log returns. <code>training_start_date</code> enables backtest-style time-travel truncation.</p>
-<h3 id="fit_garch_modelhourly_returns-use_naive_priortrue"><code>fit_garch_model(hourly_returns, use_naive_prior=True)</code><a class="headerlink" href="#fit_garch_modelhourly_returns-use_naive_priortrue" title="Permanent link">&para;</a></h3>
-<p>Fit GARCH(1,1) + Student-t via <code>arch</code> library. Returns dict of fitted parameters.</p>
+<h3 id="fit_garch_modelhourly_returns-use_naive_priortrue-filter_jumpstrue"><code>fit_garch_model(hourly_returns, use_naive_prior=True, filter_jumps=True)</code><a class="headerlink" href="#fit_garch_modelhourly_returns-use_naive_priortrue-filter_jumpstrue" title="Permanent link">&para;</a></h3>
+<p>Fit GARCH(1,1) or FIGARCH(1,d,1) + Student-t via <code>arch</code> library. <code>filter_jumps=True</code> (default) first winsorizes detected jump-bar returns to +/- 3x local bipower sigma via <code>filter_jump_returns()</code>, so the fit sees approximately the diffusion component only (avoids double-counting jump variance against the separately simulated jump process). When <code>use_figarch=True</code>, fits <code>arch_model(vol='FIGARCH', p=1, q=1)</code> jointly estimating phi, d, beta. Falls back to GARCH on convergence failure. Returns dict of fitted parameters.</p>
 <h3 id="get_contract_probabilitypaths-strike_price"><code>get_contract_probability(paths, strike_price)</code><a class="headerlink" href="#get_contract_probabilitypaths-strike_price" title="Permanent link">&para;</a></h3>
-<p>Calculate P(path ≥ strike) from simulated terminal prices. Supports strict_above for <code>&gt;</code> vs <code>&gt;=</code> semantics.</p>
+<p>Calculate P(path &gt;= strike) from simulated terminal prices. Supports strict_above for <code>&gt;</code> vs <code>&gt;=</code> semantics.</p>
 <h3 id="build_regime_jump_paramsbase_params-regime_label"><code>build_regime_jump_params(base_params, regime_label)</code><a class="headerlink" href="#build_regime_jump_paramsbase_params-regime_label" title="Permanent link">&para;</a></h3>
 <p>Apply regime-specific scaling to jump parameters for regime-conditional pricing.</p>
 <h3 id="skewed_t_rvsnu-lam-size-rng"><code>skewed_t_rvs(nu, lam, size, rng)</code><a class="headerlink" href="#skewed_t_rvsnu-lam-size-rng" title="Permanent link">&para;</a></h3>
-<p>Generate Hansen (1994) skewed-t random variates. Inverse-transform sampling from standard-t base.</p>
-<h3 id="_compute_figarch_weightsd-trunc_k100"><code>_compute_figarch_weights(d, trunc_k=100)</code><a class="headerlink" href="#_compute_figarch_weightsd-trunc_k100" title="Permanent link">&para;</a></h3>
-<p>Compute FIGARCH binomial expansion weights for long-memory variance recursion.</p>
+<p>Generate Hansen (1994) <strong>standardized</strong> skewed-t variates (mean 0, variance 1 by construction) via inverse-CDF sampling: draw U~Uniform(0,1), invert the standardized-t quantile within the left ((1-lambda)/2 mass) / right ((1+lambda)/2 mass) piece, then map with Hansen's a, b constants. lambda&lt;0 =&gt; heavier left tail (negative skew). <code>skewed_t_scale_factor()</code> returns 1.0 (the variate is already standardized; no external rescale).</p>
+<h3 id="_compute_figarch_weightsd-phi-beta-trunc_k1000"><code>_compute_figarch_weights(d, phi, beta, trunc_k=1000)</code><a class="headerlink" href="#_compute_figarch_weightsd-phi-beta-trunc_k1000" title="Permanent link">&para;</a></h3>
+<p>Compute FIGARCH(1,d,1) infinite-ARCH weights for the variance recursion. Recurrence matches the arch library: delta_1=d, lambda_1=phi-beta+d, delta_i=((i-1-d)/i)<em>delta_{i-1}, lambda_i=beta</em>lambda_{i-1}+(delta_i-phi*delta_{i-1}). Returns weights[0]=0 (no contemporaneous epsilon^2) and weights[k]=lambda_k for k&gt;=1. fit_garch_model() fits arch_model(vol='FIGARCH', p=1, q=1) jointly estimating phi, d, beta -- Bollerslev-Mikkelsen positivity satisfied natively.</p>
 <h2 id="feature-flags">Feature Flags<a class="headerlink" href="#feature-flags" title="Permanent link">&para;</a></h2>
 <table>
 <thead>
@@ -3139,13 +3139,19 @@
 <td><code>use_naive_prior</code></td>
 <td><code>True</code></td>
 <td>1.1</td>
-<td>Enforce μ=0 in GARCH</td>
+<td>Enforce mu=0 in GARCH</td>
+</tr>
+<tr>
+<td><code>martingale_anchor</code></td>
+<td><code>False</code></td>
+<td>--</td>
+<td>Use exponential-cumulant jump compensator. Corrects the JUMP compensator only -- the diffusion Jensen term is NOT subtracted, so E[S_T]=S0 does NOT hold exactly (Student-t exponential moments are finite only due to the per-step return clip). Default False keeps the legacy log-mean compensator (log-mean anchored, E[log S_T] = log S0); flip only with calibration re-baseline.</td>
 </tr>
 <tr>
 <td><code>use_svcj</code></td>
 <td><code>False</code></td>
 <td>1.3</td>
-<td>Correlated volatility jumps</td>
+<td>Correlated volatility jumps (Eraker 2004: return + variance jump on the same Poisson count)</td>
 </tr>
 <tr>
 <td><code>use_skewed_t</code></td>
@@ -3157,7 +3163,7 @@
 <td><code>use_figarch</code></td>
 <td><code>False</code></td>
 <td>2.5</td>
-<td>FIGARCH long-memory variance</td>
+<td>FIGARCH(1,d,1) long-memory variance</td>
 </tr>
 <tr>
 <td><code>use_regime_switching</code></td>
@@ -3185,23 +3191,23 @@
 <tbody>
 <tr>
 <td>T &gt; 90 days</td>
-<td>Naive prior only (μ=0, GARCH+t, no jumps)</td>
+<td>Naive prior (mu=0, GARCH+t); Kou return jumps retained, SVCJ/skew/FIGARCH/regime/XGB disabled</td>
 </tr>
 <tr>
-<td>30 &lt; T ≤ 90 days</td>
+<td>30 &lt; T &lt;= 90 days</td>
 <td>Naive prior + simplified (Kou jumps, no SVCJ/FIGARCH/skewed-t)</td>
 </tr>
 <tr>
-<td>7 &lt; T ≤ 30 days</td>
+<td>7 &lt; T &lt;= 30 days</td>
 <td>Intermediate (all features except skewed-t)</td>
 </tr>
 <tr>
-<td>T ≤ 7 days</td>
+<td>T &lt;= 7 days</td>
 <td>Full model (SVCJ, skewed-t, FIGARCH all enabled)</td>
 </tr>
 </tbody>
 </table>
-<p>Horizon gating is <strong>automatic</strong> — it overrides feature flags for medium/long horizons.</p>
+<p>Horizon gating is <strong>automatic</strong> -- it overrides feature flags for medium/long horizons.</p>
 <h2 id="key-parameters">Key Parameters<a class="headerlink" href="#key-parameters" title="Permanent link">&para;</a></h2>
 <table>
 <thead>

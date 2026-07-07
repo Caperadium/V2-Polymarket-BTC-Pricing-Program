@@ -3336,7 +3336,7 @@
 <p>The V2 BTC Contract Pricing system automates the full lifecycle of trading Bitcoin binary options on Polymarket:</p>
 <div class="highlight"><pre><span></span><code>┌──────────────────┐    ┌──────────────────────┐    ┌─────────────────┐
 │   Data Layer     │───▶│   Pricing Engine v2  │───▶│  Curve Fitting  │
-│ (BTC + Macro)    │    │ (GARCH+SVCJ+FIGARCH) │    │   (Logistic)    │
+│ (BTC + Macro)    │    │ (GARCH+SVCJ+FIGARCH(1,d,1)) │    │   (Logistic)    │
 └──────────────────┘    └──────────┬───────────┘    └────────┬────────┘
                                    │                         │
                     ┌──────────────┼──────────────┐          │
@@ -3390,7 +3390,7 @@
 <tbody>
 <tr>
 <td><code>btc_pricing_engine.py</code></td>
-<td>GARCH+SVCJ+Skewed-t+FIGARCH Monte Carlo simulator (v2, hourly)</td>
+<td>GARCH+SVCJ+Skewed-t+FIGARCH(1,d,1) Monte Carlo simulator (v2, hourly)</td>
 <td>0–2.6</td>
 </tr>
 <tr>
@@ -3413,6 +3413,16 @@
 <td>XGBoost classifier for P(up) modifier</td>
 <td>2.3</td>
 </tr>
+<tr>
+<td><code>engine_config.py</code></td>
+<td><code>build_engine_kwargs()</code> -- single source of truth for the v2 engine flag bundle (backrunner + live pipelines)</td>
+<td>--</td>
+</tr>
+<tr>
+<td><code>bayesian_estimation.py</code></td>
+<td>Bayesian posteriors for GARCH (MH sampler) + jump params (conjugate); credible bands for P(S_T &gt; K)</td>
+<td>3.2</td>
+</tr>
 </tbody>
 </table>
 <h3 id="3-validation-layer-corevalidation">3. Validation Layer (<code>core/validation/</code>)<a class="headerlink" href="#3-validation-layer-corevalidation" title="Permanent link">&para;</a></h3>
@@ -3431,6 +3441,10 @@
 <tr>
 <td><code>calibration_metrics.py</code></td>
 <td>Brier score, Expected Calibration Error (ECE), reliability diagrams</td>
+</tr>
+<tr>
+<td><code>rolling_evaluator.py</code></td>
+<td>Rolling-window re-fit + forecast evaluation: Brier (model vs naive Gaussian) + Basel VaR exceedances per (window, horizon)</td>
 </tr>
 </tbody>
 </table>
@@ -3658,7 +3672,7 @@
 </tr>
 <tr>
 <td>2.5</td>
-<td>FIGARCH long memory</td>
+<td>FIGARCH(1,d,1) long memory</td>
 <td><code>use_figarch</code></td>
 <td>Opt-in</td>
 </tr>

@@ -46,6 +46,13 @@ class JumpCalibrationResult:
     rho_J: float        # Return-vol jump correlation
     lam_v: float        # Vol jump intensity (can differ from return lam; default = lam)
 
+    # FIX 4 (M1): Eraker (2004) regression SLOPE (return per unit variance jump),
+    # distinct from rho_J (a Pearson correlation, dimensionless). Default 0.0 =
+    # term off (old effective behavior -- rho_J was previously misused as a slope
+    # in simulate_paths, which made the term ~5 orders of magnitude too small to
+    # matter). See _estimate_vol_jump_params for the OLS estimate.
+    rho_j_slope: float = 0.0
+
     # Diagnostics
     n_jumps_detected: int = 0
     n_obs: int = 0
@@ -88,7 +95,8 @@ def detect_jumps_bipower(
     returns: np.ndarray,
     significance: float = 0.01,
     window: int = 78,
-) -> np.ndarray:
+    return_sigma: bool = False,
+):
     """
     Detect jumps using the Lee & Mykland (2008) local bipower test.
 
@@ -109,24 +117,44 @@ def detect_jumps_bipower(
     with c=√(2/π), C_n=(2 ln n)^{1/2}/c − (ln π + ln ln n)/(2c(2 ln n)^{1/2}),
     S_n = 1/(c (2 ln n)^{1/2}).
 
+    FIX 2 (M3): sigma_hat_t must use products up to |r_{t-2}||r_{t-1}| only
+    (LM's window ends at t-1) -- a plain `.shift(1)` on one side of the product
+    still leaves |r_{t-1}|*|r_t| as the last term, which contains the
+    contemporaneous return being tested. A genuine jump at t then inflates its
+    own threshold. The extra `.shift(1)` on the whole product series removes
+    that term.
+
     Args:
         returns: Array of log returns.
-        significance: Test level β (default 0.01).
+        significance: Test level beta (default 0.01).
         window: Trailing window K (bars) for the local bipower vol estimate.
+            K=78 is the LM guidance for 5-minute bars; the appropriate K for
+            hourly bars is untested -- kept at 78 for calibration continuity
+            (downstream calibrations depend on this default), not because it is
+            known optimal for this sampling frequency.
+        return_sigma: If True, also return the local bipower sigma array (after
+            the median backfill) used for the test. Default False (old
+            single-value return) for backward compatibility.
 
     Returns:
-        Boolean jump_mask aligned to *returns*.
+        Boolean jump_mask aligned to *returns* (default), or
+        (jump_mask, sigma_local) when return_sigma=True.
     """
     n = len(returns)
     if n < window + 2:
-        return np.zeros(n, dtype=bool)
+        empty_mask = np.zeros(n, dtype=bool)
+        if return_sigma:
+            return empty_mask, np.full(n, np.nan)
+        return empty_mask
 
     abs_ret = np.abs(returns)
     # Local jump-robust (bipower) variance: trailing mean of |r_{t-1}|*|r_t|,
-    # scaled by π/2. Shift(1) so σ̂_t excludes the contemporaneous return (a jump
-    # at t must not inflate its own threshold).
+    # scaled by pi/2, with the WHOLE product series shifted by one more bar so
+    # sigma_hat_t at time t uses only products up to |r_{t-2}||r_{t-1}| (window
+    # ends at t-1, per Lee & Mykland 2008) -- the contemporaneous return r_t
+    # never enters its own threshold (FIX 2 / M3).
     s = pd.Series(abs_ret)
-    bpv_local = (np.pi / 2.0) * (s.shift(1) * s).rolling(
+    bpv_local = (np.pi / 2.0) * (s.shift(1) * s).shift(1).rolling(
         window, min_periods=max(10, window // 3)
     ).mean()
     sigma_local = np.sqrt(bpv_local.to_numpy())
@@ -135,7 +163,10 @@ def detect_jumps_bipower(
     med = np.nanmedian(sigma_local)
     sigma_local = np.where(np.isfinite(sigma_local) & (sigma_local > 0), sigma_local, med)
     if not np.isfinite(med) or med <= 0:
-        return np.zeros(n, dtype=bool)
+        empty_mask = np.zeros(n, dtype=bool)
+        if return_sigma:
+            return empty_mask, sigma_local
+        return empty_mask
 
     L = abs_ret / sigma_local
 
@@ -147,7 +178,10 @@ def detect_jumps_bipower(
     gumbel_q = -np.log(-np.log(1.0 - significance))
 
     jump_mask = (L - C_n) / S_n > gumbel_q
-    return np.asarray(jump_mask, dtype=bool)
+    jump_mask = np.asarray(jump_mask, dtype=bool)
+    if return_sigma:
+        return jump_mask, sigma_local
+    return jump_mask
 
 
 # ---------------------------------------------------------------------------
@@ -166,7 +200,7 @@ def fit_kou_params(
         method: "mle" or "moments".
 
     Returns:
-        (p_crash, eta_up, eta_down, annual_lambda)
+        (p_crash, eta_up, eta_down, n_jumps_total)
     """
     if len(jump_returns) < 10:
         logger.warning("Too few detected jumps for reliable Kou fit; using literature defaults")
@@ -190,6 +224,133 @@ def fit_kou_params(
 
     # Lambda: jumps per year = (n_jumps / n_total_obs) * hours_per_year
     return p_crash, eta_up, eta_down, n_total
+
+
+# ---------------------------------------------------------------------------
+# SVCJ Volatility-Jump Estimation (shared by calibrate_jumps and
+# calibrate_regime_jumps -- FIX 3 / M2)
+# ---------------------------------------------------------------------------
+
+def _estimate_vol_jump_params(
+    returns: np.ndarray,
+    jump_mask: np.ndarray,
+    jump_returns: np.ndarray,
+    window: int = 24,
+    sigma_local: Optional[np.ndarray] = None,
+) -> Tuple[float, float, float, int]:
+    """
+    Estimate SVCJ volatility-jump parameters (mu_v, rho_J, rho_j_slope) from a
+    jump mask and the returns at jump times.
+
+    FIX 3 (M2): the trailing rolling-variance INPUT has each jump bar's squared
+    return replaced with the LOCAL diffusion variance at that bar (sigma_local**2
+    when available, else the median non-jump squared return) before the rolling
+    mean is taken. Without this, the post-jump window (which contains the jump
+    bar itself) is mechanically inflated by ~J^2/window regardless of whether
+    true diffusion volatility moved at all -- the confound this fix removes.
+
+    Args:
+        returns: Full array of log returns (same array the jump_mask indexes).
+        jump_mask: Boolean array aligned to returns, True at detected jump bars.
+        jump_returns: returns[jump_mask] (passed separately since callers
+            already compute it for the Kou fit).
+        window: Rolling window (bars) for the variance estimate. Default 24 (1
+            day of hourly bars) -- unchanged from the pre-fix behavior.
+        sigma_local: Optional local bipower sigma array (from
+            detect_jumps_bipower(..., return_sigma=True)), same length as
+            returns. When None, jump bars are replaced with the median non-jump
+            squared return instead (coarser, but still removes the J^2 term).
+
+    Returns:
+        (mu_v, rho_J_corr, rho_j_slope, n_events_used)
+
+        mu_v: Censored-at-zero mean vol jump (hourly variance units), i.e.
+            mean(max(delta_var, 0)) over ALL jump events (zeros included), then
+            clipped to [1e-6, 1e-3]. This is the MLE mean of an exponential
+            censored at zero and is conservative (biased LOW) versus the old
+            selective mean of positive deltas only (biased HIGH -- an upward
+            selection bias on top of the J^2 confound).
+        rho_J_corr: Pearson correlation between jump return and delta-variance
+            truncated at zero (same convention as the pre-fix code) -- reporting
+            / diagnostics only, NOT used as a slope downstream.
+        rho_j_slope: OLS slope of jump_return on delta_var (delta_var NOT
+            truncated at zero here -- the slope needs the untruncated sign),
+            i.e. cov(jump_ret, dv) / var(dv). Sanity-capped so
+            |rho_j_slope| * mu_v <= 0.5 * mean(|jump_returns|) (prevents a noisy
+            slope from dominating jump sizes downstream). 0.0 if var(dv) == 0 or
+            fewer than 10 usable jump events.
+        n_events_used: Number of jump events with a valid pre/post window.
+    """
+    returns = np.asarray(returns)
+    jump_mask = np.asarray(jump_mask, dtype=bool)
+    sq = returns ** 2
+
+    if sigma_local is not None and len(sigma_local) == len(returns):
+        sigma_local = np.asarray(sigma_local)
+        valid_sigma = np.isfinite(sigma_local) & (sigma_local > 0)
+        replace_mask = jump_mask & valid_sigma
+        sq = sq.copy()
+        sq[replace_mask] = sigma_local[replace_mask] ** 2
+    else:
+        non_jump_sq = sq[~jump_mask]
+        fallback = np.median(non_jump_sq) if len(non_jump_sq) > 0 else np.median(sq)
+        sq = sq.copy()
+        sq[jump_mask] = fallback
+
+    rolling_var = pd.Series(sq).rolling(window, min_periods=4).mean().to_numpy()
+
+    # Preserve the existing +2/-2 pre/post index offsets (window geometry is not
+    # part of this fix; the jump-square replacement and censored mean are).
+    jump_indices = np.where(jump_mask)[0]
+    deltas = []        # untruncated delta_var, for the slope
+    jrets_for_slope = []
+    corr_deltas = []   # truncated-at-zero delta_var, for the correlation (as before)
+    corr_rets = []
+
+    for j_idx, full_idx in enumerate(jump_indices):
+        if full_idx >= 2 and full_idx < len(rolling_var) - 1 and j_idx < len(jump_returns):
+            pre_var = np.nan_to_num(rolling_var[max(0, full_idx - 2)], nan=0.0)
+            post_var = np.nan_to_num(rolling_var[min(len(rolling_var) - 1, full_idx + 2)], nan=0.0)
+            delta_var = post_var - pre_var
+            deltas.append(delta_var)
+            jrets_for_slope.append(jump_returns[j_idx])
+            corr_deltas.append(delta_var if delta_var > 0 else 0.0)
+            corr_rets.append(jump_returns[j_idx])
+
+    n_events_used = len(deltas)
+    deltas_arr = np.array(deltas)
+    jrets_arr = np.array(jrets_for_slope)
+
+    # mu_v: censored-at-zero mean over ALL events (zeros included).
+    if n_events_used > 0:
+        mu_v = float(np.clip(np.mean(np.maximum(deltas_arr, 0.0)), 0.000001, 0.001))
+    else:
+        mu_v = 0.000025  # Teng estimate (hourly)
+
+    # rho_J_corr: Pearson correlation, truncated-at-zero delta (unchanged convention).
+    if len(corr_deltas) > 10:
+        corr_returns_arr = np.array(corr_rets)
+        corr_vols_arr = np.array(corr_deltas)
+        if np.std(corr_returns_arr) > 0 and np.std(corr_vols_arr) > 0:
+            rho_J_corr = float(np.clip(np.corrcoef(corr_returns_arr, corr_vols_arr)[0, 1], -0.5, 0.5))
+        else:
+            rho_J_corr = -0.08
+    else:
+        rho_J_corr = -0.08
+
+    # rho_j_slope: OLS slope of jump_return on (untruncated) delta_var.
+    rho_j_slope = 0.0
+    if n_events_used >= 10:
+        var_dv = np.var(deltas_arr)
+        if var_dv > 0:
+            slope = float(np.cov(jrets_arr, deltas_arr, bias=True)[0, 1] / var_dv)
+            mean_abs_jret = float(np.mean(np.abs(jrets_arr)))
+            if mean_abs_jret > 0 and mu_v > 0:
+                cap = 0.5 * mean_abs_jret / mu_v
+                slope = float(np.clip(slope, -cap, cap))
+            rho_j_slope = slope
+
+    return mu_v, rho_J_corr, rho_j_slope, n_events_used
 
 
 def calibrate_jumps(
@@ -224,9 +385,12 @@ def calibrate_jumps(
 
     n_obs = len(returns)
 
-    # Detect jumps
+    # Detect jumps. FIX 3 (M2) item 8: bipower detection must request sigma_local
+    # so _estimate_vol_jump_params below gets the real local diffusion variance
+    # instead of always falling back to the coarser median-replacement path.
+    sigma_local = None
     if detection_method == "bipower":
-        jump_mask = detect_jumps_bipower(returns)
+        jump_mask, sigma_local = detect_jumps_bipower(returns, return_sigma=True)
         jump_threshold = 0.0
     else:
         jump_mask, jump_threshold = detect_jumps_mad(returns, mad_multiplier)
@@ -246,58 +410,15 @@ def calibrate_jumps(
 
     # Fit Kou parameters
     jump_returns = returns[jump_mask]
-    p_crash, eta_up, eta_down, n_jumps_for_lambda = fit_kou_params(jump_returns, method="mle")
+    p_crash, eta_up, eta_down, n_jumps_total = fit_kou_params(jump_returns, method="mle")
 
     # Annual lambda: (n_jumps / n_obs) * hours_per_year
     lam = (n_jumps / n_obs) * hours_per_year
 
-    # --- SVCJ Vol Jump Calibration ---
-    # Estimate realized variance changes around jump events
-    # For each detected jump day, compute variance before/after jump
-    squared_returns = returns ** 2
-
-    # Rolling variance (1h = 1 observation)
-    window = 24  # 24h = 1 day
-    rolling_var = pd.Series(squared_returns).rolling(window, min_periods=4).mean().values
-
-    # Vol jump = difference in variance at jump times vs pre-jump
-    vol_changes = []
-    vol_jump_corr_data = []
-    jump_indices = np.where(jump_mask)[0]
-    n_jumps = len(jump_indices)
-
-    for j_idx, full_idx in enumerate(jump_indices):
-        if full_idx >= 2 and full_idx < len(rolling_var) - 1 and j_idx < len(jump_returns):
-            pre_var = np.nan_to_num(rolling_var[max(0, full_idx - 2)], nan=0.0)
-            post_var = np.nan_to_num(rolling_var[min(len(rolling_var) - 1, full_idx + 2)], nan=0.0)
-            delta_var = max(0.0, post_var - pre_var)
-            vol_changes.append(delta_var)
-            vol_jump_corr_data.append((jump_returns[j_idx], delta_var if delta_var > 0 else 0))
-
-    # Estimate mu_v: mean of positive vol changes at jump times (hourly variance units)
-    vol_changes_arr = np.array(vol_changes)
-    positive_vol_changes = vol_changes_arr[vol_changes_arr > 0]
-
-    if len(positive_vol_changes) > 5:
-        # Fit exponential distribution to positive vol changes
-        mu_v = np.mean(positive_vol_changes)
-        # Cap at reasonable values
-        mu_v = np.clip(mu_v, 0.000001, 0.001)
-    else:
-        mu_v = 0.000025  # Teng estimate (hourly)
-
-    # Estimate rho_J: correlation between return jumps and vol jumps
-    if len(vol_jump_corr_data) > 10:
-        corr_returns = np.array([v[0] for v in vol_jump_corr_data])
-        corr_vols = np.array([v[1] for v in vol_jump_corr_data])
-        if np.std(corr_returns) > 0 and np.std(corr_vols) > 0:
-            rho_J = np.corrcoef(corr_returns, corr_vols)[0, 1]
-            # Clamp to reasonable range
-            rho_J = np.clip(rho_J, -0.5, 0.5)
-        else:
-            rho_J = -0.08  # Teng estimate
-    else:
-        rho_J = -0.08
+    # --- SVCJ Vol Jump Calibration (FIX 3 / M2: shared helper) ---
+    mu_v, rho_J, rho_j_slope, n_vol_events = _estimate_vol_jump_params(
+        returns, jump_mask, jump_returns, window=24, sigma_local=sigma_local,
+    )
 
     # Handle extremes for eta parameters
     eta_up = np.clip(eta_up, 5.0, 200.0)
@@ -307,12 +428,13 @@ def calibrate_jumps(
     logger.info(
         f"Calibrated jumps: lam={lam:.1f}/yr, p_crash={p_crash:.3f}, "
         f"eta_up={eta_up:.1f}, eta_down={eta_down:.1f}, "
-        f"mu_v={mu_v:.6f}, rho_J={rho_J:.3f}"
+        f"mu_v={mu_v:.6f}, rho_J={rho_J:.3f}, rho_j_slope={rho_j_slope:.4f} "
+        f"({n_vol_events} vol-jump events)"
     )
 
     return JumpCalibrationResult(
         lam=lam, p_crash=p_crash, eta_up=eta_up, eta_down=eta_down,
-        mu_v=mu_v, rho_J=rho_J, lam_v=lam,
+        mu_v=mu_v, rho_J=rho_J, lam_v=lam, rho_j_slope=rho_j_slope,
         n_jumps_detected=n_jumps, n_obs=n_obs,
         jump_threshold=jump_threshold, fit_converged=True,
     )
@@ -335,6 +457,7 @@ class RegimeJumpResult:
     n_jumps: int
     n_obs_in_regime: int
     jump_pct: float       # % of regime observations that are jumps
+    rho_j_slope: float = 0.0  # FIX 4 (M1): regression slope, see JumpCalibrationResult
 
 
 def calibrate_regime_jumps(
@@ -402,6 +525,15 @@ def calibrate_regime_jumps(
 
     # Map HMM state index -> regime name via state_order
     # state_order = [bear_idx, sideways_idx, bull_idx] → position = regime
+    # NOTE (T6/H3): this is pure RANK mapping and does NOT apply the
+    # threshold-aware demotion in RegimeDetector._label_states (e.g. a
+    # low-but-still-positive-drift state in a strong bull market keeps being
+    # called "bear" here). `detector._labels.state_labels` is the
+    # authoritative, demotion-aware per-state mapping used by fit()/
+    # predict_weights()/get_regime_variance_scales(); this function is not on
+    # the live pipeline path today (regime_calibrated=None everywhere in
+    # build_regime_jump_params callers), so it is left as rank-only rather
+    # than risk changing behavior for a currently-unused code path.
     state_order = detector._labels.state_order
     hmm_state_to_regime = {}
     for regime_pos, hmm_state in enumerate(state_order):
@@ -447,9 +579,12 @@ def calibrate_regime_jumps(
             results[regime] = None
             continue
 
-        # Detect jumps within this regime
+        # Detect jumps within this regime. FIX 3 (M2): request sigma_local on the
+        # bipower path so _estimate_vol_jump_params gets the real local diffusion
+        # variance (same treatment as calibrate_jumps).
+        regime_sigma_local = None
         if detection_method == "bipower":
-            jump_mask = detect_jumps_bipower(regime_returns)
+            jump_mask, regime_sigma_local = detect_jumps_bipower(regime_returns, return_sigma=True)
         else:
             jump_mask, threshold = detect_jumps_mad(regime_returns, mad_multiplier)
 
@@ -476,38 +611,13 @@ def calibrate_regime_jumps(
         hours_per_year = 365 * 24
         lam = (n_jumps / n_regime) * hours_per_year
 
-        # Estimate mu_v: mean positive vol change around regime-specific jumps
-        squared_returns = regime_returns ** 2
-        window = 24
-        rolling_var = pd.Series(squared_returns).rolling(window, min_periods=4).mean().values
-        jump_indices = np.where(jump_mask)[0]
-
-        vol_changes = []
-        vol_jump_corr_data = []
-        for j_idx, full_idx in enumerate(jump_indices):
-            if full_idx >= 2 and full_idx < len(rolling_var) - 1 and j_idx < len(jump_returns):
-                pre_var = np.nan_to_num(rolling_var[max(0, full_idx - 2)], nan=0.0)
-                post_var = np.nan_to_num(rolling_var[min(len(rolling_var) - 1, full_idx + 2)], nan=0.0)
-                delta_var = max(0.0, post_var - pre_var)
-                vol_changes.append(delta_var)
-                vol_jump_corr_data.append((jump_returns[j_idx], delta_var if delta_var > 0 else 0))
-
-        vol_changes_arr = np.array(vol_changes)
-        positive_vol_changes = vol_changes_arr[vol_changes_arr > 0]
-        if len(positive_vol_changes) > 5:
-            mu_v = np.clip(np.mean(positive_vol_changes), 0.000001, 0.001)
-        else:
-            mu_v = 0.000025
-
-        if len(vol_jump_corr_data) > 10:
-            corr_returns = np.array([v[0] for v in vol_jump_corr_data])
-            corr_vols = np.array([v[1] for v in vol_jump_corr_data])
-            if np.std(corr_returns) > 0 and np.std(corr_vols) > 0:
-                rho_J = np.clip(np.corrcoef(corr_returns, corr_vols)[0, 1], -0.5, 0.5)
-            else:
-                rho_J = -0.08
-        else:
-            rho_J = -0.08
+        # Estimate SVCJ vol-jump params around regime-specific jumps (FIX 3 / M2:
+        # shared helper -- same jump-square replacement + censored mean as the
+        # base calibration).
+        mu_v, rho_J, rho_j_slope, n_vol_events = _estimate_vol_jump_params(
+            regime_returns, jump_mask, jump_returns, window=24,
+            sigma_local=regime_sigma_local,
+        )
 
         # Clamp extremes
         eta_up = np.clip(eta_up, 5.0, 200.0)
@@ -522,6 +632,7 @@ def calibrate_regime_jumps(
             eta_down=eta_down,
             mu_v=mu_v,
             rho_J=rho_J,
+            rho_j_slope=rho_j_slope,
             n_jumps=n_jumps,
             n_obs_in_regime=n_regime,
             jump_pct=100 * n_jumps / n_regime,
@@ -529,8 +640,10 @@ def calibrate_regime_jumps(
 
         logger.info(
             "Regime '%s' calibrated: lam=%.1f/yr, p_crash=%.3f, "
-            "eta_up=%.1f, eta_down=%.1f, mu_v=%.6f, rho_J=%.3f (%d jumps)",
-            regime, lam, p_crash, eta_up, eta_down, mu_v, rho_J, n_jumps,
+            "eta_up=%.1f, eta_down=%.1f, mu_v=%.6f, rho_J=%.3f, "
+            "rho_j_slope=%.4f (%d jumps, %d vol-jump events)",
+            regime, lam, p_crash, eta_up, eta_down, mu_v, rho_J, rho_j_slope,
+            n_jumps, n_vol_events,
         )
 
     return results

@@ -3038,6 +3038,12 @@ python<span class="w"> </span>core/pricing/regime_detector.py<span class="w"> </
 <span class="c1"># Basel backtest (runs multi-horizon VaR on historical data)</span>
 python<span class="w"> </span>core/validation/basel_backtest.py<span class="w"> </span>--input<span class="w"> </span>DATA/btc_hourly.csv
 
+<span class="c1"># Rolling-window evaluation (Brier vs naive baseline + VaR exceedances)</span>
+python<span class="w"> </span>core/validation/rolling_evaluator.py<span class="w"> </span>--window-days<span class="w"> </span><span class="m">90</span><span class="w"> </span>--step-days<span class="w"> </span><span class="m">7</span><span class="w"> </span>--horizons<span class="w"> </span><span class="m">1</span>,14,28<span class="w"> </span>--max-windows<span class="w"> </span><span class="m">40</span>
+
+<span class="c1"># Bayesian posterior estimation (GARCH MH sampler + conjugate jump posteriors)</span>
+python<span class="w"> </span>core/pricing/bayesian_estimation.py<span class="w"> </span>--strikes<span class="w"> </span><span class="m">90000</span>,100000<span class="w"> </span>--hours<span class="w"> </span><span class="m">336</span><span class="w"> </span>--n-posterior<span class="w"> </span><span class="m">50</span>
+
 <span class="c1"># Macro fetcher (downloads to DATA/macro_daily.csv)</span>
 python<span class="w"> </span>core/data/macro_fetcher.py<span class="w"> </span>--period<span class="w"> </span>5y
 

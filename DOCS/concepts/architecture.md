@@ -46,6 +46,8 @@ BTC data flows into the pricing engine. Macro data feeds the regime detector and
 | `jump_calibration.py` | MAD-based Kou jump parameter estimation + SVCJ vol jump params | 0.5 |
 | `regime_detector.py` | 3-state HMM regime detection (bear/sideways/bull) | 1.2 |
 | `directional_xgb.py` | XGBoost classifier for P(up) modifier | 2.3 |
+| `engine_config.py` | `build_engine_kwargs()` -- single source of truth for the v2 engine flag bundle (backrunner + live pipelines) | -- |
+| `bayesian_estimation.py` | Bayesian posteriors for GARCH (MH sampler) + jump params (conjugate); credible bands for P(S_T > K) | 3.2 |
 
 ### 3. Validation Layer (`core/validation/`)
 
@@ -53,6 +55,7 @@ BTC data flows into the pricing engine. Macro data feeds the regime detector and
 |------|---------|
 | `basel_backtest.py` | Kupiec POF traffic light VaR backtest + expected shortfall (Acerbi-Szekely) |
 | `calibration_metrics.py` | Brier score, Expected Calibration Error (ECE), reliability diagrams |
+| `rolling_evaluator.py` | Rolling-window re-fit + forecast evaluation: Brier (model vs naive Gaussian) + Basel VaR exceedances per (window, horizon) |
 
 Validates model adequacy across multiple horizons and confidence levels using regulatory-standard tests and calibration diagnostics.
 

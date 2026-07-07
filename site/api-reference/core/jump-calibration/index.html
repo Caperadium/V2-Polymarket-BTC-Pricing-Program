@@ -1542,10 +1542,10 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
-  <a href="#calibrate_jumpshourly_csv-returnsnone-detection_methodmad-mad_multiplier30-hours_per_year8760" class="md-nav__link">
+  <a href="#calibrate_jumpshourly_csv-returnsnone-detection_methodbipower-mad_multiplier30-hours_per_year8760" class="md-nav__link">
     <span class="md-ellipsis">
       
-        calibrate_jumps(hourly_csv, returns=None, detection_method="MAD", mad_multiplier=3.0, hours_per_year=8760)
+        calibrate_jumps(hourly_csv, returns=None, detection_method="bipower", mad_multiplier=3.0, hours_per_year=8760)
       
     </span>
   </a>
@@ -1564,10 +1564,10 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#detect_jumps_bipowerreturns-significance001" class="md-nav__link">
+  <a href="#detect_jumps_bipowerreturns-significance001-window78-return_sigmafalse" class="md-nav__link">
     <span class="md-ellipsis">
       
-        detect_jumps_bipower(returns, significance=0.01)
+        detect_jumps_bipower(returns, significance=0.01, window=78, return_sigma=False)
       
     </span>
   </a>
@@ -2912,10 +2912,10 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
-  <a href="#calibrate_jumpshourly_csv-returnsnone-detection_methodmad-mad_multiplier30-hours_per_year8760" class="md-nav__link">
+  <a href="#calibrate_jumpshourly_csv-returnsnone-detection_methodbipower-mad_multiplier30-hours_per_year8760" class="md-nav__link">
     <span class="md-ellipsis">
       
-        calibrate_jumps(hourly_csv, returns=None, detection_method="MAD", mad_multiplier=3.0, hours_per_year=8760)
+        calibrate_jumps(hourly_csv, returns=None, detection_method="bipower", mad_multiplier=3.0, hours_per_year=8760)
       
     </span>
   </a>
@@ -2934,10 +2934,10 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#detect_jumps_bipowerreturns-significance001" class="md-nav__link">
+  <a href="#detect_jumps_bipowerreturns-significance001-window78-return_sigmafalse" class="md-nav__link">
     <span class="md-ellipsis">
       
-        detect_jumps_bipower(returns, significance=0.01)
+        detect_jumps_bipower(returns, significance=0.01, window=78, return_sigma=False)
       
     </span>
   </a>
@@ -3009,15 +3009,15 @@
 <p><code>core/pricing/jump_calibration.py</code></p>
 <p>Historical jump calibration from threshold exceedances on BTC hourly returns. Estimates Kou double-exponential parameters and SVCJ volatility jump parameters without MCMC.</p>
 <h2 id="functions">Functions<a class="headerlink" href="#functions" title="Permanent link">&para;</a></h2>
-<h3 id="calibrate_jumpshourly_csv-returnsnone-detection_methodmad-mad_multiplier30-hours_per_year8760"><code>calibrate_jumps(hourly_csv, returns=None, detection_method="MAD", mad_multiplier=3.0, hours_per_year=8760)</code><a class="headerlink" href="#calibrate_jumpshourly_csv-returnsnone-detection_methodmad-mad_multiplier30-hours_per_year8760" title="Permanent link">&para;</a></h3>
-<p>End-to-end calibration pipeline. Detects jumps → fits Kou MLE → estimates SVCJ vol jump params.</p>
+<h3 id="calibrate_jumpshourly_csv-returnsnone-detection_methodbipower-mad_multiplier30-hours_per_year8760"><code>calibrate_jumps(hourly_csv, returns=None, detection_method="bipower", mad_multiplier=3.0, hours_per_year=8760)</code><a class="headerlink" href="#calibrate_jumpshourly_csv-returnsnone-detection_methodbipower-mad_multiplier30-hours_per_year8760" title="Permanent link">&para;</a></h3>
+<p>End-to-end calibration pipeline. Detects jumps → fits Kou MLE → estimates SVCJ vol jump params (via the shared <code>_estimate_vol_jump_params</code> helper).</p>
 <p><strong>Returns</strong>: <code>JumpCalibrationResult</code></p>
 <h3 id="detect_jumps_madreturns-mad_multiplier30"><code>detect_jumps_mad(returns, mad_multiplier=3.0)</code><a class="headerlink" href="#detect_jumps_madreturns-mad_multiplier30" title="Permanent link">&para;</a></h3>
 <p>MAD-based jump detection. Returns <code>(jump_mask, threshold)</code>.</p>
-<h3 id="detect_jumps_bipowerreturns-significance001"><code>detect_jumps_bipower(returns, significance=0.01)</code><a class="headerlink" href="#detect_jumps_bipowerreturns-significance001" title="Permanent link">&para;</a></h3>
-<p>Bipower variation jump detection. Returns <code>jump_mask</code>.</p>
+<h3 id="detect_jumps_bipowerreturns-significance001-window78-return_sigmafalse"><code>detect_jumps_bipower(returns, significance=0.01, window=78, return_sigma=False)</code><a class="headerlink" href="#detect_jumps_bipowerreturns-significance001-window78-return_sigmafalse" title="Permanent link">&para;</a></h3>
+<p>Lee-Mykland (2008) local bipower jump detection. The local sigma window ends at t-1 (the contemporaneous return is excluded, so a jump cannot inflate its own detection threshold). Returns <code>jump_mask</code>, or <code>(jump_mask, sigma_local)</code> when <code>return_sigma=True</code>.</p>
 <h3 id="fit_kou_paramsjump_returns-methodmle"><code>fit_kou_params(jump_returns, method="mle")</code><a class="headerlink" href="#fit_kou_paramsjump_returns-methodmle" title="Permanent link">&para;</a></h3>
-<p>MLE fit of Kou parameters. Returns <code>(p_crash, eta_up, eta_down, n_jumps)</code>.</p>
+<p>MLE fit of Kou parameters. Returns <code>(p_crash, eta_up, eta_down, n_jumps_total)</code> -- the 4th element is a jump COUNT, not an annual lambda (callers annualize it themselves).</p>
 <h2 id="classes">Classes<a class="headerlink" href="#classes" title="Permanent link">&para;</a></h2>
 <h3 id="jumpcalibrationresult"><code>JumpCalibrationResult</code><a class="headerlink" href="#jumpcalibrationresult" title="Permanent link">&para;</a></h3>
 <table>
@@ -3052,12 +3052,17 @@
 <tr>
 <td><code>mu_v</code></td>
 <td>float</td>
-<td>Mean vol jump size (hourly variance)</td>
+<td>Mean vol jump size (hourly variance); censored-at-zero mean over ALL jump events, with jump-bar squares replaced by local diffusion variance in the rolling-variance input</td>
 </tr>
 <tr>
 <td><code>rho_J</code></td>
 <td>float</td>
-<td>Return-vol jump correlation</td>
+<td>Return-vol jump Pearson correlation (diagnostics/reporting only)</td>
+</tr>
+<tr>
+<td><code>rho_j_slope</code></td>
+<td>float</td>
+<td>OLS slope of jump return on vol-jump delta (return per unit variance jump, sanity-capped; default 0.0 = term off). Used by the SVCJ return-jump adjustment in <code>simulate_paths</code></td>
 </tr>
 <tr>
 <td><code>lam_v</code></td>

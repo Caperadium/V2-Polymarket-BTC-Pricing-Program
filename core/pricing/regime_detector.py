@@ -52,25 +52,53 @@ TRAINING_WINDOW_DAYS = 730  # 2 years
 
 @dataclass
 class RegimeLabels:
-    """Labeled regime states with human-readable names."""
-    state_order: List[int]         # [bear_state_idx, sideways_state_idx, bull_state_idx]
-    state_names: List[str]         # ["bear", "sideways", "bull"]
-    state_means: List[float]       # Mean daily return per state
+    """Labeled regime states with human-readable names.
+
+    T6 (H3): rank-based fields (state_order / bear_idx / sideways_idx /
+    bull_idx / label_state()) are PRESERVED for backward compat and keep pure
+    RANK semantics (lowest-mean state is "bear_idx" etc, regardless of its
+    actual annualized mean). `state_labels` is the new THRESHOLD-AWARE
+    per-state semantic labeling (see RegimeDetector._label_states) and is the
+    authoritative mapping for weight aggregation in `fit()` /
+    `predict_weights()`. In a strong bull market the lowest-mean state can
+    still be demoted from "bear" to "sideways" in `state_labels` while
+    `bear_idx` still points at it by rank -- callers that need the demoted
+    semantics must use `state_labels`, not `bear_idx`/`label_state()`.
+    """
+    state_order: List[int]         # [bear_state_idx, sideways_state_idx, bull_state_idx] (rank order)
+    state_names: List[str]         # ["bear", "sideways", "bull"] (rank names, parallel to state_order)
+    state_means: List[float]       # Mean daily return per state, in rank order (parallel to state_order)
+    # T6 (H3): per-HMM-state semantic label (index = HMM state id, NOT rank
+    # position), after demotion rules. len == n_states. Multiple states may
+    # share a label (e.g. two states both demoted to "sideways").
+    state_labels: List[str] = field(default_factory=list)
 
     @property
     def bear_idx(self) -> int:
+        """Rank semantics: the lowest-mean state, regardless of demotion.
+        Use `state_labels` for the threshold-aware semantic label."""
         return self.state_order[0]
 
     @property
     def sideways_idx(self) -> int:
+        """Rank semantics: the middle-mean state. See `bear_idx` note."""
         return self.state_order[1]
 
     @property
     def bull_idx(self) -> int:
+        """Rank semantics: the highest-mean state. See `bear_idx` note."""
         return self.state_order[2]
 
     def label_state(self, state: int) -> str:
-        """Map HMM state integer to regime name."""
+        """Map HMM state integer to its threshold-aware semantic label.
+
+        T6 (H3): reads from `state_labels` (demotion-aware) rather than pure
+        rank, so a low-mean-but-still-positive state in a strong bull market
+        is correctly reported as "sideways", not "bear".
+        """
+        if self.state_labels and 0 <= state < len(self.state_labels):
+            return self.state_labels[state]
+        # Fallback for legacy callers / incomplete state_labels: pure rank.
         if state == self.bear_idx:
             return "bear"
         elif state == self.bull_idx:
@@ -158,13 +186,34 @@ class RegimeDetector:
         self._last_dominant: str = "sideways"
         self._last_transmat: np.ndarray = np.ones((3, 3)) / 3.0
         self._last_fit_obs: int = 0
+        # T6 (H3): full per-HMM-state posterior at the last fit (native state
+        # order, NOT aggregated by label). Needed so predict_weights() can
+        # forward-propagate through transmat_ at the state level, then
+        # re-aggregate by (possibly-shared) label -- aggregating first would
+        # lose information when two states share a label.
+        self._last_state_probs: np.ndarray = np.ones(n_states) / n_states
 
     def _label_states(
         self,
         model: hmm.GaussianHMM,
         daily_returns: np.ndarray,
     ) -> RegimeLabels:
-        """Label HMM states by annualized mean return."""
+        """Label HMM states by annualized mean return, with threshold-aware
+        demotion (T6/H3).
+
+        Provisional labels are assigned by rank (lowest mean -> "bear",
+        highest -> "bull", the rest -> "sideways"), exactly as before. Then:
+          - if the provisional bear state's annualized mean (mean_daily*365)
+            is >= self.bear_threshold, it is NOT actually bearish (e.g. a
+            low-but-positive-drift state in a strong bull market) -- relabel
+            it "sideways" so it doesn't receive bear-regime crash-heavy jump
+            multipliers (PRICING_REVIEW.md H3).
+          - symmetric for the provisional bull state and self.bull_threshold.
+        Multiple states may end up sharing "sideways" -- intended (see
+        RegimeLabels docstring). `state_order`/`state_names`/`state_means`
+        keep their original RANK semantics unchanged for backward compat;
+        `state_labels` is the new authoritative (demotion-aware) mapping.
+        """
         # Get posterior state assignments
         _, hidden_states = model.decode(daily_returns.reshape(-1, 1))
 
@@ -177,14 +226,59 @@ class RegimeDetector:
             else:
                 state_means.append(0.0)
 
-        # Sort by mean → [bear_idx, sideways_idx, bull_idx]
+        # Sort by mean -> [bear_idx, sideways_idx, bull_idx] (rank order)
         state_order = np.argsort(state_means).tolist()
+
+        # ---- Threshold-aware demotion (T6/H3) ----
+        # Provisional labels by rank position, indexed by HMM state id.
+        state_labels = [""] * model.n_components
+        for rank_pos, state_idx in enumerate(state_order):
+            if rank_pos == 0:
+                state_labels[state_idx] = "bear"
+            elif rank_pos == len(state_order) - 1:
+                state_labels[state_idx] = "bull"
+            else:
+                state_labels[state_idx] = "sideways"
+
+        bear_state_idx = state_order[0]
+        bull_state_idx = state_order[-1]
+        bear_ann_mean = state_means[bear_state_idx] * 365.0
+        bull_ann_mean = state_means[bull_state_idx] * 365.0
+
+        if bear_ann_mean >= self.bear_threshold:
+            state_labels[bear_state_idx] = "sideways"
+        if bull_ann_mean <= self.bull_threshold:
+            state_labels[bull_state_idx] = "sideways"
 
         return RegimeLabels(
             state_order=state_order,
             state_names=["bear", "sideways", "bull"],
             state_means=[state_means[i] for i in state_order],
+            state_labels=state_labels,
         )
+
+    @staticmethod
+    def _stationary_distribution(transmat: np.ndarray) -> np.ndarray:
+        """Stationary distribution of a Markov transition matrix.
+
+        Computed as the left eigenvector for eigenvalue 1 (normalized to sum
+        1). Falls back to the uniform distribution on any numerical failure
+        (e.g. a degenerate/absorbing transmat with no valid eigenvector).
+        """
+        n = transmat.shape[0]
+        try:
+            eigvals, eigvecs = np.linalg.eig(transmat.T)
+            idx = int(np.argmin(np.abs(eigvals - 1.0)))
+            vec = np.real(eigvecs[:, idx])
+            if vec.sum() < 0:
+                vec = -vec
+            vec = np.clip(vec, 0.0, None)
+            total = vec.sum()
+            if total <= 1e-12:
+                raise ValueError("degenerate stationary distribution")
+            return vec / total
+        except Exception:
+            return np.ones(n) / n
 
     def _needs_refit(self, now: datetime) -> bool:
         """Check if model needs re-estimation based on frequency."""
@@ -278,13 +372,19 @@ class RegimeDetector:
             # Fallback to stationary distribution
             last_probs = np.ones(self.n_states) / self.n_states
 
-        # Map to labeled probabilities
-        probs = {}
-        for i, (name, idx) in enumerate(zip(
-            ["bear", "sideways", "bull"],
-            self._labels.state_order,
-        )):
-            probs[name] = float(last_probs[idx])
+        # T6 (H3): keep the full per-state posterior (native state order) so
+        # predict_weights() can propagate it through transmat_ at the state
+        # level before re-aggregating by label.
+        self._last_state_probs = last_probs
+
+        # T6 (H3): SUM the posterior over all HMM states sharing a semantic
+        # label (state_labels), not a 1:1 rank->name mapping -- a demoted
+        # state (e.g. a second "sideways") must not have its posterior mass
+        # dropped.
+        probs = {"bear": 0.0, "sideways": 0.0, "bull": 0.0}
+        for state_idx in range(self.n_states):
+            label = self._labels.state_labels[state_idx]
+            probs[label] = probs.get(label, 0.0) + float(last_probs[state_idx])
 
         # Ensure sum to 1
         total = sum(probs.values())
@@ -319,6 +419,12 @@ class RegimeDetector:
         """
         Predict regime weights n_days ahead using transition matrix.
 
+        T6 (H3): propagates the full per-STATE posterior (`_last_state_probs`,
+        native HMM state order) through `transmat_^n_days_ahead`, THEN
+        aggregates by `state_labels` -- aggregating by label first (the old
+        behavior) would silently drop posterior mass whenever two states
+        share a label (see RegimeLabels docstring).
+
         Args:
             n_days_ahead: Days to forecast forward.
 
@@ -328,13 +434,7 @@ class RegimeDetector:
         if self._model is None or self._labels is None:
             return {"bear": 0.0, "sideways": 1.0, "bull": 0.0}
 
-        # Current probability vector (in model state order)
-        current = np.zeros(self.n_states)
-        for name, idx in zip(
-            ["bear", "sideways", "bull"],
-            self._labels.state_order,
-        ):
-            current[idx] = self._last_weights.get(name, 0.0)
+        current = self._last_state_probs
 
         # Step forward
         if n_days_ahead > 0:
@@ -342,14 +442,71 @@ class RegimeDetector:
         else:
             forward = current
 
-        result = {}
-        for name, idx in zip(
-            ["bear", "sideways", "bull"],
-            self._labels.state_order,
-        ):
-            result[name] = float(forward[idx])
+        result = {"bear": 0.0, "sideways": 0.0, "bull": 0.0}
+        for state_idx in range(self.n_states):
+            label = self._labels.state_labels[state_idx]
+            result[label] = result.get(label, 0.0) + float(forward[state_idx])
+
+        total = sum(result.values())
+        if total > 0:
+            result = {k: v / total for k, v in result.items()}
 
         return result
+
+    def get_regime_variance_scales(self) -> Dict[str, float]:
+        """Per-label variance scale for the regime-conditional simulation
+        (T6/H3): HMM emissions carry per-state variance information that the
+        simulator previously ignored entirely (regimes differed only through
+        jump-parameter multipliers and skew, PRICING_REVIEW.md H3 point 1).
+
+        s_label = (occupancy-weighted mean of state emission variances with
+        that label) / (occupancy-weighted pooled variance across all states).
+        Occupancy = stationary distribution of `transmat_` (see
+        `_stationary_distribution`). Clamped to [0.5, 2.0] -- a second-order
+        adjustment, not a regime-specific volatility MODEL replacement.
+
+        Returns:
+            Dict {"bear": scale, "sideways": scale, "bull": scale}. All 1.0
+            when unfitted.
+        """
+        if self._model is None or self._labels is None:
+            return {"bear": 1.0, "sideways": 1.0, "bull": 1.0}
+
+        n = self.n_states
+        occupancy = self._stationary_distribution(self._last_transmat)
+
+        # covars_ shape depends on covariance_type: 'full' on 1-D data gives
+        # (n_states, 1, 1); 'diag'/'spherical' give (n_states, 1) or
+        # (n_states,). Flatten each state's block and take its first (only)
+        # entry -- the scalar emission variance for our univariate HMM.
+        covars = np.asarray(self._model.covars_)
+        state_vars = covars.reshape(n, -1)[:, 0].astype(float)
+        state_vars = np.maximum(state_vars, 1e-12)
+
+        pooled_var = float(np.sum(occupancy * state_vars))
+        if pooled_var <= 0:
+            return {"bear": 1.0, "sideways": 1.0, "bull": 1.0}
+
+        label_var_sum: Dict[str, float] = {"bear": 0.0, "sideways": 0.0, "bull": 0.0}
+        label_occ_sum: Dict[str, float] = {"bear": 0.0, "sideways": 0.0, "bull": 0.0}
+        for state_idx in range(n):
+            label = self._labels.state_labels[state_idx]
+            w = float(occupancy[state_idx])
+            label_var_sum[label] = label_var_sum.get(label, 0.0) + w * state_vars[state_idx]
+            label_occ_sum[label] = label_occ_sum.get(label, 0.0) + w
+
+        scales: Dict[str, float] = {}
+        for label in ["bear", "sideways", "bull"]:
+            occ = label_occ_sum.get(label, 0.0)
+            if occ > 1e-12:
+                label_mean_var = label_var_sum[label] / occ
+                scale = label_mean_var / pooled_var
+            else:
+                # No state carries this label (fully demoted away) -- neutral.
+                scale = 1.0
+            scales[label] = float(np.clip(scale, 0.5, 2.0))
+
+        return scales
 
     def fit_predict(
         self,

@@ -3026,7 +3026,7 @@
 <p>Macroeconomic data feeder that downloads daily Gold, DXY, VIX, and SPX data from Yahoo Finance. Provides features for HMM regime detection (Phase 1.2) and directional XGBoost (Phase 2.3).</p>
 <p>Based on: Köse et al. (2025) — Gold-BTC correlation via TFT, Kim et al. (2025) — macro drivers post-2019, Pakstaite et al. (2025) — structural break in BTC-macro relationships.</p>
 <h2 id="why-it-matters">Why It Matters<a class="headerlink" href="#why-it-matters" title="Permanent link">&para;</a></h2>
-<p>Post-2019, BTC price behavior has become increasingly correlated with traditional macro assets. The 2020 institutional adoption wave and 2024 ETF approvals strengthened these linkages. Macro features improve both regime detection accuracy and directional prediction:</p>
+<p>Post-2019, BTC price behavior has become increasingly correlated with traditional macro assets. The 2020 institutional adoption wave and 2024 ETF approvals strengthened these linkages. The research rationale below motivates macro as a regime / directional input — but see the <strong>Status</strong> note under <a href="#data-flow">Data Flow</a>: on this project's 1–7 DTE data macro has not yet earned a live role (regime detection is BTC-only; the XGBoost tilt is off).</p>
 <ul>
 <li><strong>Gold</strong>: Köse et al. (2025) TFT model assigns Gold attention weight 0.85 — the strongest macro signal for BTC direction</li>
 <li><strong>DXY</strong>: Dollar strength inversely correlated with BTC in risk-on/risk-off regimes</li>
@@ -3161,16 +3161,33 @@ python<span class="w"> </span>core/data/macro_fetcher.py<span class="w"> </span>
       ▼
 macro_fetcher.py ──▶ DATA/macro_daily.csv
       │
-      ├──▶ regime_detector.py (HMM features)
-      │
-      └──▶ directional_xgb.py (XGBoost features)
+      └──▶ directional_xgb.py (XGBoost features only)
               │
               ▼
-         btc_pricing_engine.py (Phase 2.3 blend)
+         btc_pricing_engine.py (drift-shift, λ-gated)
 </code></pre></div>
+<blockquote>
+<p><strong>Status (verified 2026-06).</strong> Macro feeds <strong>only</strong> the directional XGBoost. The HMM
+<code>regime_detector.py</code> is <strong>univariate BTC daily returns</strong> (<code>fit()</code> reshapes to one
+column) and does <strong>not</strong> consume macro — an earlier version of this diagram wrongly
+showed a <code>regime_detector</code> arm. And because the XGBoost tilt is off for the traded
+<strong>1–7 DTE</strong> band (<code>XGB_TILT_LAMBDA=0</code>, no OOS skill — see
+<a href="../directional-xgb/#empirical-validation-this-projects-data">Directional XGBoost › Empirical Validation</a>),
+macro is currently <strong>fetched but unused in production pricing</strong>. Keep it for
+re-validation / future regime-feature work, not as a live input.</p>
+</blockquote>
 <h2 id="file-format">File Format<a class="headerlink" href="#file-format" title="Permanent link">&para;</a></h2>
-<p><code>DATA/macro_daily.csv</code> — CSV with date index, columns: <code>gold</code>, <code>gold_ret</code>, <code>dxy</code>, <code>dxy_ret</code>, <code>vix</code>, <code>spx_ret</code>.</p>
+<p><code>DATA/macro_daily.csv</code> — CSV with date index, columns: <code>gold</code>, <code>dxy</code>, <code>vix</code>, <code>spx</code>, <code>gold_ret</code>, <code>dxy_ret</code>, <code>vix_ret</code>, <code>spx_ret</code>, <code>vix_regime</code>, <code>dxy_trend</code>.</p>
 <p>Dates in UTC, resampled to daily frequency.</p>
+<blockquote>
+<p><strong>The BTC-macro correlation columns (<code>btc_gold_corr_30d</code>, <code>btc_dxy_corr_30d</code>) are
+NOT in this file.</strong> <code>fetch_macro_data()</code> (which writes the CSV) cannot — it has no
+BTC data; only <code>merge_with_btc()</code> computes them, and the XGBoost pipeline does not
+call it. Instead <code>directional_xgb.build_features</code> computes those correlations
+on-the-fly from the date-joined BTC returns + <code>gold_ret</code>/<code>dxy_ret</code> (leak-safe,
+past-only rolling window). Must be <strong>fetched before any backtest</strong> — like BTC data,
+the fetch is manual (<code>python core/data/macro_fetcher.py</code>), not auto-triggered.</p>
+</blockquote>
 <p>See <a href="../../api-reference/core/macro-fetcher/">Macro Fetcher API Reference</a> for function signatures and parameters.</p>
 
 

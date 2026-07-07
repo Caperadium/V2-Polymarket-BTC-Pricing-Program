@@ -2,15 +2,32 @@ import argparse
 import csv
 import json
 import logging
+import sys
+from pathlib import Path
 import requests
 import re
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta, timezone
 import pytz
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 
-from core.pricing.btc_pricing_engine import load_and_prep_data, fit_garch_model, simulate_paths, get_contract_probability
+# Guard: ensure repo root is on sys.path when invoked as a script (e.g.
+# `python scripts/pipelines/batch_pricing_runner.py --help`), mirroring
+# core/backtesting/backrunner.py. Without this, module-level `core.*`
+# imports below raise ModuleNotFoundError because sys.path[0] is this
+# script's own directory, not the repo root. Pre-existing gap (not
+# introduced by T5) surfaced by the `--help` exit-0 acceptance check.
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from core.pricing.btc_pricing_engine import (
+    load_and_prep_data, calculate_probabilities, dte_bucket_horizon,
+    load_calibrated_jumps, build_regime_jump_params,
+)
+from core.pricing.regime_detector import RegimeDetector
+from core.pricing.engine_config import build_engine_kwargs
 
 # Setup Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -144,23 +161,27 @@ def main():
     num_sims = args.num_sims
     current_year = datetime.now().year # Default to current year as per removal of flag
 
-    # 1. Load Data & Fit Model Once
+    # 1. Load Data Once
     logger.info("Initializing Pricing Engine...")
     hourly_csv = "DATA/btc_hourly.csv"
     intraday_csv = "DATA/btc_intraday_1m.csv"
 
+    # T5 (H2): load hourly + intraday ONCE and route pricing through
+    # calculate_probabilities (per-expiry-group), mirroring the backrunner
+    # pattern, instead of a direct fit_garch_model + simulate_paths loop with
+    # no regime switching / horizon gating.
     try:
-        hourly_returns, S0 = load_and_prep_data(hourly_csv, intraday_csv)
+        hourly_df_live = pd.read_csv(hourly_csv)
+        intraday_df_live = pd.read_csv(intraday_csv)
+        _, S0 = load_and_prep_data(
+            hourly_csv, intraday_csv,
+            hourly_df=hourly_df_live, intraday_df=intraday_df_live,
+        )
     except Exception as e:
         logger.error(f"Error loading data: {e}")
         return
 
-    logger.info(f"Data Loaded. S0: {S0}. Fitting GARCH...")
-    # FIX 1 (C1): tell fit_garch_model to fit FIGARCH when advanced features are on,
-    # otherwise simulate_paths(use_figarch=True) silently falls back to GARCH because
-    # the returned dict carries no 'figarch_weights'. Matches the backtest path.
-    garch_params = fit_garch_model(hourly_returns, use_figarch=args.advanced_features)
-    logger.info(f"Model Fitted: {garch_params}")
+    logger.info(f"Data Loaded. S0: {S0}.")
 
     # FIX 2 (M1): calibrate jump parameters by default when advanced features are on,
     # so the LIVE jump source matches the BACKTEST (calibrated everywhere via bipower).
@@ -169,8 +190,11 @@ def main():
     # 'lambda'/'crash_prob'. Map them or the calibrated lambda/crash silently fall back
     # to module defaults (a latent bug in the previous --recalibrate-jumps path).
     calibrated_jumps = None
+    # Raw dict from load_calibrated_jumps -- keyed 'lam'/'p_crash'/'rho_J'/
+    # 'fit_converged'. build_regime_jump_params needs THIS dict (via its
+    # `calibrated=` kwarg), never the remapped `calibrated_jumps` above.
+    cal = None
     if args.advanced_features or args.recalibrate_jumps:
-        from core.pricing.btc_pricing_engine import load_calibrated_jumps
         cal = load_calibrated_jumps(
             hourly_csv=hourly_csv, force_recalibrate=args.recalibrate_jumps,
         )
@@ -179,8 +203,28 @@ def main():
                 "lambda": cal["lam"], "crash_prob": cal["p_crash"],
                 "eta_up": cal["eta_up"], "eta_down": cal["eta_down"],
                 "mu_v": cal["mu_v"], "rho_J": cal["rho_J"],
+                # FIX 4 (M1): SVCJ return-vol regression slope actually used in
+                # simulate_paths (rho_J above is reporting-only). Key only exists
+                # in `cal` when load_calibrated_jumps has been run after the T3
+                # write-path fix; .get() falls back to inert 0.0.
+                "rho_j_slope": cal.get("rho_j_slope", 0.0),
             }
             logger.info("Using data-calibrated jump parameters (live)")
+        else:
+            cal = None  # not converged -- do not build regime params from it
+
+    # T5 (H2): regime layer construction, mirroring the backrunner. `cal` is
+    # only defined (and non-None) when fit_converged was truthy above.
+    detector = None
+    regime_params = None
+    if args.advanced_features:
+        detector = RegimeDetector()
+        if calibrated_jumps is not None and cal is not None:
+            regime_params = build_regime_jump_params(calibrated=cal)
+
+    # Per-snapshot dedup: fit GARCH/FIGARCH + derive S0 once, reuse across
+    # every expiry group processed in this run (byte-identical output).
+    garch_cache: Dict[bool, Any] = {}
 
     # FIX 3 (re-enabled): XGBoost directional drift setup (live). Per-DTE-bucket
     # models trained once on the full live data (leak is not a concern live —
@@ -190,9 +234,6 @@ def main():
     xgb_model_cache = {}
     if args.use_xgb:
         from core.pricing.directional_xgb import DirectionalXGB, to_daily_log_return_series
-        from core.pricing.btc_pricing_engine import (
-            dte_bucket_horizon, apply_xgb_drift_shift, XGB_TILT_LAMBDA,
-        )
         import os as _os
         xgb_daily_ret = to_daily_log_return_series(pd.read_csv(hourly_csv))
         macro_path = "DATA/macro_daily.csv"
@@ -205,7 +246,6 @@ def main():
                 "XGB enabled but DATA/macro_daily.csv missing; running BTC-only "
                 "(directional signal expected weak — run core/data/macro_fetcher.py)."
             )
-        _xgb_lam = XGB_TILT_LAMBDA if args.xgb_tilt_lambda is None else args.xgb_tilt_lambda
 
         def _get_xgb_model(bucket_h):
             if bucket_h in xgb_model_cache:
@@ -320,37 +360,47 @@ def main():
 
         logger.info(f"Simulating for {date_key} (T={hours_to_expiry:.1f}h)...")
 
-        # Simulate Paths
-        paths = simulate_paths(S0, garch_params, jump_params=calibrated_jumps,
-                               hours_to_expiry=hours_to_expiry, n_sims=num_sims,
-                               use_naive_prior=True,
-                               use_svcj=args.advanced_features,
-                               use_skewed_t=args.advanced_features,
-                               use_figarch=args.advanced_features)
-
-        # FIX 3 (re-enabled): XGBoost directional drift shift on the terminal
-        # distribution (strike-agnostic, monotonicity-preserving). Per-DTE bucket.
+        # T5 (H2): pick the per-DTE-bucket XGB model for this expiry group
+        # (calculate_probabilities applies the drift shift INTERNALLY -- the
+        # old post-simulation apply_xgb_drift_shift block is gone; leaving it
+        # in place would double-apply the tilt).
+        xgb_model = None
         if args.use_xgb and xgb_daily_ret is not None:
             bucket_h = dte_bucket_horizon(hours_to_expiry / 24.0)
             if bucket_h is not None:
-                _m = _get_xgb_model(bucket_h)
-                if _m is not None:
-                    _p_up = _m.predict_direction_adjustment(
-                        S0=S0, hours_to_expiry=hours_to_expiry,
-                        btc_returns=xgb_daily_ret, macro_df=xgb_macro,
-                        horizon_days=int(round(bucket_h)),
-                    )
-                    paths, _dH, _meta = apply_xgb_drift_shift(paths, S0, _p_up, _xgb_lam)
-                    if _meta.get("applied"):
-                        logger.info("XGB drift: p_up=%.3f dH=%.4f (bucket %.0fd)",
-                                    _p_up, _dH, bucket_h)
+                xgb_model = _get_xgb_model(bucket_h)
+
+        # T5 (H2): per-expiry-group call to calculate_probabilities (regime
+        # switching + horizon gating + calibrated jumps), same engine
+        # configuration as the backtest path.
+        engine_kwargs = build_engine_kwargs(
+            advanced_features=args.advanced_features,
+            detector=detector,
+            regime_params=regime_params,
+            jump_params=calibrated_jumps,
+            n_sims=num_sims,
+            use_xgb=args.use_xgb,
+            xgb_model=xgb_model,
+            xgb_tilt_lambda=args.xgb_tilt_lambda,
+            macro_df=xgb_macro,
+        )
+        probs = calculate_probabilities(
+            strikes=[c['strike'] for c in contracts],
+            hours_to_expiry=hours_to_expiry,
+            hourly_df=hourly_df_live,
+            intraday_df=intraday_df_live,
+            use_naive_prior=True,
+            garch_cache=garch_cache,
+            s0_override=S0,
+            **engine_kwargs,
+        )
 
         # Grade each contract
         for c in contracts:
             strike = c['strike']
             poly_price = c['poly_price']
-            model_prob = get_contract_probability(paths, strike)
-            
+            model_prob = probs.get(strike, float('nan'))
+
             edge = model_prob - poly_price
             
             # Format expiry ET string

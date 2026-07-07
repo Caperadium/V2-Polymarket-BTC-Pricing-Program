@@ -3332,10 +3332,7 @@ Refactored to a 3-stage pipeline: Target -&gt; Delta -&gt; Action.</p>
 
             <details class="mkdocstrings-source">
               <summary>Source code in <code>core\strategy\auto_reco.py</code></summary>
-              <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal">353</span>
-<span class="normal">354</span>
-<span class="normal">355</span>
-<span class="normal">356</span>
+              <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal">356</span>
 <span class="normal">357</span>
 <span class="normal">358</span>
 <span class="normal">359</span>
@@ -3843,7 +3840,22 @@ Refactored to a 3-stage pipeline: Target -&gt; Delta -&gt; Action.</p>
 <span class="normal">861</span>
 <span class="normal">862</span>
 <span class="normal">863</span>
-<span class="normal">864</span></pre></div></td><td class="code"><div><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">build_targets</span><span class="p">(</span>
+<span class="normal">864</span>
+<span class="normal">865</span>
+<span class="normal">866</span>
+<span class="normal">867</span>
+<span class="normal">868</span>
+<span class="normal">869</span>
+<span class="normal">870</span>
+<span class="normal">871</span>
+<span class="normal">872</span>
+<span class="normal">873</span>
+<span class="normal">874</span>
+<span class="normal">875</span>
+<span class="normal">876</span>
+<span class="normal">877</span>
+<span class="normal">878</span>
+<span class="normal">879</span></pre></div></td><td class="code"><div><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">build_targets</span><span class="p">(</span>
     <span class="n">batch_df</span><span class="p">:</span> <span class="n">pd</span><span class="o">.</span><span class="n">DataFrame</span><span class="p">,</span>
     <span class="n">current_exposure</span><span class="p">:</span> <span class="n">Dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">float</span><span class="p">],</span>
     <span class="n">vol_gate_result</span><span class="p">:</span> <span class="n">VolGateResult</span><span class="p">,</span>
@@ -3905,14 +3917,16 @@ Refactored to a 3-stage pipeline: Target -&gt; Delta -&gt; Action.</p>
     <span class="n">data</span><span class="p">[</span><span class="s2">&quot;expiry_key&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">_derive_expiry_key</span><span class="p">(</span><span class="n">data</span><span class="p">)</span>
 
     <span class="n">price_col</span> <span class="o">=</span> <span class="n">_pick_column</span><span class="p">(</span><span class="n">data</span><span class="p">,</span> <span class="p">[</span><span class="s2">&quot;market_price&quot;</span><span class="p">,</span> <span class="s2">&quot;market_pr&quot;</span><span class="p">,</span> <span class="s2">&quot;Polymarket_Price&quot;</span><span class="p">])</span>
-    <span class="n">model_col</span> <span class="o">=</span> <span class="n">_pick_column</span><span class="p">(</span><span class="n">data</span><span class="p">,</span> <span class="p">[</span><span class="s2">&quot;p_model_fit&quot;</span><span class="p">,</span> <span class="s2">&quot;p_real_mc&quot;</span><span class="p">,</span> <span class="s2">&quot;model_probability&quot;</span><span class="p">,</span> <span class="s2">&quot;Model_Prob&quot;</span><span class="p">])</span>
+    <span class="c1"># Value-level coalesce: a failed (all-NaN) p_model_fit no longer shadows a</span>
+    <span class="c1"># populated p_real_mc — each row falls back to the best available estimate.</span>
+    <span class="n">model_prob</span> <span class="o">=</span> <span class="n">resolve_model_prob</span><span class="p">(</span><span class="n">data</span><span class="p">)</span>
 
-    <span class="k">if</span> <span class="n">price_col</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="n">model_col</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="k">if</span> <span class="n">price_col</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="n">model_prob</span><span class="o">.</span><span class="n">notna</span><span class="p">()</span><span class="o">.</span><span class="n">sum</span><span class="p">()</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
         <span class="n">logger</span><span class="o">.</span><span class="n">error</span><span class="p">(</span><span class="s2">&quot;Batch file missing market_price or model probability columns&quot;</span><span class="p">)</span>
         <span class="k">return</span> <span class="n">targets</span>
 
     <span class="n">data</span><span class="p">[</span><span class="s2">&quot;market_price&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">pd</span><span class="o">.</span><span class="n">to_numeric</span><span class="p">(</span><span class="n">data</span><span class="p">[</span><span class="n">price_col</span><span class="p">],</span> <span class="n">errors</span><span class="o">=</span><span class="s2">&quot;coerce&quot;</span><span class="p">)</span>
-    <span class="n">data</span><span class="p">[</span><span class="s2">&quot;model_prob&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">pd</span><span class="o">.</span><span class="n">to_numeric</span><span class="p">(</span><span class="n">data</span><span class="p">[</span><span class="n">model_col</span><span class="p">],</span> <span class="n">errors</span><span class="o">=</span><span class="s2">&quot;coerce&quot;</span><span class="p">)</span>
+    <span class="n">data</span><span class="p">[</span><span class="s2">&quot;model_prob&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">model_prob</span>
     <span class="n">data</span> <span class="o">=</span> <span class="n">data</span><span class="o">.</span><span class="n">dropna</span><span class="p">(</span><span class="n">subset</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;market_price&quot;</span><span class="p">,</span> <span class="s2">&quot;model_prob&quot;</span><span class="p">])</span>
 
     <span class="c1"># Compute required edge thresholds</span>
@@ -3931,6 +3945,16 @@ Refactored to a 3-stage pipeline: Target -&gt; Delta -&gt; Action.</p>
         <span class="n">data</span> <span class="o">=</span> <span class="n">data</span><span class="p">[</span><span class="n">mask</span><span class="p">]</span>
 
     <span class="n">data</span> <span class="o">=</span> <span class="n">data</span><span class="p">[</span><span class="n">data</span><span class="p">[</span><span class="s2">&quot;model_prob&quot;</span><span class="p">]</span><span class="o">.</span><span class="n">between</span><span class="p">(</span><span class="n">config</span><span class="o">.</span><span class="n">min_model_prob</span><span class="p">,</span> <span class="n">config</span><span class="o">.</span><span class="n">max_model_prob</span><span class="p">)]</span>
+
+    <span class="c1"># Moneyness filter (signed or abs). No-op if no bounds or no moneyness column.</span>
+    <span class="n">data</span> <span class="o">=</span> <span class="n">filter_by_moneyness</span><span class="p">(</span>
+        <span class="n">data</span><span class="p">,</span>
+        <span class="n">lower</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">min_moneyness</span><span class="p">,</span>
+        <span class="n">upper</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">max_moneyness</span><span class="p">,</span>
+        <span class="n">mode</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">moneyness_mode</span><span class="p">,</span>
+    <span class="p">)</span>
+    <span class="k">if</span> <span class="n">data</span><span class="o">.</span><span class="n">empty</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">targets</span>
 
     <span class="c1"># Stability penalty</span>
     <span class="k">if</span> <span class="n">config</span><span class="o">.</span><span class="n">use_stability_penalty</span><span class="p">:</span>
@@ -4400,10 +4424,7 @@ Refactored to a 3-stage pipeline: Target -&gt; Delta -&gt; Action.</p>
 
             <details class="mkdocstrings-source">
               <summary>Source code in <code>core\strategy\auto_reco.py</code></summary>
-              <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal">161</span>
-<span class="normal">162</span>
-<span class="normal">163</span>
-<span class="normal">164</span>
+              <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal">164</span>
 <span class="normal">165</span>
 <span class="normal">166</span>
 <span class="normal">167</span>
@@ -4437,7 +4458,10 @@ Refactored to a 3-stage pipeline: Target -&gt; Delta -&gt; Action.</p>
 <span class="normal">195</span>
 <span class="normal">196</span>
 <span class="normal">197</span>
-<span class="normal">198</span></pre></div></td><td class="code"><div><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">compute_current_exposure_mtm</span><span class="p">(</span>
+<span class="normal">198</span>
+<span class="normal">199</span>
+<span class="normal">200</span>
+<span class="normal">201</span></pre></div></td><td class="code"><div><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">compute_current_exposure_mtm</span><span class="p">(</span>
     <span class="n">positions_df</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">pd</span><span class="o">.</span><span class="n">DataFrame</span><span class="p">],</span>
     <span class="n">bankroll</span><span class="p">:</span> <span class="nb">float</span>
 <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">float</span><span class="p">]:</span>
@@ -4525,22 +4549,7 @@ Refactored to a 3-stage pipeline: Target -&gt; Delta -&gt; Action.</p>
 
             <details class="mkdocstrings-source">
               <summary>Source code in <code>core\strategy\auto_reco.py</code></summary>
-              <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"> 871</span>
-<span class="normal"> 872</span>
-<span class="normal"> 873</span>
-<span class="normal"> 874</span>
-<span class="normal"> 875</span>
-<span class="normal"> 876</span>
-<span class="normal"> 877</span>
-<span class="normal"> 878</span>
-<span class="normal"> 879</span>
-<span class="normal"> 880</span>
-<span class="normal"> 881</span>
-<span class="normal"> 882</span>
-<span class="normal"> 883</span>
-<span class="normal"> 884</span>
-<span class="normal"> 885</span>
-<span class="normal"> 886</span>
+              <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"> 886</span>
 <span class="normal"> 887</span>
 <span class="normal"> 888</span>
 <span class="normal"> 889</span>
@@ -4717,7 +4726,22 @@ Refactored to a 3-stage pipeline: Target -&gt; Delta -&gt; Action.</p>
 <span class="normal">1060</span>
 <span class="normal">1061</span>
 <span class="normal">1062</span>
-<span class="normal">1063</span></pre></div></td><td class="code"><div><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">compute_deltas</span><span class="p">(</span>
+<span class="normal">1063</span>
+<span class="normal">1064</span>
+<span class="normal">1065</span>
+<span class="normal">1066</span>
+<span class="normal">1067</span>
+<span class="normal">1068</span>
+<span class="normal">1069</span>
+<span class="normal">1070</span>
+<span class="normal">1071</span>
+<span class="normal">1072</span>
+<span class="normal">1073</span>
+<span class="normal">1074</span>
+<span class="normal">1075</span>
+<span class="normal">1076</span>
+<span class="normal">1077</span>
+<span class="normal">1078</span></pre></div></td><td class="code"><div><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">compute_deltas</span><span class="p">(</span>
     <span class="n">targets</span><span class="p">:</span> <span class="n">Dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">TargetPosition</span><span class="p">],</span>
     <span class="n">current_exposure</span><span class="p">:</span> <span class="n">Dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">float</span><span class="p">],</span>
     <span class="n">vol_gate_result</span><span class="p">:</span> <span class="n">VolGateResult</span><span class="p">,</span>
@@ -4982,10 +5006,7 @@ Refactored to a 3-stage pipeline: Target -&gt; Delta -&gt; Action.</p>
 
             <details class="mkdocstrings-source">
               <summary>Source code in <code>core\strategy\auto_reco.py</code></summary>
-              <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal">132</span>
-<span class="normal">133</span>
-<span class="normal">134</span>
-<span class="normal">135</span>
+              <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal">135</span>
 <span class="normal">136</span>
 <span class="normal">137</span>
 <span class="normal">138</span>
@@ -5008,7 +5029,10 @@ Refactored to a 3-stage pipeline: Target -&gt; Delta -&gt; Action.</p>
 <span class="normal">155</span>
 <span class="normal">156</span>
 <span class="normal">157</span>
-<span class="normal">158</span></pre></div></td><td class="code"><div><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">generate_key</span><span class="p">(</span>
+<span class="normal">158</span>
+<span class="normal">159</span>
+<span class="normal">160</span>
+<span class="normal">161</span></pre></div></td><td class="code"><div><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">generate_key</span><span class="p">(</span>
     <span class="n">row</span><span class="p">:</span> <span class="n">pd</span><span class="o">.</span><span class="n">Series</span><span class="p">,</span>
     <span class="n">side</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
 <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
@@ -5057,11 +5081,11 @@ Refactored to a 3-stage pipeline: Target -&gt; Delta -&gt; Action.</p>
 
             <details class="mkdocstrings-source">
               <summary>Source code in <code>core\strategy\auto_reco.py</code></summary>
-              <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal">273</span>
-<span class="normal">274</span>
-<span class="normal">275</span>
-<span class="normal">276</span>
-<span class="normal">277</span></pre></div></td><td class="code"><div><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">kelly_fraction_no</span><span class="p">(</span><span class="n">p</span><span class="p">:</span> <span class="nb">float</span><span class="p">,</span> <span class="n">q</span><span class="p">:</span> <span class="nb">float</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">float</span><span class="p">:</span>
+              <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal">276</span>
+<span class="normal">277</span>
+<span class="normal">278</span>
+<span class="normal">279</span>
+<span class="normal">280</span></pre></div></td><td class="code"><div><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">kelly_fraction_no</span><span class="p">(</span><span class="n">p</span><span class="p">:</span> <span class="nb">float</span><span class="p">,</span> <span class="n">q</span><span class="p">:</span> <span class="nb">float</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">float</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;Kelly fraction for NO side: f* = (q - p) / q&quot;&quot;&quot;</span>
     <span class="k">if</span> <span class="n">q</span> <span class="o">&lt;=</span> <span class="mf">0.0</span> <span class="ow">or</span> <span class="n">q</span> <span class="o">&gt;=</span> <span class="mf">1.0</span><span class="p">:</span>
         <span class="k">return</span> <span class="mf">0.0</span>
@@ -5088,11 +5112,11 @@ Refactored to a 3-stage pipeline: Target -&gt; Delta -&gt; Action.</p>
 
             <details class="mkdocstrings-source">
               <summary>Source code in <code>core\strategy\auto_reco.py</code></summary>
-              <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal">266</span>
-<span class="normal">267</span>
-<span class="normal">268</span>
-<span class="normal">269</span>
-<span class="normal">270</span></pre></div></td><td class="code"><div><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">kelly_fraction_yes</span><span class="p">(</span><span class="n">p</span><span class="p">:</span> <span class="nb">float</span><span class="p">,</span> <span class="n">q</span><span class="p">:</span> <span class="nb">float</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">float</span><span class="p">:</span>
+              <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal">269</span>
+<span class="normal">270</span>
+<span class="normal">271</span>
+<span class="normal">272</span>
+<span class="normal">273</span></pre></div></td><td class="code"><div><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">kelly_fraction_yes</span><span class="p">(</span><span class="n">p</span><span class="p">:</span> <span class="nb">float</span><span class="p">,</span> <span class="n">q</span><span class="p">:</span> <span class="nb">float</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">float</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;Kelly fraction for YES side: f* = (p - q) / (1 - q)&quot;&quot;&quot;</span>
     <span class="k">if</span> <span class="n">q</span> <span class="o">&lt;=</span> <span class="mf">0.0</span> <span class="ow">or</span> <span class="n">q</span> <span class="o">&gt;=</span> <span class="mf">1.0</span><span class="p">:</span>
         <span class="k">return</span> <span class="mf">0.0</span>
@@ -5120,10 +5144,7 @@ Refactored to a 3-stage pipeline: Target -&gt; Delta -&gt; Action.</p>
 
             <details class="mkdocstrings-source">
               <summary>Source code in <code>core\strategy\auto_reco.py</code></summary>
-              <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"> 73</span>
-<span class="normal"> 74</span>
-<span class="normal"> 75</span>
-<span class="normal"> 76</span>
+              <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"> 76</span>
 <span class="normal"> 77</span>
 <span class="normal"> 78</span>
 <span class="normal"> 79</span>
@@ -5159,7 +5180,10 @@ Refactored to a 3-stage pipeline: Target -&gt; Delta -&gt; Action.</p>
 <span class="normal">109</span>
 <span class="normal">110</span>
 <span class="normal">111</span>
-<span class="normal">112</span></pre></div></td><td class="code"><div><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">load_btc_csv</span><span class="p">(</span><span class="n">path</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;DATA/btc_intraday_1m.csv&quot;</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Optional</span><span class="p">[</span><span class="n">pd</span><span class="o">.</span><span class="n">DataFrame</span><span class="p">]:</span>
+<span class="normal">112</span>
+<span class="normal">113</span>
+<span class="normal">114</span>
+<span class="normal">115</span></pre></div></td><td class="code"><div><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">load_btc_csv</span><span class="p">(</span><span class="n">path</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;DATA/btc_intraday_1m.csv&quot;</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Optional</span><span class="p">[</span><span class="n">pd</span><span class="o">.</span><span class="n">DataFrame</span><span class="p">]:</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
 <span class="sd">    Load BTC price data for volatility gate computation.</span>
 
@@ -5221,10 +5245,7 @@ Refactored to a 3-stage pipeline: Target -&gt; Delta -&gt; Action.</p>
 
             <details class="mkdocstrings-source">
               <summary>Source code in <code>core\strategy\auto_reco.py</code></summary>
-              <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal">115</span>
-<span class="normal">116</span>
-<span class="normal">117</span>
-<span class="normal">118</span>
+              <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal">118</span>
 <span class="normal">119</span>
 <span class="normal">120</span>
 <span class="normal">121</span>
@@ -5235,7 +5256,10 @@ Refactored to a 3-stage pipeline: Target -&gt; Delta -&gt; Action.</p>
 <span class="normal">126</span>
 <span class="normal">127</span>
 <span class="normal">128</span>
-<span class="normal">129</span></pre></div></td><td class="code"><div><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">load_latest_fitted_batch</span><span class="p">(</span><span class="n">directory</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;fitted_batch_results&quot;</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Optional</span><span class="p">[</span><span class="n">pd</span><span class="o">.</span><span class="n">DataFrame</span><span class="p">]:</span>
+<span class="normal">129</span>
+<span class="normal">130</span>
+<span class="normal">131</span>
+<span class="normal">132</span></pre></div></td><td class="code"><div><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">load_latest_fitted_batch</span><span class="p">(</span><span class="n">directory</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;fitted_batch_results&quot;</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Optional</span><span class="p">[</span><span class="n">pd</span><span class="o">.</span><span class="n">DataFrame</span><span class="p">]:</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;Load the most recent batch_with_fits.csv.&quot;&quot;&quot;</span>
     <span class="n">pattern</span> <span class="o">=</span> <span class="n">Path</span><span class="p">(</span><span class="n">directory</span><span class="p">)</span> <span class="o">/</span> <span class="s2">&quot;*&quot;</span> <span class="o">/</span> <span class="s2">&quot;batch_with_fits.csv&quot;</span>
     <span class="n">files</span> <span class="o">=</span> <span class="n">glob</span><span class="o">.</span><span class="n">glob</span><span class="p">(</span><span class="nb">str</span><span class="p">(</span><span class="n">pattern</span><span class="p">))</span>
@@ -5272,34 +5296,7 @@ Refactored to a 3-stage pipeline: Target -&gt; Delta -&gt; Action.</p>
 
             <details class="mkdocstrings-source">
               <summary>Source code in <code>core\strategy\auto_reco.py</code></summary>
-              <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal">1273</span>
-<span class="normal">1274</span>
-<span class="normal">1275</span>
-<span class="normal">1276</span>
-<span class="normal">1277</span>
-<span class="normal">1278</span>
-<span class="normal">1279</span>
-<span class="normal">1280</span>
-<span class="normal">1281</span>
-<span class="normal">1282</span>
-<span class="normal">1283</span>
-<span class="normal">1284</span>
-<span class="normal">1285</span>
-<span class="normal">1286</span>
-<span class="normal">1287</span>
-<span class="normal">1288</span>
-<span class="normal">1289</span>
-<span class="normal">1290</span>
-<span class="normal">1291</span>
-<span class="normal">1292</span>
-<span class="normal">1293</span>
-<span class="normal">1294</span>
-<span class="normal">1295</span>
-<span class="normal">1296</span>
-<span class="normal">1297</span>
-<span class="normal">1298</span>
-<span class="normal">1299</span>
-<span class="normal">1300</span>
+              <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal">1300</span>
 <span class="normal">1301</span>
 <span class="normal">1302</span>
 <span class="normal">1303</span>
@@ -5345,7 +5342,34 @@ Refactored to a 3-stage pipeline: Target -&gt; Delta -&gt; Action.</p>
 <span class="normal">1343</span>
 <span class="normal">1344</span>
 <span class="normal">1345</span>
-<span class="normal">1346</span></pre></div></td><td class="code"><div><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">main</span><span class="p">():</span>
+<span class="normal">1346</span>
+<span class="normal">1347</span>
+<span class="normal">1348</span>
+<span class="normal">1349</span>
+<span class="normal">1350</span>
+<span class="normal">1351</span>
+<span class="normal">1352</span>
+<span class="normal">1353</span>
+<span class="normal">1354</span>
+<span class="normal">1355</span>
+<span class="normal">1356</span>
+<span class="normal">1357</span>
+<span class="normal">1358</span>
+<span class="normal">1359</span>
+<span class="normal">1360</span>
+<span class="normal">1361</span>
+<span class="normal">1362</span>
+<span class="normal">1363</span>
+<span class="normal">1364</span>
+<span class="normal">1365</span>
+<span class="normal">1366</span>
+<span class="normal">1367</span>
+<span class="normal">1368</span>
+<span class="normal">1369</span>
+<span class="normal">1370</span>
+<span class="normal">1371</span>
+<span class="normal">1372</span>
+<span class="normal">1373</span></pre></div></td><td class="code"><div><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">main</span><span class="p">():</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;CLI interface for generating trade recommendations.&quot;&quot;&quot;</span>
     <span class="n">parser</span> <span class="o">=</span> <span class="n">argparse</span><span class="o">.</span><span class="n">ArgumentParser</span><span class="p">(</span>
         <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Generate Kelly-style trade recommendations from fitted batch data&quot;</span><span class="p">,</span>
@@ -5429,7 +5453,7 @@ Refactored to a 3-stage pipeline: Target -&gt; Delta -&gt; Action.</p>
 
 
 <h3 id="core.strategy.auto_reco.recommend_trades" class="doc doc-heading">
-            <code class="highlight language-python"><span class="n">recommend_trades</span><span class="p">(</span><span class="n">df</span><span class="p">,</span> <span class="n">bankroll</span><span class="p">,</span> <span class="n">positions_df</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">kelly_fraction</span><span class="o">=</span><span class="mf">0.15</span><span class="p">,</span> <span class="n">min_edge</span><span class="o">=</span><span class="mf">0.06</span><span class="p">,</span> <span class="n">max_bets_per_expiry</span><span class="o">=</span><span class="mi">3</span><span class="p">,</span> <span class="n">max_capital_per_expiry_frac</span><span class="o">=</span><span class="n">MAX_CAP_PER_EXPIRY_FRAC_DEFAULT</span><span class="p">,</span> <span class="n">max_capital_total_frac</span><span class="o">=</span><span class="n">MAX_CAP_TOTAL_FRAC_DEFAULT</span><span class="p">,</span> <span class="n">min_price</span><span class="o">=</span><span class="mf">0.03</span><span class="p">,</span> <span class="n">max_price</span><span class="o">=</span><span class="mf">0.95</span><span class="p">,</span> <span class="n">min_model_prob</span><span class="o">=</span><span class="mf">0.0</span><span class="p">,</span> <span class="n">max_model_prob</span><span class="o">=</span><span class="mf">1.0</span><span class="p">,</span> <span class="n">require_active</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">use_stability_penalty</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">allow_no</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">min_trade_usd</span><span class="o">=</span><span class="n">DEFAULT_MIN_TRADE_USD</span><span class="p">,</span> <span class="n">disable_staleness</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">check_existing_consistency</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">current_open_positions</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">use_fixed_stake</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">fixed_stake_amount</span><span class="o">=</span><span class="mf">10.0</span><span class="p">,</span> <span class="n">max_dte</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">use_prob_threshold</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">prob_threshold_yes</span><span class="o">=</span><span class="mf">0.7</span><span class="p">,</span> <span class="n">prob_threshold_no</span><span class="o">=</span><span class="mf">0.3</span><span class="p">,</span> <span class="n">max_moneyness</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">min_moneyness</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">btc_price_df</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">risk_off_targets_to_zero</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">missing_target_policy</span><span class="o">=</span><span class="s1">&#39;KEEP&#39;</span><span class="p">,</span> <span class="n">return_all</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">min_edge_entry</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span></code>
+            <code class="highlight language-python"><span class="n">recommend_trades</span><span class="p">(</span><span class="n">df</span><span class="p">,</span> <span class="n">bankroll</span><span class="p">,</span> <span class="n">positions_df</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">kelly_fraction</span><span class="o">=</span><span class="mf">0.15</span><span class="p">,</span> <span class="n">min_edge</span><span class="o">=</span><span class="mf">0.06</span><span class="p">,</span> <span class="n">max_bets_per_expiry</span><span class="o">=</span><span class="mi">3</span><span class="p">,</span> <span class="n">max_capital_per_expiry_frac</span><span class="o">=</span><span class="n">MAX_CAP_PER_EXPIRY_FRAC_DEFAULT</span><span class="p">,</span> <span class="n">max_capital_total_frac</span><span class="o">=</span><span class="n">MAX_CAP_TOTAL_FRAC_DEFAULT</span><span class="p">,</span> <span class="n">min_price</span><span class="o">=</span><span class="mf">0.03</span><span class="p">,</span> <span class="n">max_price</span><span class="o">=</span><span class="mf">0.95</span><span class="p">,</span> <span class="n">min_model_prob</span><span class="o">=</span><span class="mf">0.0</span><span class="p">,</span> <span class="n">max_model_prob</span><span class="o">=</span><span class="mf">1.0</span><span class="p">,</span> <span class="n">require_active</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">use_stability_penalty</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">allow_no</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">min_trade_usd</span><span class="o">=</span><span class="n">DEFAULT_MIN_TRADE_USD</span><span class="p">,</span> <span class="n">disable_staleness</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">check_existing_consistency</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">current_open_positions</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">use_fixed_stake</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">fixed_stake_amount</span><span class="o">=</span><span class="mf">10.0</span><span class="p">,</span> <span class="n">max_dte</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">use_prob_threshold</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">prob_threshold_yes</span><span class="o">=</span><span class="mf">0.7</span><span class="p">,</span> <span class="n">prob_threshold_no</span><span class="o">=</span><span class="mf">0.3</span><span class="p">,</span> <span class="n">max_moneyness</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">min_moneyness</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">moneyness_mode</span><span class="o">=</span><span class="s1">&#39;abs&#39;</span><span class="p">,</span> <span class="n">btc_price_df</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">asof_utc</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">risk_off_targets_to_zero</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">missing_target_policy</span><span class="o">=</span><span class="s1">&#39;KEEP&#39;</span><span class="p">,</span> <span class="n">return_all</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">min_edge_entry</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span></code>
 
 <a href="#core.strategy.auto_reco.recommend_trades" class="headerlink" title="Permanent link">&para;</a></h3>
 
@@ -5470,22 +5494,7 @@ Refactored to a 3-stage pipeline: Target -&gt; Delta -&gt; Action.</p>
 
             <details class="mkdocstrings-source">
               <summary>Source code in <code>core\strategy\auto_reco.py</code></summary>
-              <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal">1070</span>
-<span class="normal">1071</span>
-<span class="normal">1072</span>
-<span class="normal">1073</span>
-<span class="normal">1074</span>
-<span class="normal">1075</span>
-<span class="normal">1076</span>
-<span class="normal">1077</span>
-<span class="normal">1078</span>
-<span class="normal">1079</span>
-<span class="normal">1080</span>
-<span class="normal">1081</span>
-<span class="normal">1082</span>
-<span class="normal">1083</span>
-<span class="normal">1084</span>
-<span class="normal">1085</span>
+              <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal">1085</span>
 <span class="normal">1086</span>
 <span class="normal">1087</span>
 <span class="normal">1088</span>
@@ -5651,7 +5660,34 @@ Refactored to a 3-stage pipeline: Target -&gt; Delta -&gt; Action.</p>
 <span class="normal">1248</span>
 <span class="normal">1249</span>
 <span class="normal">1250</span>
-<span class="normal">1251</span></pre></div></td><td class="code"><div><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">recommend_trades</span><span class="p">(</span>
+<span class="normal">1251</span>
+<span class="normal">1252</span>
+<span class="normal">1253</span>
+<span class="normal">1254</span>
+<span class="normal">1255</span>
+<span class="normal">1256</span>
+<span class="normal">1257</span>
+<span class="normal">1258</span>
+<span class="normal">1259</span>
+<span class="normal">1260</span>
+<span class="normal">1261</span>
+<span class="normal">1262</span>
+<span class="normal">1263</span>
+<span class="normal">1264</span>
+<span class="normal">1265</span>
+<span class="normal">1266</span>
+<span class="normal">1267</span>
+<span class="normal">1268</span>
+<span class="normal">1269</span>
+<span class="normal">1270</span>
+<span class="normal">1271</span>
+<span class="normal">1272</span>
+<span class="normal">1273</span>
+<span class="normal">1274</span>
+<span class="normal">1275</span>
+<span class="normal">1276</span>
+<span class="normal">1277</span>
+<span class="normal">1278</span></pre></div></td><td class="code"><div><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">recommend_trades</span><span class="p">(</span>
     <span class="n">df</span><span class="p">:</span> <span class="n">pd</span><span class="o">.</span><span class="n">DataFrame</span><span class="p">,</span>
     <span class="n">bankroll</span><span class="p">:</span> <span class="nb">float</span><span class="p">,</span>
     <span class="n">positions_df</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">pd</span><span class="o">.</span><span class="n">DataFrame</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
@@ -5679,7 +5715,9 @@ Refactored to a 3-stage pipeline: Target -&gt; Delta -&gt; Action.</p>
     <span class="n">prob_threshold_no</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">0.3</span><span class="p">,</span>
     <span class="n">max_moneyness</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">float</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="n">min_moneyness</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">float</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="n">moneyness_mode</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;abs&quot;</span><span class="p">,</span>
     <span class="n">btc_price_df</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">pd</span><span class="o">.</span><span class="n">DataFrame</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="n">asof_utc</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">datetime</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="n">risk_off_targets_to_zero</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span>
     <span class="n">missing_target_policy</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span><span class="s2">&quot;KEEP&quot;</span><span class="p">,</span> <span class="s2">&quot;EXIT&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="s2">&quot;KEEP&quot;</span><span class="p">,</span>
     <span class="n">return_all</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
@@ -5722,6 +5760,7 @@ Refactored to a 3-stage pipeline: Target -&gt; Delta -&gt; Action.</p>
         <span class="n">max_dte</span><span class="o">=</span><span class="n">max_dte</span><span class="p">,</span>
         <span class="n">max_moneyness</span><span class="o">=</span><span class="n">max_moneyness</span><span class="p">,</span>
         <span class="n">min_moneyness</span><span class="o">=</span><span class="n">min_moneyness</span><span class="p">,</span>
+        <span class="n">moneyness_mode</span><span class="o">=</span><span class="n">moneyness_mode</span><span class="p">,</span>
         <span class="n">require_active</span><span class="o">=</span><span class="n">require_active</span><span class="p">,</span>
         <span class="n">use_stability_penalty</span><span class="o">=</span><span class="n">use_stability_penalty</span><span class="p">,</span>
         <span class="n">disable_staleness</span><span class="o">=</span><span class="n">disable_staleness</span><span class="p">,</span>
@@ -5739,15 +5778,16 @@ Refactored to a 3-stage pipeline: Target -&gt; Delta -&gt; Action.</p>
         <span class="n">max_reduce_per_cycle_usd</span><span class="o">=</span><span class="n">kwargs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;max_reduce_per_cycle_usd&quot;</span><span class="p">,</span> <span class="mf">200000.0</span><span class="p">),</span>
     <span class="p">)</span>
 
-    <span class="c1"># Load BTC data for vol gate</span>
+    <span class="c1"># Load BTC data for vol gate (live path only; backtest passes btc_price_df in)</span>
     <span class="k">if</span> <span class="n">btc_price_df</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
         <span class="n">btc_price_df</span> <span class="o">=</span> <span class="n">load_btc_csv</span><span class="p">()</span>
 
-    <span class="c1"># Compute vol gate</span>
-    <span class="n">now_utc</span> <span class="o">=</span> <span class="n">datetime</span><span class="o">.</span><span class="n">now</span><span class="p">(</span><span class="n">timezone</span><span class="o">.</span><span class="n">utc</span><span class="p">)</span>
+    <span class="c1"># Evaluate vol gate AS OF the relevant timestamp (replay time in backtest,</span>
+    <span class="c1"># wall-clock in live). Avoids &quot;Data stale near &lt;now&gt;&quot; when replaying history.</span>
+    <span class="n">now_utc</span> <span class="o">=</span> <span class="n">asof_utc</span> <span class="k">if</span> <span class="n">asof_utc</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">datetime</span><span class="o">.</span><span class="n">now</span><span class="p">(</span><span class="n">timezone</span><span class="o">.</span><span class="n">utc</span><span class="p">)</span>
     <span class="k">if</span> <span class="n">btc_price_df</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">btc_price_df</span><span class="o">.</span><span class="n">empty</span><span class="p">:</span>
         <span class="n">vol_gate_result</span> <span class="o">=</span> <span class="n">compute_vol_gate</span><span class="p">(</span><span class="n">btc_price_df</span><span class="p">,</span> <span class="n">now_utc</span><span class="p">)</span>
-        <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[VolGate] Regime=</span><span class="si">{</span><span class="n">vol_gate_result</span><span class="o">.</span><span class="n">regime</span><span class="si">}</span><span class="s2"> Reason=</span><span class="si">{</span><span class="n">vol_gate_result</span><span class="o">.</span><span class="n">reason</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[VolGate] Regime=</span><span class="si">{</span><span class="n">vol_gate_result</span><span class="o">.</span><span class="n">regime</span><span class="si">}</span><span class="s2"> Reason=</span><span class="si">{</span><span class="n">vol_gate_result</span><span class="o">.</span><span class="n">reason</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
     <span class="k">else</span><span class="p">:</span>
         <span class="c1"># Fallback: normal regime</span>
         <span class="n">vol_gate_result</span> <span class="o">=</span> <span class="n">VolGateResult</span><span class="p">(</span>
@@ -5763,6 +5803,14 @@ Refactored to a 3-stage pipeline: Target -&gt; Delta -&gt; Action.</p>
             <span class="n">reason</span><span class="o">=</span><span class="s2">&quot;No BTC data available&quot;</span>
         <span class="p">)</span>
         <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span><span class="s2">&quot;[VolGate] No BTC data - using fallback normal regime&quot;</span><span class="p">)</span>
+
+    <span class="c1"># Inject signed moneyness for the live path (backtest pre-injects its own</span>
+    <span class="c1"># leak-free per-snapshot column, which is preserved by the &quot;only if missing&quot; guard).</span>
+    <span class="k">if</span> <span class="s2">&quot;moneyness&quot;</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">df</span><span class="o">.</span><span class="n">columns</span> <span class="ow">and</span> <span class="s2">&quot;strike&quot;</span> <span class="ow">in</span> <span class="n">df</span><span class="o">.</span><span class="n">columns</span><span class="p">:</span>
+        <span class="n">spot</span> <span class="o">=</span> <span class="n">latest_spot_as_of</span><span class="p">(</span><span class="n">btc_price_df</span><span class="p">,</span> <span class="n">now_utc</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">spot</span> <span class="ow">and</span> <span class="n">spot</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">:</span>
+            <span class="n">df</span> <span class="o">=</span> <span class="n">df</span><span class="o">.</span><span class="n">copy</span><span class="p">()</span>
+            <span class="n">df</span><span class="p">[</span><span class="s2">&quot;moneyness&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="p">(</span><span class="n">pd</span><span class="o">.</span><span class="n">to_numeric</span><span class="p">(</span><span class="n">df</span><span class="p">[</span><span class="s2">&quot;strike&quot;</span><span class="p">],</span> <span class="n">errors</span><span class="o">=</span><span class="s2">&quot;coerce&quot;</span><span class="p">)</span> <span class="o">-</span> <span class="n">spot</span><span class="p">)</span> <span class="o">/</span> <span class="n">spot</span>
 
     <span class="c1"># Compute current exposure</span>
     <span class="n">combined_positions</span> <span class="o">=</span> <span class="n">positions_df</span>
@@ -5855,15 +5903,15 @@ Refactored to a 3-stage pipeline: Target -&gt; Delta -&gt; Action.</p>
 
             <details class="mkdocstrings-source">
               <summary>Source code in <code>core\strategy\auto_reco.py</code></summary>
-              <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal">1258</span>
-<span class="normal">1259</span>
-<span class="normal">1260</span>
-<span class="normal">1261</span>
-<span class="normal">1262</span>
-<span class="normal">1263</span>
-<span class="normal">1264</span>
-<span class="normal">1265</span>
-<span class="normal">1266</span></pre></div></td><td class="code"><div><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">recommendations_to_dataframe</span><span class="p">(</span><span class="n">recs</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="n">DeltaIntent</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="n">pd</span><span class="o">.</span><span class="n">DataFrame</span><span class="p">:</span>
+              <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal">1285</span>
+<span class="normal">1286</span>
+<span class="normal">1287</span>
+<span class="normal">1288</span>
+<span class="normal">1289</span>
+<span class="normal">1290</span>
+<span class="normal">1291</span>
+<span class="normal">1292</span>
+<span class="normal">1293</span></pre></div></td><td class="code"><div><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">recommendations_to_dataframe</span><span class="p">(</span><span class="n">recs</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="n">DeltaIntent</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="n">pd</span><span class="o">.</span><span class="n">DataFrame</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;Convert recommendations to a DataFrame for display.&quot;&quot;&quot;</span>
     <span class="k">if</span> <span class="ow">not</span> <span class="n">recs</span><span class="p">:</span>
         <span class="k">return</span> <span class="n">pd</span><span class="o">.</span><span class="n">DataFrame</span><span class="p">()</span>
@@ -5894,10 +5942,10 @@ Refactored to a 3-stage pipeline: Target -&gt; Delta -&gt; Action.</p>
 
             <details class="mkdocstrings-source">
               <summary>Source code in <code>core\strategy\auto_reco.py</code></summary>
-              <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal">63</span>
-<span class="normal">64</span>
-<span class="normal">65</span>
-<span class="normal">66</span></pre></div></td><td class="code"><div><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">reset_threshold_debug</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+              <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal">66</span>
+<span class="normal">67</span>
+<span class="normal">68</span>
+<span class="normal">69</span></pre></div></td><td class="code"><div><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">reset_threshold_debug</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;Reset the threshold debug accumulator.&quot;&quot;&quot;</span>
     <span class="k">global</span> <span class="n">LAST_RECO_THRESHOLD_DEBUG</span>
     <span class="n">LAST_RECO_THRESHOLD_DEBUG</span> <span class="o">=</span> <span class="kc">None</span>

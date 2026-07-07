@@ -198,23 +198,37 @@ def run_pipeline_programmatic(
     all_result_rows = []
     
     try:
-        # Import batch pricing internals
-        from core.pricing.btc_pricing_engine import load_and_prep_data, fit_garch_model, simulate_paths, get_contract_probability
+        import pandas as pd
+
+        # T5 (H2): route through calculate_probabilities (per-expiry-group),
+        # mirroring the backrunner pattern, instead of a direct fit_garch_model
+        # + simulate_paths loop with no regime switching / horizon gating.
+        from core.pricing.btc_pricing_engine import (
+            calculate_probabilities, load_and_prep_data, load_calibrated_jumps,
+            build_regime_jump_params,
+        )
+        from core.pricing.regime_detector import RegimeDetector
+        from core.pricing.engine_config import build_engine_kwargs
         import scripts.pipelines.batch_pricing_runner as batch_pricing_runner
-        
+
         # Load data once
-        log("Loading BTC data and fitting GARCH model (hourly)...")
+        log("Loading BTC data (hourly + intraday)...")
         # Resolve paths relative to project root (Streamlit may run from different CWD)
         _project_root = Path(__file__).resolve().parents[2]
         hourly_csv = str(_project_root / "DATA" / "btc_hourly.csv")
         intraday_csv = str(_project_root / "DATA" / "btc_intraday_1m.csv")
 
-        hourly_returns, S0 = load_and_prep_data(hourly_csv, intraday_csv)
-        # FIX 1 (C1): fit FIGARCH when advanced features are on so
-        # simulate_paths(use_figarch=True) actually uses long-memory weights
-        # instead of silently falling back to GARCH. Matches the backtest path.
-        garch_params = fit_garch_model(hourly_returns, use_figarch=advanced_features)
-        log(f"✅ Model fitted. S0=${S0:.2f}")
+        hourly_df_live = pd.read_csv(hourly_csv)
+        intraday_df_live = pd.read_csv(intraday_csv)
+
+        # load_and_prep_data reuses the already-loaded frames (no double read);
+        # kept for the S0 log line and as the s0_override passed to every
+        # calculate_probabilities call below (per-snapshot dedup, T5).
+        _, S0 = load_and_prep_data(
+            hourly_csv, intraday_csv,
+            hourly_df=hourly_df_live, intraday_df=intraday_df_live,
+        )
+        log(f"Data loaded. S0=${S0:.2f}")
 
         # FIX 2 (M1): calibrate jumps by default when advanced features are on so the
         # live jump source matches the backtest (calibrated everywhere via bipower).
@@ -222,8 +236,11 @@ def run_pipeline_programmatic(
         # 'lambda'/'crash_prob' (passing the raw dict silently drops the calibrated
         # lambda/crash to module defaults).
         calibrated_jumps = None
+        # Raw dict from load_calibrated_jumps -- keyed 'lam'/'p_crash'/'rho_J'/
+        # 'fit_converged'. build_regime_jump_params needs THIS dict (via its
+        # `calibrated=` kwarg), never the remapped `calibrated_jumps` above.
+        cal = None
         if advanced_features or recalibrate_jumps:
-            from core.pricing.btc_pricing_engine import load_calibrated_jumps
             cal = load_calibrated_jumps(
                 hourly_csv=hourly_csv, force_recalibrate=recalibrate_jumps,
             )
@@ -232,9 +249,29 @@ def run_pipeline_programmatic(
                     "lambda": cal["lam"], "crash_prob": cal["p_crash"],
                     "eta_up": cal["eta_up"], "eta_down": cal["eta_down"],
                     "mu_v": cal["mu_v"], "rho_J": cal["rho_J"],
+                    # FIX 4 (M1): SVCJ return-vol regression slope actually used
+                    # in simulate_paths (rho_J above is reporting-only). Key only
+                    # exists in `cal` when load_calibrated_jumps has been run
+                    # after the T3 write-path fix; .get() falls back to inert 0.0.
+                    "rho_j_slope": cal.get("rho_j_slope", 0.0),
                 }
                 log("Using data-calibrated jump parameters (live)")
-        
+            else:
+                cal = None  # not converged -- do not build regime params from it
+
+        # T5 (H2): regime layer construction, mirroring the backrunner. `cal`
+        # is only defined (and non-None) when fit_converged was truthy above.
+        detector = None
+        regime_params = None
+        if advanced_features:
+            detector = RegimeDetector()
+            if calibrated_jumps is not None and cal is not None:
+                regime_params = build_regime_jump_params(calibrated=cal)
+
+        # Per-snapshot dedup: fit GARCH/FIGARCH + derive S0 once, reuse across
+        # every expiry group processed in this run (byte-identical output).
+        garch_cache: Dict[bool, Any] = {}
+
         now_utc = datetime.now(timezone.utc)
         
         for group in date_groups:
@@ -315,17 +352,31 @@ def run_pipeline_programmatic(
                         result["failed"].append({"date": date_key, "error": "Already expired"})
                         continue
 
-                    paths = simulate_paths(S0, garch_params, jump_params=calibrated_jumps,
-                                          hours_to_expiry=hours_to_expiry, n_sims=num_sims,
-                                          use_naive_prior=True,
-                                          use_svcj=advanced_features,
-                                          use_skewed_t=advanced_features,
-                                          use_figarch=advanced_features)
+                    # T5 (H2): per-expiry-group call to calculate_probabilities
+                    # (regime switching + horizon gating + calibrated jumps),
+                    # same engine configuration as the backtest path.
+                    engine_kwargs = build_engine_kwargs(
+                        advanced_features=advanced_features,
+                        detector=detector,
+                        regime_params=regime_params,
+                        jump_params=calibrated_jumps,
+                        n_sims=num_sims,
+                    )
+                    probs = calculate_probabilities(
+                        strikes=[c['strike'] for c in contracts],
+                        hours_to_expiry=hours_to_expiry,
+                        hourly_df=hourly_df_live,
+                        intraday_df=intraday_df_live,
+                        use_naive_prior=True,
+                        garch_cache=garch_cache,
+                        s0_override=S0,
+                        **engine_kwargs,
+                    )
 
                     import pytz
                     import re
                     for c in contracts:
-                        model_prob = get_contract_probability(paths, c['strike'])
+                        model_prob = probs.get(c['strike'], float('nan'))
 
                         et_tz = pytz.timezone('US/Eastern')
                         expiry_et = expiry_utc.astimezone(et_tz)

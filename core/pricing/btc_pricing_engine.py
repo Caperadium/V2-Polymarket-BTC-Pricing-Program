@@ -65,7 +65,18 @@ ETA_DOWN = 25.0     # Decay parameter for downward jumps (1/mean jump size)
 # SVCJ VOLATILITY JUMP PARAMETERS
 # ==============================================================================
 SVCJ_MU_V = 0.000025     # Mean volatility jump size (hourly variance units)
-SVCJ_RHO_J = -0.08       # Return-vol jump correlation (Teng 2025 estimate)
+SVCJ_RHO_J = -0.08       # Return-vol jump correlation (Teng 2025 estimate; REPORTING
+                         # ONLY as of FIX 4/M1 -- see SVCJ_RHO_J_SLOPE below)
+# FIX 4 (M1): SVCJ_RHO_J above is a Pearson CORRELATION (dimensionless), but the
+# Eraker (2004) return-jump equation needs a regression SLOPE (return per unit
+# variance jump): xi_s | xi_v ~ N(rho_J_slope * xi_v, sigma_s^2). Using the
+# correlation directly as a slope made the term ~5 orders of magnitude too small
+# to matter (vol_jump_mag is in hourly-variance units, ~1e-5..1e-3; a correlation
+# of ~-0.08 times that is ~-1e-6, far below a typical jump size of ~0.02-0.04).
+# Default 0.0 = term off (the old effective behavior, now explicit). Nonzero
+# values come from calibration (JumpCalibrationResult.rho_j_slope /
+# RegimeJumpResult.rho_j_slope, see jump_calibration._estimate_vol_jump_params).
+SVCJ_RHO_J_SLOPE = 0.0
 SVCJ_LAM_V = None        # If None, uses same lambda as return jumps
 SVCJ_SIGMA_S = 0.01      # Conditional std dev of return jump given vol jump (Eraker 2004)
 # FIX 5 (H3): persistence (per-hour decay) of the SVCJ variance-jump state on the
@@ -182,6 +193,8 @@ def load_and_prep_data(
 
     # Apply training start date filter if date column present (Phase 0.1)
     date_col = col_map.get('date', col_map.get('timestamp'))
+    # M5 fallback: keep pre-filter copy in case we need to restore all data
+    hourly_df_prefilter = hourly_df.copy()
     if date_col and training_start_date is not None:
         hourly_df[date_col] = pd.to_datetime(hourly_df[date_col], utc=True, errors='coerce')
         start_dt = pd.Timestamp(training_start_date, tz='UTC')
@@ -191,9 +204,9 @@ def load_and_prep_data(
                 f"Only {len(hourly_df)} rows after training_start_date={training_start_date}. "
                 "Falling back to all data."
             )
-            # Reload without filter
-            if hourly_df is None:
-                hourly_df = pd.read_csv(hourly_csv)
+            # Restore from pre-filter copy and re-log
+            hourly_df = hourly_df_prefilter.copy()
+            logger.info(f"Using all {len(hourly_df)} available rows for GARCH fitting.")
 
     # Calculate Log Returns: ln(S_t / S_{t-1})
     hourly_returns = np.log(hourly_df[close_col] / hourly_df[close_col].shift(1)).dropna()
@@ -388,6 +401,61 @@ def _compute_figarch_weights(d: float, phi: float, beta: float, trunc_k: int = F
 
 
 # ==============================================================================
+# JUMP-FILTERED RETURNS (FIX 1 / H1)
+# ==============================================================================
+
+def filter_jump_returns(returns: pd.Series, clip_mult: float = 3.0) -> pd.Series:
+    """
+    Winsorize detected jump-bar returns to +/- clip_mult * local bipower sigma so
+    a subsequent GARCH/FIGARCH fit sees (approximately) the diffusion component
+    only.
+
+    FIX 1 (H1): `fit_garch_model` previously fit on raw hourly returns, including
+    jumps, while `simulate_paths` separately adds a calibrated compound-Poisson
+    jump process on top -- double-counting jump variance in the simulated total
+    (see PRICING_REVIEW.md H1, ~10% vol overstatement at typical calibration).
+    Winsorizing (not dropping) jump bars keeps the series length and index intact
+    for `arch_model` while removing most of the jump's contribution to the
+    likelihood; the tail residual left after clipping to +/-3 local sigma is a
+    minor, symmetric approximation error, not a second jump channel.
+
+    Detection: `detect_jumps_bipower(returns, return_sigma=True)` (Lee-Mykland),
+    the SAME detector used for jump calibration, so the GARCH fit and the jump
+    calibration agree on which bars are "jumps". Non-jump bars are unchanged.
+
+    Args:
+        returns: pd.Series of log returns (hourly, in this codebase).
+        clip_mult: Winsorize half-width in local-sigma units. Default 3.0.
+
+    Returns:
+        A new pd.Series aligned to the input index. On detection failure, an
+        all-False mask, or no bars with a valid local sigma, returns a copy of
+        the input unchanged (logged at debug level) -- this also guarantees the
+        zero-jumps case is bit-identical to the unfiltered series.
+    """
+    from core.pricing.jump_calibration import detect_jumps_bipower
+
+    arr = returns.to_numpy()
+    try:
+        jump_mask, sigma_local = detect_jumps_bipower(arr, return_sigma=True)
+    except Exception as e:
+        logger.debug("filter_jump_returns: detection failed (%s); returning input unchanged", e)
+        return returns.copy()
+
+    valid_mask = jump_mask & np.isfinite(sigma_local) & (sigma_local > 0)
+    if not np.any(valid_mask):
+        logger.debug("filter_jump_returns: no jumps detected; returning input unchanged")
+        return returns.copy()
+
+    filtered = arr.copy()
+    lo = -clip_mult * sigma_local
+    hi = clip_mult * sigma_local
+    filtered[valid_mask] = np.clip(arr[valid_mask], lo[valid_mask], hi[valid_mask])
+
+    return pd.Series(filtered, index=returns.index, name=returns.name)
+
+
+# ==============================================================================
 # MODEL FITTING
 # ==============================================================================
 
@@ -397,6 +465,7 @@ def fit_garch_model(
     use_figarch: bool = False,
     figarch_d: float = FIGARCH_D,
     figarch_trunc_k: int = FIGARCH_TRUNC_K,
+    filter_jumps: bool = True,
 ):
     """
     Fit GARCH(1,1) or FIGARCH(1,d,1) with Student-t errors via the `arch` library.
@@ -416,6 +485,12 @@ def fit_garch_model(
         figarch_d: Unused when live-fitting FIGARCH (d comes from fit).
             Retained for backward compat; FIGARCH_D constant used in tests only.
         figarch_trunc_k: Unused when live-fitting FIGARCH (FIGARCH_TRUNC_K used).
+        filter_jumps: If True (default), winsorize detected jump bars via
+            `filter_jump_returns` BEFORE the `* 100` scaling, for both the
+            FIGARCH and GARCH branches (FIX 1/H1 -- this default IS the fix, so
+            `last_variance` comes from the jump-filtered fit, which is what the
+            simulator needs since it adds jumps back on top separately). False
+            preserves the legacy raw-return fit for A/B comparison.
 
     Returns:
         For FIGARCH: Dict with omega, beta, nu, mu, last_variance, use_figarch,
@@ -423,6 +498,22 @@ def fit_garch_model(
             (No 'alpha' key — consumers should use .get('alpha', 0.0).)
         For GARCH: Dict with omega, alpha, beta, nu, mu, last_variance.
     """
+    # FIX 1 (H1): filter jump bars before fitting so BOTH branches below (FIGARCH
+    # and GARCH) see the jump-filtered series -- this reassigns `returns` once,
+    # upstream of `scaled_returns`, rather than duplicating the filter per branch.
+    if filter_jumps:
+        filtered_returns = filter_jump_returns(returns)
+        n_changed = int(np.sum(~np.isclose(
+            filtered_returns.to_numpy(), returns.to_numpy(), equal_nan=True
+        )))
+        if len(returns) > 0 and n_changed > 0.05 * len(returns):
+            logger.warning(
+                "filter_jump_returns changed %d/%d observations (%.1f%%) -- "
+                "unexpectedly high for a 1%% bipower jump test; proceeding anyway.",
+                n_changed, len(returns), 100.0 * n_changed / len(returns),
+            )
+        returns = filtered_returns
+
     # 1. Scale returns for numerical stability
     scaled_returns = returns * 100
 
@@ -629,12 +720,16 @@ def simulate_paths(
     on HOURLY steps.
 
     MEASURE NOTE (FIX 9 / M3): by default this simulates under the PHYSICAL measure
-    and is MEDIAN-anchored (use_naive_prior sets μ=0 with only the jump-drift
-    compensator subtracted; there is NO diffusion convexity / Jensen correction). It
-    is therefore NOT a risk-neutral distribution and E[S_T] ≠ S0 in general. The
-    risk-neutral switch is `martingale_anchor=True`, which uses the exponential
-    cumulant compensator so E[S_T]=S0. Downstream `p_market_fit` (formerly p_rn_fit)
-    is a logistic fit to MARKET prices, not a risk-neutral model probability.
+    and is log-mean anchored (E[log S_T] = log S0); the median coincides only for
+    a symmetric log distribution. use_naive_prior sets μ=0 with only the
+    jump-drift compensator subtracted; there is NO diffusion convexity / Jensen
+    correction. It is therefore NOT a risk-neutral distribution and E[S_T] ≠ S0
+    in general. The risk-neutral switch is `martingale_anchor=True`, which
+    corrects the JUMP compensator only; the diffusion Jensen term (~ +sigma^2/2
+    per step, roughly +1% at 30 days at 50% annualized vol) is NOT subtracted,
+    and Student-t exponential moments are finite only due to the per-step return
+    clip. Downstream `p_market_fit` (formerly p_rn_fit) is a logistic fit to
+    MARKET prices, not a risk-neutral model probability.
 
     Phase 1.1 (use_naive_prior): Sets μ=0, anchoring distribution on current price.
     Phase 1.3 (use_svcj): Adds correlated volatility jumps (Eraker 2004 specification).
@@ -647,6 +742,9 @@ def simulate_paths(
         S0: Current spot price.
         garch_params: Dict with omega, alpha, beta, nu, mu, last_variance.
         jump_params: Dict with lambda, crash_prob, eta_up, eta_down (or None).
+            Also accepts mu_v, rho_J (reporting only, FIX 4/M1), rho_j_slope
+            (the SVCJ return-vol regression slope actually used in the return
+            equation), sigma_s, svcj_persist.
         hours_to_expiry: Float, number of hours until expiry.
         n_sims: Number of Monte Carlo paths.
         seed: Random seed for reproducibility.
@@ -674,6 +772,7 @@ def simulate_paths(
         eta_down = ETA_DOWN
         svcj_mu_v = SVCJ_MU_V
         svcj_rho_j = SVCJ_RHO_J
+        svcj_rho_j_slope = SVCJ_RHO_J_SLOPE
         svcj_sigma_s = SVCJ_SIGMA_S
         svcj_persist = SVCJ_PERSIST
     else:
@@ -683,6 +782,7 @@ def simulate_paths(
         eta_down = jump_params.get('eta_down', ETA_DOWN)
         svcj_mu_v = jump_params.get('mu_v', SVCJ_MU_V)
         svcj_rho_j = jump_params.get('rho_J', SVCJ_RHO_J)
+        svcj_rho_j_slope = jump_params.get('rho_j_slope', SVCJ_RHO_J_SLOPE)
         svcj_sigma_s = jump_params.get('sigma_s', SVCJ_SIGMA_S)
         svcj_persist = jump_params.get('svcj_persist', SVCJ_PERSIST)
 
@@ -695,6 +795,7 @@ def simulate_paths(
         eta_down = rp.get('eta_down', eta_down)
         svcj_mu_v = rp.get('mu_v', svcj_mu_v)
         svcj_rho_j = rp.get('rho_J', svcj_rho_j)
+        svcj_rho_j_slope = rp.get('rho_j_slope', svcj_rho_j_slope)
         svcj_sigma_s = rp.get('sigma_s', svcj_sigma_s)
         svcj_persist = rp.get('svcj_persist', svcj_persist)
         logger.debug(f"Regime-conditional jumps ({regime_label}): lam={lam:.1f}, p_crash={p_crash:.2f}")
@@ -889,7 +990,14 @@ def simulate_paths(
                 # on jump events. Both the deterministic ρ_J term and the stochastic
                 # residual must be masked to jumping paths — leaking the residual to
                 # non-jumping paths injects spurious per-step variance into every path.
-                correlated_adjustment = svcj_rho_j * vol_jump_mag  # already 0 off-mask
+                # FIX 4 (M1): the Eraker equation's rho_J is a SLOPE (return per unit
+                # variance jump), not the dimensionless Pearson correlation reported
+                # as svcj_rho_j (kept above for logs/meta only). svcj_rho_j_slope is
+                # in the correct units; using svcj_rho_j here made the term ~5 orders
+                # of magnitude too small to matter (see SVCJ_RHO_J_SLOPE comment).
+                # Co-timing (shared Poisson k) + vol-jump persistence remain the
+                # dominant SVCJ correlation channels regardless of this term.
+                correlated_adjustment = svcj_rho_j_slope * vol_jump_mag  # already 0 off-mask
                 stochastic_residual = rng.normal(0, svcj_sigma_s, size=n_sims)
                 stochastic_residual[~mask_vol_jump] = 0.0
                 jump_sizes += correlated_adjustment + stochastic_residual
@@ -1087,6 +1195,8 @@ def calculate_probabilities(
     # snapshot instead of once per expiry group.
     garch_cache: Optional[dict] = None,
     s0_override: Optional[float] = None,
+    # T9 (M5): vol_gate_regime affects jump intensity scaling in simulate_paths
+    vol_gate_regime: str = "normal",
 ):
     """
     Calculates probabilities for multiple strikes using hourly simulation.
@@ -1130,7 +1240,7 @@ def calculate_probabilities(
         # Very long horizon: naive prior only, no model complexity
         logger.info(
             f"Horizon gate: T={days_to_expiry:.0f}d > {HORIZON_LONG_DAYS}d. "
-            "Using naive prior only (μ=0, no jumps)."
+            "Kou return jumps retained; SVCJ/skew/FIGARCH/regime/XGB disabled."
         )
         use_naive_prior = True
         use_regime_switching = False
@@ -1186,6 +1296,10 @@ def calculate_probabilities(
 
     # ---- Regime Detection (Phase 1.2) ----
     regime_weights = {"bear": 0.0, "sideways": 1.0, "bull": 0.0}
+    # T6 (H3): horizon-propagated weights actually used for path allocation
+    # (see below); defaults to the t0 posterior until a successful fit.
+    regime_weights_used = regime_weights
+    regime_variance_scales = {"bear": 1.0, "sideways": 1.0, "bull": 1.0}
     dominant_regime = "sideways"
 
     if use_regime_switching and regime_detector is not None:
@@ -1204,76 +1318,133 @@ def calculate_probabilities(
             # In live mode as_of is None → RegimeDetector.fit falls back to wall time.
             regime_weights, dominant_regime = regime_detector.fit_predict(daily_ret, now=as_of)
             logger.info(f"Regime detection: dominant={dominant_regime}, weights={regime_weights}")
+
+            # T6 (H3): a 14-30 DTE contract should not be priced with today's
+            # regime posterior held fixed over the entire path -- propagate it
+            # through the transition matrix (average-occupancy approximation,
+            # PRICING_REVIEW.md H3 point 3). Guard on FIT SUCCESS
+            # (regime_detector._model is not None), NOT on weight values: an
+            # all-sideways posterior {bear:0, sideways:1, bull:0} is a
+            # legitimate fit result, identical in VALUE to the unfitted
+            # default, so it must not be treated as "fit failed".
+            if regime_detector._model is not None:
+                regime_weights_used = regime_detector.predict_weights(
+                    n_days_ahead=int(round(days_to_expiry / 2))
+                )
+                regime_variance_scales = regime_detector.get_regime_variance_scales()
+            else:
+                regime_weights_used = regime_weights
         except Exception as e:
             logger.warning(f"Regime detection failed ({e}); using default sideways regime")
+            regime_weights_used = regime_weights
 
     # ---- Regime-Conditional Simulation OR Single Simulation ----
     if use_regime_switching and regime_detector is not None:
         # Mixture by PROPORTIONAL ALLOCATION: each active regime receives a path
-        # count proportional to its HMM posterior weight, summing to ~n_sims. This
-        # encodes the mixture in the sample itself (equal per-path weight downstream)
-        # and preserves the full effective sample size — the old fixed n_sims//3
-        # split dropped to ~n_sims/3 effective paths whenever one regime dominated.
+        # count proportional to its HORIZON-PROPAGATED HMM weight, summing to
+        # ~n_sims. This encodes the mixture in the sample itself (equal
+        # per-path weight downstream) and preserves the full effective sample
+        # size -- the old fixed n_sims//3 split dropped to ~n_sims/3 effective
+        # paths whenever one regime dominated.
         regime_labels = ["bear", "sideways", "bull"]
-        active = [(rl, regime_weights.get(rl, 0.0))
-                  for rl in regime_labels if regime_weights.get(rl, 0.0) >= 0.01]
+        active = [(rl, regime_weights_used.get(rl, 0.0))
+                  for rl in regime_labels if regime_weights_used.get(rl, 0.0) >= 0.01]
         total_w = sum(w for _, w in active)
 
-        all_paths = []
-        for i, (rl, w) in enumerate(active):
-            n_r = int(round(n_sims * w / total_w)) if total_w > 0 else 0
-            if n_r <= 0:
-                continue
-
-            # Distinct sub-seed per regime so the regime draws are INDEPENDENT.
-            # Sharing one seed across regimes correlates their innovations and
-            # breaks the mixture's independence assumption.
-            seed_r = None if seed is None else int(seed) + i + 1
-
-            # Regime-specific skewed-t lambda
+        # T6 (H3): sideways-only fast path. If the (horizon-propagated) mixture
+        # puts >=99% weight on a single label AND that label's variance scale
+        # is within +/-5% of neutral, the mixture machinery is pure overhead --
+        # skip straight to one simulation with that regime's params (preserves
+        # the pre-T6 fast-path semantics for the common near-unanimous case).
+        _dominant_used = max(regime_weights_used, key=regime_weights_used.get) if regime_weights_used else "sideways"
+        _dominant_scale = regime_variance_scales.get(_dominant_used, 1.0)
+        if regime_weights_used.get(_dominant_used, 0.0) >= 0.99 and 0.95 <= _dominant_scale <= 1.05:
             if use_skewed_t:
-                if rl == "bear":
-                    st_lam = -0.3  # Negative skew in bear
-                elif rl == "bull":
-                    st_lam = 0.2   # Positive skew in bull
+                if _dominant_used == "bear":
+                    st_lam = -0.3
+                elif _dominant_used == "bull":
+                    st_lam = 0.2
                 else:
-                    st_lam = 0.0   # Symmetric in sideways
+                    st_lam = 0.0
             else:
                 st_lam = SKEWED_T_LAMBDA_DEFAULT
 
             paths = simulate_paths(
-                S0=S0,
-                garch_params=garch_params,
-                jump_params=jump_params,
-                hours_to_expiry=hours_to_expiry,
-                n_sims=n_r,
-                seed=seed_r,
-                martingale_anchor=martingale_anchor,
-                use_naive_prior=use_naive_prior,
-                use_svcj=use_svcj,
-                use_skewed_t=use_skewed_t,
-                skewed_t_lam=st_lam,
-                use_figarch=use_figarch,
-                regime_jump_params=regime_params,
-                regime_label=rl,
-            )
-
-            all_paths.append(paths)
-
-        if not all_paths:
-            # Fallback: single simulation
-            paths = simulate_paths(
                 S0=S0, garch_params=garch_params, jump_params=jump_params,
                 hours_to_expiry=hours_to_expiry, n_sims=n_sims, seed=seed,
-                martingale_anchor=martingale_anchor,
-                use_naive_prior=use_naive_prior, use_svcj=use_svcj,
-                use_skewed_t=use_skewed_t, use_figarch=use_figarch,
-                regime_label=dominant_regime,
+                martingale_anchor=martingale_anchor, use_naive_prior=use_naive_prior,
+                use_svcj=use_svcj, use_skewed_t=use_skewed_t, skewed_t_lam=st_lam,
+                use_figarch=use_figarch, regime_jump_params=regime_params,
+                regime_label=_dominant_used, vol_gate_regime=vol_gate_regime,
             )
         else:
-            # Proportional allocation already encodes the mixture: equal weight.
-            paths = np.concatenate(all_paths)
-        weights_array = None
+            all_paths = []
+            for i, (rl, w) in enumerate(active):
+                n_r = int(round(n_sims * w / total_w)) if total_w > 0 else 0
+                if n_r <= 0:
+                    continue
+
+                # Distinct sub-seed per regime so the regime draws are INDEPENDENT.
+                # Sharing one seed across regimes correlates their innovations and
+                # breaks the mixture's independence assumption.
+                seed_r = None if seed is None else int(seed) + i + 1
+
+                # Regime-specific skewed-t lambda
+                if use_skewed_t:
+                    if rl == "bear":
+                        st_lam = -0.3  # Negative skew in bear
+                    elif rl == "bull":
+                        st_lam = 0.2   # Positive skew in bull
+                    else:
+                        st_lam = 0.0   # Symmetric in sideways
+                else:
+                    st_lam = SKEWED_T_LAMBDA_DEFAULT
+
+                # T6 (H3): per-regime variance scaling on a SHALLOW COPY of
+                # garch_params -- scaling omega scales the GARCH/FIGARCH
+                # unconditional variance by s (alpha/beta persistence
+                # unchanged); last_variance (the warm-start / FIGARCH eps^2
+                # init) scales too. NEVER mutate garch_params itself: it may
+                # be the caller's garch_cache-shared dict, reused across
+                # expiry groups and other regimes in this same call.
+                scale = regime_variance_scales.get(rl, 1.0)
+                garch_params_r = dict(garch_params)
+                garch_params_r['omega'] = garch_params_r['omega'] * scale
+                garch_params_r['last_variance'] = garch_params_r['last_variance'] * scale
+
+                paths = simulate_paths(
+                    S0=S0,
+                    garch_params=garch_params_r,
+                    jump_params=jump_params,
+                    hours_to_expiry=hours_to_expiry,
+                    n_sims=n_r,
+                    seed=seed_r,
+                    martingale_anchor=martingale_anchor,
+                    use_naive_prior=use_naive_prior,
+                    use_svcj=use_svcj,
+                    use_skewed_t=use_skewed_t,
+                    skewed_t_lam=st_lam,
+                    use_figarch=use_figarch,
+                    regime_jump_params=regime_params,
+                    regime_label=rl,
+                    vol_gate_regime=vol_gate_regime,
+                )
+
+                all_paths.append(paths)
+
+            if not all_paths:
+                # Fallback: single simulation
+                paths = simulate_paths(
+                    S0=S0, garch_params=garch_params, jump_params=jump_params,
+                    hours_to_expiry=hours_to_expiry, n_sims=n_sims, seed=seed,
+                    martingale_anchor=martingale_anchor,
+                    use_naive_prior=use_naive_prior, use_svcj=use_svcj,
+                    use_skewed_t=use_skewed_t, use_figarch=use_figarch,
+                    regime_label=dominant_regime, vol_gate_regime=vol_gate_regime,
+                )
+            else:
+                # Proportional allocation already encodes the mixture: equal weight.
+                paths = np.concatenate(all_paths)
     else:
         # ---- Single Simulation (legacy / non-regime path) ----
         paths = simulate_paths(
@@ -1290,8 +1461,8 @@ def calculate_probabilities(
             use_figarch=use_figarch,
             regime_jump_params=regime_params,
             regime_label=dominant_regime,
+            vol_gate_regime=vol_gate_regime,
         )
-        weights_array = None
 
     # ---- Phase 2.3: Directional XGBoost drift shift (FIX 3 / H2 re-enabled) ----
     # The XGBoost P(up) is applied ONCE to the assembled terminal distribution
@@ -1340,12 +1511,7 @@ def calculate_probabilities(
     # ---- Compute Probabilities ----
     results = {}
     for strike in strikes:
-        if weights_array is not None:
-            # Weighted probability from regime mixture
-            prob = np.average(paths >= strike, weights=weights_array)
-        else:
-            prob = get_contract_probability(paths, strike)
-
+        prob = get_contract_probability(paths, strike)
         results[strike] = float(prob)
 
     # ---- Build Extended Results ----
@@ -1354,6 +1520,15 @@ def calculate_probabilities(
         'hours_to_expiry': hours_to_expiry,
         'n_sims': n_sims,
         'regime_weights': regime_weights,
+        # T6 (H3): horizon-propagated weights actually used for path
+        # allocation (t0 posterior stepped forward through transmat_ by
+        # round(days_to_expiry/2) days); equals regime_weights when
+        # regime switching is off or n_days_ahead resolves to 0.
+        'regime_weights_used': regime_weights_used,
+        # T6 (H3): per-label variance scale actually applied to garch_params
+        # in the mixture branch (get_regime_variance_scales()); all-1.0 when
+        # regime switching is off/unfitted or the sideways-only fast path fired.
+        'regime_variance_scales': regime_variance_scales,
         'dominant_regime': dominant_regime,
         'use_naive_prior': use_naive_prior,
         'martingale_anchor': martingale_anchor,
@@ -1365,6 +1540,7 @@ def calculate_probabilities(
         'xgb_p_up': xgb_p_up,
         'xgb_delta_H': xgb_delta_H,
         'xgb_applied': xgb_applied,
+        'vol_gate_regime': vol_gate_regime,
         'horizon_gate_active': days_to_expiry > HORIZON_MEDIUM_DAYS,
     }
 
@@ -1395,8 +1571,8 @@ def load_calibrated_jumps(
 
     Returns:
         Dict with keys matching JumpCalibrationResult dataclass fields:
-        lam, p_crash, eta_up, eta_down, mu_v, rho_J, lam_v, n_jumps_detected,
-        fit_converged, calibration_date.
+        lam, p_crash, eta_up, eta_down, mu_v, rho_J, rho_j_slope, lam_v,
+        n_jumps_detected, fit_converged, calibration_date.
     """
     from core.pricing.jump_calibration import calibrate_jumps, JumpCalibrationResult
 
@@ -1421,6 +1597,9 @@ def load_calibrated_jumps(
             "eta_down": float(row["eta_down"]),
             "mu_v": float(row["mu_v"]),
             "rho_J": float(row["rho_J"]),
+            # FIX 4 (M1) READ path: pre-fix cache CSVs have no rho_j_slope column;
+            # .get() falls back to 0.0 (SVCJ_RHO_J_SLOPE default = term off).
+            "rho_j_slope": float(row.get("rho_j_slope", 0.0)),
             "lam_v": float(row.get("lam_v", row["lam"])),
             "n_jumps_detected": int(row.get("n_jumps_detected", 0)),
             "fit_converged": bool(int(row.get("fit_converged", 1))),
@@ -1440,6 +1619,11 @@ def load_calibrated_jumps(
             "eta_down": result.eta_down,
             "mu_v": result.mu_v,
             "rho_J": result.rho_J,
+            # FIX 4 (M1) WRITE path: without this, live-mode cal["rho_j_slope"]
+            # is always absent (KeyError-free via .get() downstream, but silently
+            # 0.0) and the T4 slope term is inert live even when calibration
+            # produces a nonzero slope.
+            "rho_j_slope": result.rho_j_slope,
             "lam_v": result.lam_v,
             "n_jumps_detected": result.n_jumps_detected,
             "fit_converged": result.fit_converged,
@@ -1480,6 +1664,7 @@ def build_regime_jump_params(
     base_eta_down: float = ETA_DOWN,
     base_mu_v: float = SVCJ_MU_V,
     base_rho_j: float = SVCJ_RHO_J,
+    base_rho_j_slope: float = SVCJ_RHO_J_SLOPE,
     base_sigma_s: float = SVCJ_SIGMA_S,
     calibrated: dict | None = None,
     regime_calibrated: dict | None = None,
@@ -1501,7 +1686,13 @@ def build_regime_jump_params(
             regime_name -> RegimeJumpResult or None.
 
     Returns:
-        Dict mapping regime_label -> dict of jump parameters.
+        Dict mapping regime_label -> dict of jump parameters. Every regime dict
+        carries `rho_j_slope` (FIX 4/M1) alongside the legacy `rho_J`. NOTE: the
+        bear 1.5x / bull 0.5x regime multipliers below now apply to rho_j_slope
+        (the term actually used in simulate_paths); rho_J keeps its own
+        multiplier for reporting compat, but is otherwise inert. Since
+        base_rho_j_slope defaults to 0.0 (SVCJ_RHO_J_SLOPE), the multipliers are
+        no-ops until a calibration supplies a nonzero slope -- that is intended.
     """
     # Determine base parameters
     if calibrated is not None and calibrated.get("fit_converged", False):
@@ -1511,6 +1702,7 @@ def build_regime_jump_params(
         base_eta_down = calibrated.get("eta_down", base_eta_down)
         base_mu_v = calibrated.get("mu_v", base_mu_v)
         base_rho_j = calibrated.get("rho_J", base_rho_j)
+        base_rho_j_slope = calibrated.get("rho_j_slope", base_rho_j_slope)
         logger.info("Using data-calibrated jump parameters as base")
 
     # Build per-regime dict
@@ -1532,6 +1724,9 @@ def build_regime_jump_params(
                 "eta_down": rc.eta_down,
                 "mu_v": rc.mu_v,
                 "rho_J": rc.rho_J,
+                # FIX 4 (M1): RegimeJumpResult.rho_j_slope (default 0.0 for
+                # results computed before this field existed).
+                "rho_j_slope": getattr(rc, "rho_j_slope", 0.0),
                 "sigma_s": base_sigma_s,  # sigma_s not regime-calibrated; use base
             }
             logger.info(
@@ -1540,7 +1735,10 @@ def build_regime_jump_params(
                 regime, rc.lam, rc.p_crash, rc.n_jumps,
             )
         else:
-            # Apply hardcoded multipliers to base parameters
+            # Apply hardcoded multipliers to base parameters. FIX 4 (M1): the
+            # bear/sideways/bull multipliers now apply to rho_j_slope (the term
+            # simulate_paths actually uses); rho_J keeps its own multiplier for
+            # reporting compat only.
             if regime == "bear":
                 regime_params[label] = {
                     "lambda": base_lam * 1.5,
@@ -1549,6 +1747,7 @@ def build_regime_jump_params(
                     "eta_down": base_eta_down * 0.7,
                     "mu_v": base_mu_v * 2.0,
                     "rho_J": base_rho_j * 1.5,
+                    "rho_j_slope": base_rho_j_slope * 1.5,
                     "sigma_s": base_sigma_s * 1.5,
                 }
             elif regime == "sideways":
@@ -1559,6 +1758,7 @@ def build_regime_jump_params(
                     "eta_down": base_eta_down,
                     "mu_v": base_mu_v,
                     "rho_J": base_rho_j,
+                    "rho_j_slope": base_rho_j_slope * 1.0,
                     "sigma_s": base_sigma_s,
                 }
             else:  # bull
@@ -1569,6 +1769,7 @@ def build_regime_jump_params(
                     "eta_down": base_eta_down,
                     "mu_v": base_mu_v * 0.6,
                     "rho_J": base_rho_j * 0.5,
+                    "rho_j_slope": base_rho_j_slope * 0.5,
                     "sigma_s": base_sigma_s * 0.7,
                 }
 

@@ -821,10 +821,10 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#blend-formula" class="md-nav__link">
+  <a href="#drift-shift-integration" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Blend Formula
+        Drift-Shift Integration
       
     </span>
   </a>
@@ -842,16 +842,27 @@
   
 </li>
         
+          <li class="md-nav__item">
+  <a href="#empirical-validation-this-projects-data" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Empirical Validation (this project's data)
+      
+    </span>
+  </a>
+  
+</li>
+        
       </ul>
     </nav>
   
 </li>
       
         <li class="md-nav__item">
-  <a href="#integration" class="md-nav__link">
+  <a href="#integration-points" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Integration
+        Integration points
       
     </span>
   </a>
@@ -2967,10 +2978,10 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#blend-formula" class="md-nav__link">
+  <a href="#drift-shift-integration" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Blend Formula
+        Drift-Shift Integration
       
     </span>
   </a>
@@ -2988,16 +2999,27 @@
   
 </li>
         
+          <li class="md-nav__item">
+  <a href="#empirical-validation-this-projects-data" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Empirical Validation (this project's data)
+      
+    </span>
+  </a>
+  
+</li>
+        
       </ul>
     </nav>
   
 </li>
       
         <li class="md-nav__item">
-  <a href="#integration" class="md-nav__link">
+  <a href="#integration-points" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Integration
+        Integration points
       
     </span>
   </a>
@@ -3045,8 +3067,17 @@
 
 <h1 id="directional-xgboost">Directional XGBoost<a class="headerlink" href="#directional-xgboost" title="Permanent link">&para;</a></h1>
 <p><code>core/pricing/directional_xgb.py</code></p>
-<p>XGBoost directional classifier that provides a P(up) modifier blended with the base SVCJ+HMM Monte Carlo distribution. Phase 2.3 of the pricing improvement plan.</p>
+<p>XGBoost directional classifier that provides a P(up) estimate used to <strong>drift-shift</strong> the base SVCJ+HMM Monte Carlo terminal distribution. Phase 2.3 of the pricing improvement plan.</p>
 <p>Based on: Paskaleva &amp; Vasenska (2025) — XGBoost 81% directional accuracy, Kim et al. (2025) — asymmetric features for up vs down, Oprea &amp; Bâra (2026) — meta-learning architecture.</p>
+<blockquote>
+<p><strong>FIX 3 / H2 (re-enabled).</strong> This component was originally disabled because the
+integration was wrong, not the model. The old design blended the P(up) into each
+strike's probability additively (<code>0.7·p_mc + 0.3·p_xgb</code>), which shifted every rung
+of the ladder by the same amount and <strong>broke monotonicity</strong>. It is now re-enabled
+as a single, strike-agnostic <strong>drift shift of the terminal distribution</strong> — see
+<a href="#drift-shift-integration">Drift-Shift Integration</a> below. Off by default
+(<code>XGB_TILT_LAMBDA = 0.0</code>; runners behind <code>--use-xgb</code>).</p>
+</blockquote>
 <h2 id="why-it-matters">Why It Matters<a class="headerlink" href="#why-it-matters" title="Permanent link">&para;</a></h2>
 <p>The base GARCH+SVCJ Monte Carlo distribution is directionally uninformative — it models volatility and tail behavior but does not incorporate directional signals from macro conditions or BTC momentum. The directional XGBoost provides a lightweight, interpretable P(up) estimate that tilts the distribution without replacing the structural model.</p>
 <h2 id="architecture">Architecture<a class="headerlink" href="#architecture" title="Permanent link">&para;</a></h2>
@@ -3058,10 +3089,11 @@
 │  (Gold, DXY,     │     └─────────────────────┘     └────────┬─────────┘
 │   VIX, SPX)      │                                          │
 └──────────────────┘                                          ▼
-                                                    ┌──────────────────┐
-                                                    │  Blend: 0.7×SVCJ │
-                                                    │  + 0.3×P(up)    │
-                                                    └──────────────────┘
+                                                    ┌──────────────────────┐
+                                                    │ Drift-shift terminal │
+                                                    │ paths: ×exp(Δ_H)     │
+                                                    │ (strike-agnostic)    │
+                                                    └──────────────────────┘
 </code></pre></div>
 <h2 id="model">Model<a class="headerlink" href="#model" title="Permanent link">&para;</a></h2>
 <h3 id="feature-engineering">Feature Engineering<a class="headerlink" href="#feature-engineering" title="Permanent link">&para;</a></h3>
@@ -3118,6 +3150,16 @@
 </tbody>
 </table>
 <p><strong>Target</strong>: Binary <code>(future_Nd_return &gt; 0)</code>, shifted by <code>-horizon_days</code> to prevent lookahead.</p>
+<blockquote>
+<p><strong>BTC-macro correlation features are computed in <code>build_features</code>, not read from
+the macro CSV.</strong> <code>macro_fetcher.fetch_macro_data()</code> writes <code>DATA/macro_daily.csv</code>
+WITHOUT <code>btc_gold_corr_30d</code> / <code>btc_dxy_corr_30d</code> (those need BTC, only added by the
+unused <code>merge_with_btc</code>). <code>build_features</code> therefore computes <code>btc_gold_corr</code> /
+<code>btc_dxy_corr</code> itself as a rolling-30 correlation between the date-joined BTC
+returns and <code>gold_ret</code> / <code>dxy_ret</code> (past-only window → leak-safe), preferring a
+precomputed <code>btc_*_corr_30d</code> column if one is present. Before this fix the two
+highest-value Köse features were silently dropped (6/8 macro features active).</p>
+</blockquote>
 <h3 id="classifier">Classifier<a class="headerlink" href="#classifier" title="Permanent link">&para;</a></h3>
 <div class="highlight"><pre><span></span><code><span class="n">xgb</span><span class="o">.</span><span class="n">XGBClassifier</span><span class="p">(</span>
     <span class="n">n_estimators</span><span class="o">=</span><span class="mi">100</span><span class="p">,</span>      <span class="c1"># Conservative — deep trees not needed</span>
@@ -3127,32 +3169,224 @@
 <span class="p">)</span>
 </code></pre></div>
 <p>Trained on 80/20 time-series split (no shuffle — respects temporal order). Minimum 200 training samples required.</p>
-<h3 id="blend-formula">Blend Formula<a class="headerlink" href="#blend-formula" title="Permanent link">&para;</a></h3>
-<p>The XGBoost P(up) is blended with the base MC probability:</p>
-<div class="highlight"><pre><span></span><code>p_final = 0.7 × p_mc + 0.3 × p_xgb
+<h3 id="drift-shift-integration">Drift-Shift Integration<a class="headerlink" href="#drift-shift-integration" title="Permanent link">&para;</a></h3>
+<p>The XGBoost P(up) is <strong>not</strong> mixed into per-strike probabilities. It is converted into a single constant shift of the simulated terminal distribution, applied once <strong>before</strong> the per-strike loop, so every strike is re-derived from the shifted paths and the ladder stays monotone by construction. Lives in <code>apply_xgb_drift_shift()</code> in <code>btc_pricing_engine.py</code>.</p>
+<p><strong>Math</strong> (<code>temp/xgb_activation_plan.md</code> §2):</p>
+<div class="highlight"><pre><span></span><code>log_ret  = log(paths / S0)                      # empirical horizon log-returns
+sigma_H  = std(log_ret);  p_base = mean(paths &gt;= S0)
+p_up&#39;    = clip(p_up, 0.15, 0.85)
+p_target = clip(0.5 + λ·(p_up&#39; − 0.5), 0.02, 0.98)
+Δ_H      = −quantile(log_ret, 1 − p_target)     # empirical-CDF inversion (exact)
+Δ_H      = clip(Δ_H, ±MAX_SHIFT_FRAC·sigma_H)   # safety cap
+paths   *= exp(Δ_H)
 </code></pre></div>
-<p>The 30% weight (Shelton 2024) deliberately limits ML influence — OOS evidence shows individual directional predictors are weak. The weight is applied per-strike in <code>calculate_probabilities()</code>.</p>
+<p>Empirical-CDF inversion (not a Gaussian probit) hits <code>p_target</code> exactly on the actual jump/regime/skew distribution. The multiplicative shift is monotone and shape-preserving.</p>
+<table>
+<thead>
+<tr>
+<th>Constant</th>
+<th>Default</th>
+<th>Role</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>XGB_TILT_LAMBDA</code> (λ)</td>
+<td><strong>0.0</strong></td>
+<td>tilt strength; inert by default, production value from calibration</td>
+</tr>
+<tr>
+<td><code>XGB_P_FLOOR / _CEIL</code></td>
+<td>0.15 / 0.85</td>
+<td>clip raw p_up</td>
+</tr>
+<tr>
+<td><code>XGB_P_TARGET_FLOOR / _CEIL</code></td>
+<td>0.02 / 0.98</td>
+<td>clip target P(up)</td>
+</tr>
+<tr>
+<td><code>XGB_MAX_SHIFT_FRAC</code></td>
+<td>0.5</td>
+<td>cap |Δ_H| as fraction of σ_H</td>
+</tr>
+<tr>
+<td><code>XGB_P_BASE_GUARD</code></td>
+<td>0.02</td>
+<td>skip shift when base P(up) ≈ 0 or 1 (deep skew)</td>
+</tr>
+<tr>
+<td><code>XGB_DTE_BUCKETS</code></td>
+<td>{≤7,7–14,14–30}d</td>
+<td>per-bucket models; train horizon = bucket midpoint</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Gating</strong>: Disabled by default (<code>use_xgb_direction=False</code>, λ=0.0). <strong>Skipped under <code>martingale_anchor=True</code></strong> (the tilt is a physical-measure directional view, incompatible with the risk-neutral martingale). Active only for DTE ≤30d (<code>dte_bucket_horizon</code> returns <code>None</code> beyond).</p>
 <h3 id="fallback-behavior">Fallback Behavior<a class="headerlink" href="#fallback-behavior" title="Permanent link">&para;</a></h3>
-<p>If the model is untrained, missing macro data, or prediction fails, returns 0.5 (neutral — no tilt). This ensures the pricing engine degrades gracefully to the structural model alone.</p>
-<h2 id="integration">Integration<a class="headerlink" href="#integration" title="Permanent link">&para;</a></h2>
-<p>The model sits inside <code>calculate_probabilities()</code> in <code>btc_pricing_engine.py</code> at Phase 2.3:</p>
-<div class="highlight"><pre><span></span><code><span class="k">if</span> <span class="n">use_xgb_direction</span> <span class="ow">and</span> <span class="n">xgb_model</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-    <span class="n">direction_modifier</span> <span class="o">=</span> <span class="n">xgb_model</span><span class="o">.</span><span class="n">predict_direction_adjustment</span><span class="p">(</span>
-        <span class="n">S0</span><span class="o">=</span><span class="n">S0</span><span class="p">,</span> <span class="n">hours_to_expiry</span><span class="o">=</span><span class="n">hours_to_expiry</span><span class="p">,</span> <span class="n">macro_df</span><span class="o">=</span><span class="n">macro_df</span><span class="p">,</span>
-    <span class="p">)</span>
-    <span class="n">prob</span> <span class="o">=</span> <span class="p">(</span><span class="mi">1</span> <span class="o">-</span> <span class="n">XGB_WEIGHT</span><span class="p">)</span> <span class="o">*</span> <span class="n">prob</span> <span class="o">+</span> <span class="n">XGB_WEIGHT</span> <span class="o">*</span> <span class="n">direction_modifier</span>
-    <span class="n">prob</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">clip</span><span class="p">(</span><span class="n">prob</span><span class="p">,</span> <span class="mf">0.01</span><span class="p">,</span> <span class="mf">0.99</span><span class="p">)</span>
-</code></pre></div>
-<p><strong>Gating</strong>: Disabled by default (<code>use_xgb_direction=False</code>). Auto-disabled beyond 30-day horizon (medium-horizon gate).</p>
+<p>If the model is untrained, missing macro data, prediction fails, or the model is malformed, <code>predict_direction_adjustment</code> returns 0.5 → <code>Δ_H = 0</code> → paths unchanged. The engine also wraps the whole XGB block in try/except and falls back to unshifted paths on any error. Macro-absent runs fall back to BTC-only features, which carry little directional signal (expect near-neutral).</p>
+<h3 id="empirical-validation-this-projects-data">Empirical Validation (this project's data)<a class="headerlink" href="#empirical-validation-this-projects-data" title="Permanent link">&para;</a></h3>
+<p>A walk-forward OOS check (weekly step, train strictly on <code>index &lt; as_of</code>, score
+P(up) against the realized forward H-day return). This is <strong>expanding-window
+walk-forward (~208 OOS folds), NOT the codebase 70/30 IS/OOS</strong> (<code>in_sample_oos.py</code>,
+which is a single-cutoff partition for the <em>contract</em> backtest, not the directional
+signal). <strong>The traded book is 1–7 DTE, so only the <code>≤7</code> DTE bucket ever fires in
+production</strong> — that is the band that matters. Scripts:
+<code>temp/xgb_macro_walkforward.py</code>, <code>temp/xgb_macro_seed_moneyness.py</code>,
+<code>temp/xgb_bootstrap_dauc.py</code>.</p>
+<p><strong>Per-day OOS AUC (traded band):</strong></p>
+<table>
+<thead>
+<tr>
+<th>Horizon (DTE)</th>
+<th>BTC-only AUC</th>
+<th>BTC+macro AUC</th>
+<th>Best Spearman</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1d</td>
+<td>0.507</td>
+<td>0.524</td>
+<td>ns (p=0.98)</td>
+</tr>
+<tr>
+<td>2d</td>
+<td>0.457</td>
+<td>0.491</td>
+<td>ns (p=0.71)</td>
+</tr>
+<tr>
+<td>3d</td>
+<td>0.490</td>
+<td>0.499</td>
+<td>ns (p=0.42)</td>
+</tr>
+<tr>
+<td>4d</td>
+<td>0.473</td>
+<td>0.494</td>
+<td>ns (p=0.81)</td>
+</tr>
+<tr>
+<td>5d</td>
+<td>0.495</td>
+<td><strong>0.534</strong></td>
+<td>ns (p=0.79)</td>
+</tr>
+<tr>
+<td>6d</td>
+<td>0.477</td>
+<td>0.499</td>
+<td>ns (p=0.24)</td>
+</tr>
+<tr>
+<td>7d</td>
+<td>0.471</td>
+<td>0.492</td>
+<td>ns (p=0.59)</td>
+</tr>
+</tbody>
+</table>
+<ul>
+<li><strong>No tradeable directional skill at 1–7 DTE, macro or not.</strong> Every AUC ≈ 0.5
+  (0.46–0.53); no Spearman significant (all p &gt; 0.2). Sub-week BTC direction from
+  daily features is essentially a coin flip. <strong>5 of 7 macro AUCs are still below
+  0.50</strong> — macro mostly nudges a sub-coin-flip signal slightly less-sub-coin-flip.</li>
+</ul>
+<p><strong>Seed robustness — model is deterministic.</strong> Across 8 seeds the AUC std is
+<strong>0.0000 on every day</strong>: the classifier uses <code>subsample=1</code>, <code>colsample=1</code>, so
+XGBoost has no stochasticity for the seed to perturb. The "macro ≥ btc on every day"
+is therefore one deterministic result, not 8 independent draws. (Those sampling
+knobs are the lever if ensemble variance / regularization is ever wanted.)</p>
+<p><strong>Significance — paired bootstrap of ΔAUC (macro − btc), 5000 resamples:</strong></p>
+<table>
+<thead>
+<tr>
+<th>DTE</th>
+<th>ΔAUC</th>
+<th>95% CI</th>
+<th>p(Δ≤0)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>+0.018</td>
+<td>[−0.049, +0.086]</td>
+<td>0.30</td>
+</tr>
+<tr>
+<td>2</td>
+<td>+0.034</td>
+<td>[−0.029, +0.099]</td>
+<td>0.15</td>
+</tr>
+<tr>
+<td>3</td>
+<td>+0.010</td>
+<td>[−0.057, +0.078]</td>
+<td>0.39</td>
+</tr>
+<tr>
+<td>4</td>
+<td>+0.021</td>
+<td>[−0.039, +0.079]</td>
+<td>0.24</td>
+</tr>
+<tr>
+<td>5</td>
+<td>+0.039</td>
+<td>[−0.019, +0.098]</td>
+<td>0.10</td>
+</tr>
+<tr>
+<td>6</td>
+<td>+0.022</td>
+<td>[−0.039, +0.083]</td>
+<td>0.24</td>
+</tr>
+<tr>
+<td>7</td>
+<td>+0.021</td>
+<td>[−0.040, +0.080]</td>
+<td>0.25</td>
+</tr>
+</tbody>
+</table>
+<p>The macro lift is consistently positive but <strong>statistically insignificant</strong> — every
+95% CI straddles 0; best p ≈ 0.10 (H=5).</p>
+<p><strong>Moneyness breakdown.</strong> The XGB <code>P(up)</code> is strike-agnostic, but a "BTC above strike"
+contract at moneyness <code>m</code> resolves YES iff <code>ret_H &gt; ln(1+m)</code>, so the same predictions
+were re-scored against <code>outcome = (ret_H &gt; ln(1+m))</code> for <code>m ∈ {−2%,−1%,0,+1%,+2%}</code>
+(m&gt;0 = OTM call, m&lt;0 = ITM). Result: <strong>no moneyness bucket shows reliable skill</strong> —
+all cells hug 0.5 (0.40–0.58); isolated highs (H2/+2% = 0.575, H5/ATM = 0.534) are
+uncorroborated by neighbours → noise; deep OTM/ITM cells are class-imbalanced and
+unstable (several below 0.45).</p>
+<ul>
+<li>For context, at the <strong>untraded 30d horizon</strong> there IS modest momentum/vol-driven
+  skill (BTC-only AUC 0.628, Spearman 0.20 p=0.004), and there macro <em>degrades</em> it
+  (→0.569). Directional ML only has reach at horizons we don't price.</li>
+</ul>
+<p><strong>Consequence</strong>: <code>XGB_TILT_LAMBDA</code> stays <strong>0.0</strong> (macro wired but inert). The tilt is
+useless for the 1–7 DTE book; do not enable it — or trust the macro features —
+without re-validating after feature work. The λ grid-search was deliberately <strong>not</strong>
+run (λ only scales a non-improving signal). Note only the <code>≤7</code> DTE bucket activates
+in production — the <code>7–14</code> / <code>14–30</code> buckets are <strong>dead code for the current book</strong>.</p>
+<h2 id="integration-points">Integration points<a class="headerlink" href="#integration-points" title="Permanent link">&para;</a></h2>
+<ul>
+<li><strong>Live</strong> (<code>scripts/pipelines/batch_pricing_runner.py</code>): <code>--use-xgb</code> (+ <code>--xgb-lambda</code>). Trains per-DTE-bucket models once on the full live data, caches them, and applies <code>apply_xgb_drift_shift</code> to the simulated paths per expiry.</li>
+<li><strong>Backtest</strong> (<code>core/backtesting/backrunner.py</code>): <code>--use-xgb</code> (+ <code>--xgb-lambda</code>). Per-snapshot <strong>leak-free</strong>: trains per <code>(UTC date, DTE bucket)</code> on the strict-<code>&lt;</code> truncated daily returns + a <code>&lt; snapshot_time</code> macro slice, mirroring the jump/regime discipline. Threaded into <code>calculate_probabilities(use_xgb_direction=…, xgb_model=…, xgb_tilt_lambda=…)</code>.</li>
+<li><strong>IS/OOS</strong> (<code>core/backtesting/in_sample_oos.py</code>): XGB is walk-forward per-snapshot, <strong>NOT frozen</strong> at the cutoff (only M2 is). The leak verifier's BTC arm also re-applies the macro truncation rule.</li>
+</ul>
 <h2 id="training">Training<a class="headerlink" href="#training" title="Permanent link">&para;</a></h2>
-<p>Training is CLI-only — not automated in any pipeline:</p>
+<p><code>DirectionalXGB.train</code> / <code>train_from_slice(daily_returns, macro_df, horizon_days)</code> accept already-truncated data (preferred: a <strong>date-indexed <code>pd.Series</code></strong> of daily log returns so macro is joined by <strong>date</strong> — leak-safe — via <code>build_features</code>; a bare ndarray triggers legacy positional alignment with a warning). The standalone CLI still works:</p>
 <div class="highlight"><pre><span></span><code>python<span class="w"> </span>core/pricing/directional_xgb.py<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--btc<span class="w"> </span>DATA/btc_hourly.csv<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--macro<span class="w"> </span>DATA/macro_daily.csv<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--horizon<span class="w"> </span><span class="m">30</span>
+<span class="w">  </span>--btc<span class="w"> </span>DATA/btc_hourly.csv<span class="w"> </span>--macro<span class="w"> </span>DATA/macro_daily.csv<span class="w"> </span>--horizon<span class="w"> </span><span class="m">30</span>
 </code></pre></div>
 <p>Prerequisites: <code>DATA/btc_hourly.csv</code> (from <code>data_fetcher.py</code>) and <code>DATA/macro_daily.csv</code> (from <code>macro_fetcher.py</code>).</p>
-<p>The model is <strong>never serialized to disk</strong> — no pickle, no joblib, no checkpoint. Each session that needs XGBoost must train from scratch or receive a pre-trained instance via dependency injection.</p>
+<p><strong>Serialization</strong>: <code>DirectionalXGB.save(path)</code> / <code>DirectionalXGB.load(path)</code> persist the model + metadata (lazy <code>joblib</code>, falling back to stdlib <code>pickle</code>), so a session need not retrain from scratch.</p>
 <h2 id="uncalibrated-parameters">Uncalibrated Parameters<a class="headerlink" href="#uncalibrated-parameters" title="Permanent link">&para;</a></h2>
 <p>Several parameters remain at literature-sourced defaults and have not been empirically tuned on this project's data:</p>
 <table>
@@ -3166,10 +3400,10 @@
 </thead>
 <tbody>
 <tr>
-<td>Blend weight</td>
-<td>0.3</td>
+<td>Tilt strength <code>XGB_TILT_LAMBDA</code> (λ)</td>
+<td>0.0 (inert)</td>
 <td><strong>Critical</strong></td>
-<td>Grid-search via time-series CV over [0.05, 0.10, 0.20, 0.30, 0.40, 0.50]</td>
+<td>Keep at 0 until the directional signal validates OOS. Walk-forward (see <a href="#empirical-validation-this-projects-data">Empirical Validation</a>) shows no skill at 7/14d and macro-degraded skill at 30d, so the λ grid-search was deferred — fix the features first, then grid-search OOS AUC/Spearman over [0, 0.05, 0.10, 0.15, 0.20, 0.30]</td>
 </tr>
 <tr>
 <td><code>n_estimators</code></td>
@@ -3221,7 +3455,7 @@
 </tr>
 </tbody>
 </table>
-<p>The <strong>blend weight is the single most impactful number</strong> — it answers "how much do we trust the ML model vs. the structural model?" A literature citation is not a substitute for empirical calibration.</p>
+<p>The <strong>tilt strength λ is the single most impactful number</strong> — it answers "how much do we trust the ML model vs. the structural model?" It defaults to 0.0 (no effect) precisely because a literature citation is not a substitute for empirical calibration. On the current dataset the directional signal has not validated OOS (see <a href="#empirical-validation-this-projects-data">Empirical Validation</a>), so λ stays 0; set a production value from the backtest grid only <strong>after</strong> the signal earns its keep walk-forward.</p>
 <p>See <a href="../../api-reference/core/directional-xgb/">Directional XGBoost API Reference</a> for the full class and function reference.</p>
 
 

@@ -143,6 +143,7 @@ def _process_one(item: Dict[str, Any]) -> Optional[str]:
     from core.pricing.btc_pricing_engine import (
         calculate_probabilities, dte_bucket_horizon,
     )
+    from core.pricing.engine_config import build_engine_kwargs
 
     ts_str: str = item["ts_str"]
     ts_iso: str = item["ts_iso"]
@@ -230,6 +231,9 @@ def _process_one(item: Dict[str, Any]) -> Optional[str]:
                         "eta_down": cal.eta_down,
                         "mu_v": cal.mu_v,
                         "rho_J": cal.rho_J,
+                        # FIX 4 (M1): the SVCJ return-vol regression slope actually
+                        # used in simulate_paths (rho_J above is reporting-only).
+                        "rho_j_slope": cal.rho_j_slope,
                     }
                     # Per-regime jumps = calibrated base × literature multipliers.
                     # Avoids calibrate_regime_jumps (whose synthetic-timestamp path
@@ -237,6 +241,7 @@ def _process_one(item: Dict[str, Any]) -> Optional[str]:
                     regime_params = build_regime_jump_params(
                         calibrated={**jump_params, "lam": cal.lam,
                                     "p_crash": cal.p_crash, "rho_J": cal.rho_J,
+                                    "rho_j_slope": cal.rho_j_slope,
                                     "fit_converged": True}
                     )
             except Exception:
@@ -344,36 +349,40 @@ def _process_one(item: Dict[str, Any]) -> Optional[str]:
                 xgb_model = _get_xgb_model(bucket_h)
 
         try:
+            # T5 (H2): single source of truth for the v2 engine flag bundle,
+            # shared with the live pipelines so they cannot drift apart again.
+            # See core/pricing/engine_config.py docstring for exactly which
+            # keys are (by design) NOT covered here.
+            engine_kwargs = build_engine_kwargs(
+                advanced_features=advanced_features,
+                detector=detector,
+                regime_params=regime_params,
+                # FIX 2 (M1): calibrated jumps (leak-free, per-snapshot, bipower).
+                jump_params=jump_params,
+                n_sims=n_sims,
+                seed=seed,
+                # FIX 4 (H1): as_of threaded for leak-free deterministic regime
+                # refit gating during time-travel backtests.
+                as_of=ts_dt,
+                # FIX 3 (H2 re-enabled): XGBoost directional DRIFT shift (not the
+                # old invalid per-strike blend). Per-DTE-bucket model + leak-free
+                # macro.
+                use_xgb=use_xgb,
+                xgb_model=xgb_model,
+                xgb_tilt_lambda=xgb_tilt_lambda,
+                macro_df=xgb_macro_slice,
+            )
             probs = calculate_probabilities(
                 strikes=group_strikes,
                 hours_to_expiry=hours_to_expiry,
                 hourly_df=hourly_for_engine,
                 intraday_df=intraday_for_engine,
-                n_sims=n_sims,
-                seed=seed,
-                # FIX 2 (M1): calibrated jumps (leak-free, per-snapshot, bipower).
-                jump_params=jump_params,
-                use_svcj=advanced_features,
-                use_skewed_t=advanced_features,
-                use_figarch=advanced_features,
-                # FIX 4 (H1): regime switching is now actually wired — detector
-                # injected, as_of threaded for leak-free deterministic refit gating,
-                # and per-regime calibrated jump params supplied.
-                use_regime_switching=(advanced_features and detector is not None),
-                regime_detector=detector,
-                regime_params=regime_params,
-                as_of=ts_dt,
-                # FIX 3 (H2 re-enabled): XGBoost directional DRIFT shift (not the old
-                # invalid per-strike blend). Per-DTE-bucket model + leak-free macro.
-                use_xgb_direction=(use_xgb and xgb_model is not None),
-                xgb_model=xgb_model,
-                xgb_tilt_lambda=xgb_tilt_lambda,
-                macro_df=xgb_macro_slice,
                 disable_staleness_check=True,
                 # Per-snapshot dedup: fit GARCH/FIGARCH + derive S0 once, reuse
                 # across this snapshot's expiry groups (byte-identical output).
                 garch_cache=snapshot_garch_cache,
                 s0_override=snapshot_s0,
+                **engine_kwargs,
             )
 
             for _, row in group.iterrows():

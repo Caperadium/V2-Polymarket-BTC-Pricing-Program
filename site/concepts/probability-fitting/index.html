@@ -3023,12 +3023,18 @@
 <td>Smoothed model probability</td>
 </tr>
 <tr>
-<td><code>p_rn_fit</code></td>
+<td><code>p_market_fit</code> (alias <code>p_rn_fit</code>)</td>
 <td>Market prices or risk-neutral probs</td>
-<td>Smoothed market-implied probability</td>
+<td>Smoothed market-implied probability (fit to the <strong>market price</strong> — not a risk-neutral model prob; renamed from <code>p_rn_fit</code> per FIX 9)</td>
 </tr>
 </tbody>
 </table>
+<div class="admonition note">
+<p class="admonition-title">Known model risk (FIX 10)</p>
+<p>The fitted curve is a 2-parameter <strong>symmetric</strong> logistic with unweighted SSE,
+so it cannot represent the skewed SVCJ/skewed-t wings and over-weights the
+saturated 0/1 tails. It is a denoiser, not a full skewed risk-neutral density.</p>
+</div>
 <p>The gap between these curves is the <strong>edge</strong>:</p>
 <div class="highlight"><pre><span></span><code><span class="n">edge_vs_market_fit</span> <span class="o">=</span> <span class="n">p_model_fit</span> <span class="o">-</span> <span class="n">market_price</span>
 </code></pre></div>
@@ -3047,8 +3053,12 @@
 <td>Logistic-smoothed model probability</td>
 </tr>
 <tr>
-<td><code>p_rn_fit</code></td>
-<td>Logistic-smoothed risk-neutral probability</td>
+<td><code>p_model_cal</code></td>
+<td>Calibrated model probability (only when <code>USE_CALIBRATED_PROB=True</code>)</td>
+</tr>
+<tr>
+<td><code>p_market_fit</code></td>
+<td>Logistic fit to market price (alias: <code>p_rn_fit</code>, deprecated)</td>
 </tr>
 <tr>
 <td><code>edge_vs_market_fit</code></td>
@@ -3056,7 +3066,7 @@
 </tr>
 <tr>
 <td><code>edge_vs_rn_fit</code></td>
-<td>Fitted model prob − fitted RN prob</td>
+<td>Fitted model prob − fitted market-curve prob</td>
 </tr>
 </tbody>
 </table>
