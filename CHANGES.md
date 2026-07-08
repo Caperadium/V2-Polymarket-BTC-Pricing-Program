@@ -2,16 +2,6 @@
 
 <!-- Append one entry per logical task. Cleared after each push. -->
 
-- Streamline repo for VPS hosting (MM + dashboard): tidy `.gitignore` and untrack
-  non-source artifacts. Add ignore rules for `site/` (mkdocs build output), `*.db`
-  (SQLite runtime state incl. `market_maker/mm_state.db`), `backtest_log.txt` (the
-  `*.log` rule misses `.txt`), `Text Files/`, `Market Maker/` (research PDFs), and
-  the regenerated backtest data dumps `backtested_probabilities_pre_h1_backup/`,
-  `batch_results/`, `fitted_batch_results/`, plus `.pytest_cache/`. Untrack (files
-  kept on disk) `site/`, `polymarket_console.db`, `polymarket/intents.db`,
-  `backtest_log.txt`, `Text Files/`. `DOCS/`, `mkdocs.yml`, and `requirements-docs.txt`
-  stay tracked (legit source) and are excluded from the VPS copy at deploy time only.
-
 - Stage-A shadow runs from the dev machine caught and fixed TWO real quoting
   defects (this is exactly what shadow mode is for): (1) sigma_b estimation
   annualized 30s REST-mid microstructure jitter into belief vol (~2.5-3.5 per
@@ -284,3 +274,44 @@
   `tests/test_mm_market_data_client.py` now 15 tests, full MM suite 255
   passing. Verified against the live feed: 30s read-only smoke (4 tokens,
   July-10 ladder) connected, subscribed, and mirrored full L2 books.
+
+- Add the MM monitor dashboard page and engine start/stop control for VPS
+  deployment. New `app/pages/mm_monitor.py`: read-only Streamlit page (status
+  row with RUNNING/STARTING/STALLED/CRASHED/STOPPED badge + heartbeat age,
+  START/STOP/FORCE KILL buttons, PnL cards + equity curve, positions table
+  with q/q_max utilization and marks, fills tail, risk/liquidity/settlement
+  panels, our-spread-vs-market and tick-latency charts, historical run
+  selector, sleep+rerun auto-refresh); reads paper_state.db strictly read-only
+  (sqlite mode=ro URI + query_only, never MMStateStore) and CSVs via
+  mtime-busted cache with on_bad_lines=skip. New `market_maker/run_control.py`
+  (stdlib-only launcher/status side of the control-file protocol:
+  pid_alive posix/win32, engine_status with STARTING grace + reprice-aware
+  STALLED threshold, start_engine with O_EXCL start lock + parent-side PID
+  write + detached spawn + runner.log redirect, request_stop with PID-stamped
+  stop file, stop_engine, kill_engine). New `market_maker/pnl_report.py`
+  (settlement-aware fill_cash: SETTLEMENT pseudo-fills carry price=payoff_yes,
+  regular BUY_NO carries the NO-price; cash_by_market folded from the durable
+  fills table each snapshot so restarts cannot corrupt PnL; compute_pnl_rows
+  writes per-market + market_id-NULL TOTAL rows via the previously-unused pnl
+  table; realized = cash + q*avg_cost identity, unrealized vs mid/consensus,
+  worst-case bankroll_utilization; equity = bankroll + realized +
+  unrealized_mid with settlement payoffs inside realized). `paper_runner.py`
+  gains: --config JSON (new committed template
+  `market_maker/paper_run_config.json`; CLI flags override), --control-dir,
+  --minutes 0 = indefinite, --btc-refresh-s mtime-based re-read of the BTC
+  intraday csv (vol gate + settlement stay fresh on long runs), control-file
+  protocol (PID file written before heavy startup work, PID-stamped stop-file
+  polling, SIGTERM/SIGINT graceful stop, current_run.json with exit_reason,
+  per-run run_meta.json, atomic per-tick heartbeat.json carrying
+  tick_s/reprice_s), per-tick settlement gate (loop.settle once past the
+  12:00-ET expiry instant) and settle-then-snapshot PnL journaling (TOTAL
+  every tick, per-market every 20th). Plan iterated to GO with a plan-reviewer
+  agent (3 blockers fixed pre-build: settlement cash sign, settlement never
+  invoked, restart cash corruption). Tests: tests/test_mm_pnl_report.py (14),
+  tests/test_mm_run_control.py (10), tests/test_mm_paper_runner_control.py
+  (5); MM suite now 284 passing. Also fixes a ~1-in-8 suite flake (dummy
+  runner in the run_control tests wrote a single heartbeat, leaving RUNNING
+  observable for only 3x tick_s; it now heartbeats every loop iteration like
+  the real runner) and a production STALLED false-alarm (reprice ticks block
+  the loop for minutes; heartbeat now carries reprice_s and the threshold is
+  max(3*tick_s, reprice_s + 60)).
