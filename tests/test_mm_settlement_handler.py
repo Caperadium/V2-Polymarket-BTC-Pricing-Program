@@ -126,18 +126,19 @@ def test_no_outcome_settles_short_position(store):
     data = BTCDataProvider(intraday=intraday, daily=pd.DataFrame())
     handler = SettlementHandler(store, MMConfig(), data)
 
-    # Net short YES (holding NO): q=-50, avg_cost 0.30 (YES-terms cost basis
-    # for NO bought at 0.70), opened through the fills channel.
-    _open_via_fill(store, "mkt-no", Side.BUY_NO, 0.70, 50.0, 0.30, SETTLE_DT - timedelta(days=1))
+    # Net short YES (holding NO): q=-50, avg_cost 0.70 (raw YES-scale price of
+    # the opening BUY_NO fill, C0 -- no complement), opened through the fills
+    # channel.
+    _open_via_fill(store, "mkt-no", Side.BUY_NO, 0.70, 50.0, 0.70, SETTLE_DT - timedelta(days=1))
     # Strike 100000 > spot 99500 -> NO.
-    m = MarketPosition(market_id="mkt-no", strike=100000.0, q=-50.0, avg_cost=0.30)
+    m = MarketPosition(market_id="mkt-no", strike=100000.0, q=-50.0, avg_cost=0.70)
     result = handler.settle_expiry(EXPIRY, [m], now=SETTLE_DT + timedelta(minutes=5))
 
     ev = result.events[0]
     assert ev.outcome is SettlementOutcome.NO
     assert ev.q_settled == -50.0
     assert ev.payoff == pytest.approx(50.0 * (1.0 - 0.0))  # 50 NO shares pay 1 each
-    assert ev.pnl_realized == pytest.approx(-50.0 * (0.0 - 0.30))  # 15.0
+    assert ev.pnl_realized == pytest.approx(-50.0 * (0.0 - 0.70))  # 35.0
 
     inv = store.fold_fills_to_inventory().get("mkt-no")
     assert inv.q == pytest.approx(0.0)

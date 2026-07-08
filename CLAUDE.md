@@ -128,7 +128,7 @@ mkdocs serve
 |   |-- pricer_adapter.py         #   Sole boundary to core/pricing/btc_pricing_engine.py
 |   |-- fair_value_anchor.py      #   Beuoy bankroll-credibility consensus
 |   |-- quote_engine.py           #   Dalen AS / GLFT quoting
-|   |-- spread_builder.py         #   Additive spread terms -> QuoteSet
+|   |-- spread_builder.py         #   Additive spread terms (incl. belly widening) -> QuoteSet
 |   |-- ladder_hedger.py          #   No-arb repair + cross-strike hedging
 |   |-- robustness_sizing.py      #   Kelly -> Baker-McHale -> caps sizing
 |   |-- inventory_manager.py      #   Per-contract/per-ladder inventory (q, avg_cost)
@@ -137,8 +137,8 @@ mkdocs serve
 |   |-- order_lifecycle.py        #   QuoteSet -> venue actions, restart reconciliation
 |   |-- paper_fill_sim.py         #   Conservative queue-behind fill simulator
 |   |-- settlement_handler.py     #   12:00 ET settlement + synthetic closing fills
-|   |-- state_store.py            #   SQLite/WAL state (orders/fills/inventory/markets/...)
-|   |-- pnl_report.py             #   Settlement-aware PnL snapshots
+|   |-- state_store.py            #   SQLite/WAL state (orders/fills/inventory/markets/mid_log/...)
+|   |-- pnl_report.py             #   Settlement-aware PnL snapshots + per-region markout report
 |   |-- harness.py                #   PaperTradingLoop -- one-tick orchestration + settle/restart
 |   |-- run_control.py            #   Stdlib start/stop/status control-file protocol
 |   |-- shadow_runner.py          #   Stage-A read-only REST runner + resolve_event/resolve_next_event
@@ -336,7 +336,7 @@ Binary BTC market-making against Polymarket `bitcoin-above` ladders -- paper-tra
 - `market_data_client.py` -- `PolymarketFeedAdapter`: live CLOB WebSocket client, one connection per ladder; feed health is WS ping/pong liveness (`healthy()`), NOT message arrival (quiet books go silent 80s+).
 - `pricer_adapter.py` -- sole boundary to `core/pricing/btc_pricing_engine.py`; builds a `PricerSnapshot` over a densified strike grid.
 - `fair_value_anchor.py` -- Beuoy bankroll-credibility consensus probability + Bayes bankroll update.
-- `quote_engine.py` / `spread_builder.py` -- Dalen AS/GLFT quoting in log-odds space, composed into a `QuoteSet` per market.
+- `quote_engine.py` / `spread_builder.py` -- Dalen AS/GLFT quoting in log-odds space, composed into a `QuoteSet` per market via six additive spread terms: (1) base arrival markup (audit-only, embedded in the proposal), (2) adverse-selection buffer (`eps_base` + directive `eps_add`), (3) inventory skew (audit-only, embedded in the proposal), (4) robust widening (`sqrt(sigma2)` + credibility widening), (5) wing/tail widening outside `belly_band`, (6) belly widening inside it -- exact complements, exactly one of wing/belly fires per quote; belly charges a flat base plus a slope past `belly_widen_free_days`, since the belly is the pricer's softest region per `temp/suitability.md`. Confidence-tier day boundaries (`MMConfig.tier_full_max_days`/`tier_degraded_max_days`, 7d/14d) gate `wing_widen_scale` only -- no other quoting/sizing effect.
 - `ladder_hedger.py` -- mandatory PAV isotonic no-arb repair across the ladder before any order goes out.
 - `robustness_sizing.py` -- Kelly -> Baker-McHale shrinkage -> joint-ladder/bankroll caps -> fractional-Kelly.
 - `inventory_manager.py` -- per-contract/per-ladder position (q, avg_cost); `harness.py` (`PaperTradingLoop`) is the one-tick orchestrator wiring all of the above.
@@ -344,8 +344,8 @@ Binary BTC market-making against Polymarket `bitcoin-above` ladders -- paper-tra
 - `order_lifecycle.py` -- `QuoteSet`+`RiskDirective` -> venue actions with minimal churn; restart reconciliation (LIVE->UNKNOWN->reconciled).
 - `paper_fill_sim.py` -- conservative queue-behind fill model (no live orders; fills are simulated from the WS trade-print stream).
 - `settlement_handler.py` -- 12:00 ET settlement instant; a market resolves YES only if spot is **strictly above** the strike (venue-confirmed rule, matches the backtester's `resolve_outcome_yes`); emits a synthetic closing fill through the normal fill channel so `fold(fills) == inventory` holds through resolution.
-- `state_store.py` -- SQLite/WAL `MMStateStore` (orders/fills/inventory/quotes/pnl/settlements/**markets** registry -- the last persists `{market_id: (expiry_key, strike)}` so a restarted process can find a previous run's ladder to settle).
-- `pnl_report.py` -- settlement-aware PnL snapshots (realized = cash + q*avg_cost, folded from the durable fills table every tick).
+- `state_store.py` -- SQLite/WAL `MMStateStore` (orders/fills/inventory/quotes/pnl/settlements/**markets** registry/**mid_log** -- markets registry persists `{market_id: (expiry_key, strike)}` so a restarted process can find a previous run's ladder to settle; mid_log durably appends per-tick, per-market YES mids and backs `pnl_report.markout_report` via `mid_at_or_after`). Fill cost-basis price is YES-scale for both sides (never complemented for BUY_NO) -- `fold_fills_to_inventory` matches `inventory_manager`'s convention.
+- `pnl_report.py` -- settlement-aware PnL snapshots (realized = cash + q*avg_cost, folded from the durable fills table every tick) plus a pure `markout_report` function: per-region (belly/wing/unknown) x per-TTE-bucket (0-1d/1-2d/2-4d/4d+) x per-horizon (60s/600s/3600s, disjoint join windows -- each horizon's window is capped at the next horizon's start, exclusive upper bound) fill markout, measuring whether the pricer's belly bias bleeds through the Beuoy anchor into realized fill quality; each cell also reports `n_attempted` (eligible fills looked up, whether or not a mid was found) alongside `n` (successful hits) so "no fills" is distinguishable from "mids missing". `paper_runner.py` writes it to `<out_dir>/markout_report.json` every `PER_MARKET_SNAPSHOT_EVERY_N_TICKS` ticks; `app/pages/mm_monitor.py` renders it read-only, adding a computed coverage column (`n`/`n_attempted`). The report is a rolling 7-day window (`MARKOUT_LOOKBACK_S`), and `paper_runner.py` prunes `mid_log` to the same window (`state_store.prune_mid_log`) right after writing the report each cycle -- snapshot the state-db before this window rolls off if full-history markout analysis is ever needed, since pruned mids cannot be recomputed.
 - `run_control.py` -- stdlib-only start/stop/status control-file protocol (used by both `app/pages/mm_monitor.py` and `deploy/`'s systemd units).
 - `shadow_runner.py` -- Stage-A read-only REST-polling runner (fill-free by construction) plus `resolve_event`/`resolve_next_event` (shared with `paper_runner.py`) and `CachedEngine` (re-price cache over the real pricing engine, GARCH cache refit every `garch_refit_s`, default 6h).
 - `paper_runner.py` -- Stage-B runner: same wiring as Stage-A but fed from the live WS adapter, so trade prints reach the fill simulator. This is the VPS deployment target.

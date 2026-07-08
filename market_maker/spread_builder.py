@@ -1,7 +1,7 @@
 """Spread builder (plan Section 2.5, task S1, contract 4.5).
 
 Composes the final half-spread additively per side, in probability units, from
-five terms, then enforces floor/clamp/quantize/no-cross, in that order:
+six terms, then enforces floor/clamp/quantize/no-cross, in that order:
 
 1. base arrival markup: 1/k_arrival is a delta_x (log-odds half-spread);
    converted to p-units at the quote center (proposal.r_x) via the EXACT
@@ -20,9 +20,17 @@ five terms, then enforces floor/clamp/quantize/no-cross, in that order:
 5. wing/tail widening: outside MMConfig.belly_band, add a base wing width
    (module constant, same rationale as term 4) scaled by
    MMConfig.wing_widen_scale[confidence_tier].
+6. belly widening: inside MMConfig.belly_band (exact complement of term 5, so
+   exactly one of wing/belly fires per quote), add a flat base plus a slope
+   applied to time-to-expiry beyond a free-days window
+   (MMConfig.belly_widen_base_p / belly_widen_slope_p_per_day /
+   belly_widen_free_days) -- the belly is the model's softest region per
+   temp/suitability.md (+4.8c bias at 1-2d growing to +8.6c at 5-7d).
 
-Terms 1, 2, 4, 5 are symmetric (applied to bid down / ask up); term 3 is
-audit-only. Composition mechanics per plan 2.5: widen -> floor half-spread to
+Terms 2, 4, 5, 6 are symmetric (applied to bid down / ask up); terms 1 and 3
+are audit-only (already embedded in the proposal's x_bid/x_ask, reported in
+`terms` for decomposition, never added to the widening -- see the term-1
+inline comment). Composition mechanics per plan 2.5: widen -> floor half-spread to
 >= 1 tick -> clamp to the venue price band -> tick-quantize (floor bid, ceil
 ask, so quantization never shrinks the spread) -> resolve any crossing left by
 quantization by widening the ask one tick.
@@ -33,7 +41,7 @@ import math
 from datetime import datetime
 from typing import Optional
 
-from market_maker.config import MMConfig
+from market_maker.config import MMConfig, in_belly_band
 from market_maker.contracts import (
     ConfidenceTier,
     LiquidityState,
@@ -114,6 +122,7 @@ def build_quote_set(
     credibility_widen_scale: float = DEFAULT_CREDIBILITY_WIDEN_SCALE,
     wing_base_p: float = DEFAULT_WING_BASE_P,
     ts: Optional[datetime] = None,
+    tte_days: Optional[float] = None,
 ) -> QuoteSet:
     p_lo, p_hi = config.p_clamp
     ts_final = ts if ts is not None else proposal.ts
@@ -137,14 +146,31 @@ def build_quote_set(
     # term 4: robust widening
     robust_p = robust_scale * math.sqrt(max(sigma2, 0.0)) + (1.0 - credibility) * credibility_widen_scale
 
+    # terms 5/6: wing/tail vs belly widening share one membership test
+    # (config.in_belly_band, F7) -- wing = NOT in belly, belly = in belly, so
+    # exactly one of the two fires per quote by construction.
+    in_belly = in_belly_band(consensus_p, config.belly_band)
+
     # term 5: wing/tail widening (launch default)
-    belly_lo, belly_hi = config.belly_band
-    if consensus_p < belly_lo or consensus_p > belly_hi:
+    if not in_belly:
         wing_p = wing_base_p * config.wing_widen_scale.get(confidence_tier, 1.0)
     else:
         wing_p = 0.0
 
-    widen = eps_p + robust_p + wing_p  # markup + skew live in the proposal
+    # term 6: belly widening (temp/suitability.md). Flat base inside the free-
+    # days window; base + slope*(tte-free) beyond it. tte_days=None (caller did
+    # not pass it) falls back to base only, for back-compat.
+    if in_belly:
+        if tte_days is not None:
+            belly_p = config.belly_widen_base_p + config.belly_widen_slope_p_per_day * max(
+                0.0, tte_days - config.belly_widen_free_days
+            )
+        else:
+            belly_p = config.belly_widen_base_p
+    else:
+        belly_p = 0.0
+
+    widen = eps_p + robust_p + wing_p + belly_p  # markup + skew live in the proposal
 
     p_bid_center = sigmoid(proposal.x_bid, p_lo, p_hi)
     p_ask_center = sigmoid(proposal.x_ask, p_lo, p_hi)
@@ -177,6 +203,7 @@ def build_quote_set(
         "skew": skew_p,
         "robust": robust_p,
         "wing": wing_p,
+        "belly": belly_p,
         "floor_applied": floor_applied,
     }
 

@@ -68,9 +68,9 @@ def test_sigma2_math_and_ladder_max_and_grid_layout():
 @pytest.mark.parametrize(
     "tte_days,expected_tier",
     [
-        (14.0, ConfidenceTier.FULL),
-        (14.1, ConfidenceTier.DEGRADED),
-        (28.5, ConfidenceTier.MINIMAL),
+        (7.0, ConfidenceTier.FULL),
+        (7.1, ConfidenceTier.DEGRADED),
+        (14.1, ConfidenceTier.MINIMAL),
         (30.5, ConfidenceTier.NAIVE_GATED),
     ],
 )

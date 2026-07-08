@@ -62,6 +62,13 @@ class MMConfig:
         }
     )  # multipliers on the wing term (launch defaults, pending calibration)
 
+    # --- belly widening (temp/suitability.md: belly is the model's softest
+    # region, +4.8c bias at 1-2d growing to +8.6c at 5-7d; launch defaults
+    # pending Stage-B calibration) ---
+    belly_widen_base_p: float = 0.005  # flat extra half-spread inside belly_band (1-2d bias mostly shared with market -> small flat guard)
+    belly_widen_slope_p_per_day: float = 0.0075  # belly bias grows ~0.8c/day past belly_widen_free_days -- charge roughly the un-shared half
+    belly_widen_free_days: float = 2.0  # no slope inside the 1-2d MM sweet spot; flat base only
+
     # --- latency / execution (plan 2.12 / 6.3.4 defaults) ---
     placement_latency_ms: int = 2000  # plan default
     cancel_latency_ms: int = 2000  # plan default
@@ -93,10 +100,11 @@ class MMConfig:
     near_resolution_pull_hours: float = 24.0  # plan 2.10 / 10.8 default
     settlement_retry_window_hours: float = 24.0  # unsettleable retry window (plan 2.13)
 
-    # --- confidence-tier day boundaries (plan 2.1) ---
-    tier_full_max_days: float = 14.0  # FULL for tte <= 14d
-    tier_degraded_max_days: float = 28.0  # DEGRADED for 14-28d
-    tier_minimal_max_days: float = 30.0  # MINIMAL for 28-30d; NAIVE_GATED above
+    # --- confidence-tier day boundaries (plan 2.1; tightened per
+    # temp/suitability.md -- no backtest coverage past 7 DTE, 28d tail defect) ---
+    tier_full_max_days: float = 7.0  # FULL for tte <= 7d (suitability envelope: no coverage past 7 DTE)
+    tier_degraded_max_days: float = 14.0  # DEGRADED for 7-14d
+    tier_minimal_max_days: float = 30.0  # MINIMAL for 14-30d; NAIVE_GATED above
 
     # --- ladder machinery gate (plan 10.7) ---
     min_ladder_width_for_ladder_machinery: int = 3  # min strikes to enable ladder-level machinery (launch default)
@@ -104,3 +112,10 @@ class MMConfig:
     # --- requote tolerances (plan 2.11): no re-quote inside tolerance ---
     requote_price_tol: float = 0.005  # price units (launch default)
     requote_size_tol: float = 0.10  # fractional size change (launch default)
+
+
+def in_belly_band(p: float, belly_band: Tuple[float, float]) -> bool:
+    """Inclusive belly-band membership: belly_lo <= p <= belly_hi.
+    Single source of truth for spread terms (wing = NOT in belly,
+    belly term = in belly) and markout region tagging."""
+    return belly_band[0] <= p <= belly_band[1]

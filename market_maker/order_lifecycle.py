@@ -8,8 +8,11 @@ Side convention (inferred, not spelled out verbatim by contracts.py): the
 Side enum has only BUY_YES / BUY_NO -- no SELL_* value -- and the rest of the
 module (inventory_manager.apply_fill, state_store.fold_fills_to_inventory)
 already treats BUY_YES as +1 share and BUY_NO as -1 share, with cost basis
-tracked uniformly in YES-price terms (price for BUY_YES, 1-price for
-BUY_NO). Selling YES is economically identical to buying the complementary
+tracked uniformly in YES-price terms: the stored fill price is already
+YES-scale for both sides (the harness bridge un-complements the BUY_NO
+order-placement convention below before any fill reaches inventory_manager/
+state_store), so cost basis uses that raw price directly, with no per-side
+complement. Selling YES is economically identical to buying the complementary
 NO token, so: the bid (buy YES) is quoted as Side.BUY_YES @ bid_price; the
 ask (offer to sell YES) is quoted as Side.BUY_NO @ (1 - ask_price), same
 size. This keeps every order/fill on the single BUY_YES/BUY_NO axis the rest

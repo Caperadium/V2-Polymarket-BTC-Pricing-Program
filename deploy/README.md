@@ -73,6 +73,13 @@ event via `resolve_next_event`), `state_db: "market_maker/mm_paper_state.db"`
 (run indefinitely). Edit it in place if you want different tick/reprice
 cadence or bankroll; no code changes needed.
 
+**Start the 72h acceptance run (section 5) on a fresh `--state-db`.**
+Resuming a pre-fix state-db that has an open BUY_NO position will show a
+one-time step in the mm_monitor equity series at the deploy boundary (old
+snapshots keep the phantom -0.20/share from the pre-C0 accounting bug, new
+ones do not) -- harmless once understood, but avoid the confusion by
+starting the acceptance test on a database created after this fix.
+
 ## 2. Checking status
 
 ```bash

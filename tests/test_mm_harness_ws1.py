@@ -22,6 +22,7 @@ from market_maker.config import MMConfig
 from market_maker.contracts import ContractInv, SettlementEvent, SettlementOutcome, SpotSource
 from market_maker.harness import PaperTradingLoop
 from market_maker.order_lifecycle import SimClock
+from market_maker.pnl_report import markout_report
 from market_maker.settlement_handler import BTCDataProvider, settlement_instant_utc
 from market_maker.state_store import MMStateStore
 
@@ -299,3 +300,54 @@ def test_clean_rollover_already_terminal_emits_no_events(store):
     # unfiltered fills replay never created an entry, and the settle sync
     # loop had no event for it either.
     assert old_market_id not in loop.inv.snapshot(now).per_contract
+
+
+# ---------------------------------------------------------------------------
+# Change C harness integration (mm_suitability_alignment_plan.md C2/Tests):
+# a real fill via the normal tick() flow, later ticks logging mid_log rows,
+# and pnl_report.markout_report computed directly over the store yields the
+# expected cell.
+# ---------------------------------------------------------------------------
+
+
+def test_mid_log_written_every_tick_and_markout_report_over_store(store):
+    market_id, _strike = MARKETS[0]
+    loop = PaperTradingLoop(
+        store=store, expiry_key=EXPIRY, markets=MARKETS, engine_fn=_engine(),
+        config=MMConfig(gamma=0.5), clock=SimClock(START), vol_gate_fn=_vol_gate(),
+    )
+
+    # Tick 1: plain snapshot -> rests bid/ask quotes for both markets.
+    loop.tick(_moving_books(MARKETS, 0.0))
+
+    # Subsequent ticks: a large aggressor print through our resting bid on
+    # market_id only, guaranteed (once queue_ahead is exhausted) to produce a
+    # real fill (same technique as test_crash_before_settle_recovery above).
+    fills_seen = []
+    for _ in range(6):
+        loop.tick({market_id: _snapshot_msg(0.5, prints=[(0.01, 200.0)])})
+        fills_seen.extend([f for f in loop.last_fills if f.market_id == market_id])
+        if fills_seen:
+            break
+    assert fills_seen, "expected the scripted prints to produce at least one fill"
+    fill = fills_seen[0]
+
+    # mid_log: every tick so far appended a row for this market (full book
+    # snapshot every tick -> mm is never None).
+    mid_rows_so_far = store.get_mids(market_id)
+    assert len(mid_rows_so_far) >= 2
+    assert all(r.market_id == market_id for r in mid_rows_so_far)
+
+    # A few more ticks so a mid lands inside the h=60 markout window
+    # [fill.ts + 60, fill.ts + 660] (tick_dt_s defaults to 60s).
+    for _ in range(3):
+        loop.tick(_moving_books(MARKETS, 0.5))
+
+    report = markout_report(
+        store.get_fills(), store.mid_at_or_after, store.get_market_registry(),
+        loop.config.belly_band, horizons=(60.0,),
+    )
+    assert len(report["cells"]) >= 1
+    cell = report["cells"][0]
+    assert cell["horizon_s"] == 60.0
+    assert cell["n"] >= 1

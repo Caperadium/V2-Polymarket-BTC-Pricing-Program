@@ -76,7 +76,9 @@ def test_terms_decomposition_matches_pre_floor_half_spread():
     proposal_half_spread = half_spread_p_exact(proposal.r_x, proposal.delta_x, *config.p_clamp)
     # markup is AUDIT-ONLY (arrival already lives in proposal.delta_x — adding
     # it here double-counted arrival; Stage-A shadow finding 2026-07-07).
-    expected_half_spread = proposal_half_spread + qs.terms["eps"] + qs.terms["robust"] + qs.terms["wing"]
+    expected_half_spread = (
+        proposal_half_spread + qs.terms["eps"] + qs.terms["robust"] + qs.terms["wing"] + qs.terms["belly"]
+    )
     actual_half_spread = 0.5 * (qs.ask_price - qs.bid_price)
     assert actual_half_spread == pytest.approx(expected_half_spread, abs=1e-4)
     assert qs.terms["markup"] > 0.0  # still reported for decomposition audit
@@ -84,7 +86,7 @@ def test_terms_decomposition_matches_pre_floor_half_spread():
 
 def test_terms_dict_has_all_keys():
     qs = _build()
-    for key in ["markup", "eps", "skew", "robust", "wing", "floor_applied"]:
+    for key in ["markup", "eps", "skew", "robust", "wing", "belly", "floor_applied"]:
         assert key in qs.terms
 
 
@@ -120,6 +122,78 @@ def test_wing_larger_under_degraded_than_full():
     qs_full = _build(consensus_p=0.1, confidence_tier=ConfidenceTier.FULL)
     qs_degraded = _build(consensus_p=0.1, confidence_tier=ConfidenceTier.DEGRADED)
     assert qs_degraded.terms["wing"] > qs_full.terms["wing"]
+
+
+# ---------------------------------------------------------------------------
+# Belly term: exact complement of wing (exclusivity), free-days flat base,
+# slope beyond free days, tte_days=None back-compat
+# ---------------------------------------------------------------------------
+
+def test_belly_zero_outside_band_wing_zero_inside_exclusivity():
+    qs_belly = _build(consensus_p=0.5, tte_days=1.0)
+    assert qs_belly.terms["belly"] > 0.0
+    assert qs_belly.terms["wing"] == pytest.approx(0.0)
+
+    qs_wing = _build(consensus_p=0.1, tte_days=1.0)
+    assert qs_wing.terms["wing"] > 0.0
+    assert qs_wing.terms["belly"] == pytest.approx(0.0)
+
+
+def test_belly_base_only_at_or_below_free_days():
+    config = MMConfig()
+    qs_at_free = _build(config=config, consensus_p=0.5, tte_days=config.belly_widen_free_days)
+    assert qs_at_free.terms["belly"] == pytest.approx(config.belly_widen_base_p)
+
+    qs_below_free = _build(config=config, consensus_p=0.5, tte_days=0.5)
+    assert qs_below_free.terms["belly"] == pytest.approx(config.belly_widen_base_p)
+
+
+def test_belly_base_plus_slope_beyond_free_days():
+    config = MMConfig()
+    tte_days = 5.0
+    qs = _build(config=config, consensus_p=0.5, tte_days=tte_days)
+    expected = config.belly_widen_base_p + config.belly_widen_slope_p_per_day * (
+        tte_days - config.belly_widen_free_days
+    )
+    assert qs.terms["belly"] == pytest.approx(expected)
+
+
+def test_belly_tte_days_none_gives_base_only():
+    config = MMConfig()
+    qs = _build(config=config, consensus_p=0.5, tte_days=None)
+    assert qs.terms["belly"] == pytest.approx(config.belly_widen_base_p)
+
+
+# ---------------------------------------------------------------------------
+# F7: shared belly-band membership predicate (config.in_belly_band) --
+# boundary cases the review found missing, plus a complement-invariant sweep.
+# ---------------------------------------------------------------------------
+
+def test_belly_band_boundary_exact_lo_and_hi_fire_belly_not_wing():
+    config = MMConfig()
+    belly_lo, belly_hi = config.belly_band
+
+    qs_lo = _build(config=config, consensus_p=belly_lo, tte_days=1.0)
+    assert qs_lo.terms["belly"] > 0.0
+    assert qs_lo.terms["wing"] == pytest.approx(0.0)
+
+    qs_hi = _build(config=config, consensus_p=belly_hi, tte_days=1.0)
+    assert qs_hi.terms["belly"] > 0.0
+    assert qs_hi.terms["wing"] == pytest.approx(0.0)
+
+
+def test_belly_wing_exclusivity_sweep_including_edges():
+    # Sweep of consensus_p values including both belly_band edges: exactly
+    # one of wing/belly fires at every point (config.in_belly_band is the
+    # single source of truth both terms now share, F7).
+    config = MMConfig()
+    belly_lo, belly_hi = config.belly_band
+    p_values = [0.01, belly_lo - 0.05, belly_lo, 0.5, belly_hi, belly_hi + 0.05, 0.99]
+    for p in p_values:
+        qs = _build(config=config, consensus_p=p, tte_days=1.0)
+        wing_zero = qs.terms["wing"] == pytest.approx(0.0)
+        belly_zero = qs.terms["belly"] == pytest.approx(0.0)
+        assert wing_zero != belly_zero, f"p={p}: wing={qs.terms['wing']}, belly={qs.terms['belly']}"
 
 
 # ---------------------------------------------------------------------------

@@ -509,6 +509,158 @@ def test_markets_registry_empty_by_default(store):
 
 
 # ---------------------------------------------------------------------------
+# mid_log (mm_suitability_alignment_plan.md Change C1)
+# ---------------------------------------------------------------------------
+
+
+def test_append_mids_and_get_mids_round_trip(store):
+    store.append_mids(NOW, {"m1": 0.40, "m2": 0.60})
+    store.append_mids(NOW + timedelta(seconds=30), {"m1": 0.42})
+
+    all_rows = store.get_mids()
+    assert len(all_rows) == 3
+    assert {r.market_id for r in all_rows} == {"m1", "m2"}
+
+    m1_rows = store.get_mids("m1")
+    assert [r.mid for r in m1_rows] == [0.40, 0.42]
+    assert m1_rows[0].ts == NOW
+    assert m1_rows[1].ts == NOW + timedelta(seconds=30)
+
+
+def test_append_mids_empty_dict_is_noop(store):
+    store.append_mids(NOW, {})
+    assert store.get_mids() == []
+
+
+def test_idx_mid_log_market_ts_index_exists(store):
+    rows = store._conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'mid_log'"
+    ).fetchall()
+    names = {r["name"] for r in rows}
+    assert "idx_mid_log_market_ts" in names
+
+
+def test_mid_at_or_after_picks_first_row_at_or_after_bound(store):
+    store.append_mids(NOW, {"m1": 0.10})
+    store.append_mids(NOW + timedelta(seconds=60), {"m1": 0.20})
+    store.append_mids(NOW + timedelta(seconds=120), {"m1": 0.30})
+
+    # Bound lands exactly on the middle row -> that row (inclusive >=).
+    got = store.mid_at_or_after("m1", NOW + timedelta(seconds=60), NOW + timedelta(seconds=600))
+    assert got == pytest.approx(0.20)
+
+    # Bound lands strictly between rows -> the NEXT row at/after the bound,
+    # not the nearest.
+    got2 = store.mid_at_or_after("m1", NOW + timedelta(seconds=90), NOW + timedelta(seconds=600))
+    assert got2 == pytest.approx(0.30)
+
+
+def test_mid_at_or_after_outside_window_returns_none(store):
+    store.append_mids(NOW, {"m1": 0.10})
+    # Only row is before the window entirely.
+    got = store.mid_at_or_after("m1", NOW + timedelta(seconds=60), NOW + timedelta(seconds=120))
+    assert got is None
+
+
+def test_mid_at_or_after_no_rows_at_all_returns_none(store):
+    assert store.mid_at_or_after("m1", NOW, NOW + timedelta(seconds=600)) is None
+
+
+def test_mid_at_or_after_scoped_to_market_id(store):
+    store.append_mids(NOW, {"m1": 0.10, "m2": 0.90})
+    got = store.mid_at_or_after("m1", NOW, NOW + timedelta(seconds=1))
+    assert got == pytest.approx(0.10)
+    got_other = store.mid_at_or_after("m2", NOW, NOW + timedelta(seconds=1))
+    assert got_other == pytest.approx(0.90)
+    got_missing = store.mid_at_or_after("m3", NOW, NOW + timedelta(seconds=1))
+    assert got_missing is None
+
+
+def test_mid_at_or_after_microsecond_width_consistency(store):
+    # _dt_to_iso ground truth: Python's dt.isoformat() omits the microseconds
+    # field entirely when microsecond == 0, producing variable-width TEXT
+    # across rows. Mixing microsecond=0 and microsecond!=0 timestamps in the
+    # same market must still order correctly through the (market_id, ts)
+    # TEXT index -- this is the exact scenario the module docstring on
+    # mid_at_or_after calls out.
+    ts0 = NOW  # microsecond == 0 -> short ISO string
+    ts1 = NOW + timedelta(seconds=1, microseconds=500000)  # nonzero -> long ISO string
+    store.append_mids(ts0, {"m1": 0.10})
+    store.append_mids(ts1, {"m1": 0.20})
+
+    bound = NOW + timedelta(seconds=1)  # strictly between ts0 and ts1
+    got = store.mid_at_or_after("m1", bound, bound + timedelta(seconds=5))
+    assert got == pytest.approx(0.20)
+
+
+def test_mid_at_or_after_upper_bound_is_exclusive(store):
+    # F1: mid_at_or_after's upper bound flipped from `ts <= ts_max` to
+    # `ts < ts_max` -- a row landing exactly ON ts_max must now be excluded
+    # (this is what makes pnl_report.markout_report's abutting horizon
+    # windows disjoint rather than double-counting the boundary row).
+    ts_max = NOW + timedelta(seconds=600)
+    store.append_mids(ts_max, {"m1": 0.50})
+
+    got = store.mid_at_or_after("m1", NOW, ts_max)
+    assert got is None
+
+    # One microsecond earlier is inside the window.
+    store.append_mids(ts_max - timedelta(microseconds=1), {"m1": 0.40})
+    got_inside = store.mid_at_or_after("m1", NOW, ts_max)
+    assert got_inside == pytest.approx(0.40)
+
+
+# ---------------------------------------------------------------------------
+# mid_log pruning (F3)
+# ---------------------------------------------------------------------------
+
+
+def test_prune_mid_log_deletes_only_rows_strictly_older_than_bound(store):
+    store.append_mids(NOW - timedelta(days=10), {"m1": 0.10})
+    store.append_mids(NOW - timedelta(days=8), {"m1": 0.20})
+    bound = NOW - timedelta(days=7)
+    store.append_mids(bound, {"m1": 0.30})  # exactly on the bound -> survives (not "< bound")
+    store.append_mids(NOW - timedelta(days=1), {"m1": 0.40})
+
+    deleted = store.prune_mid_log(bound)
+    assert deleted == 2  # the two rows strictly older than `bound`
+
+    remaining = sorted(r.mid for r in store.get_mids("m1"))
+    assert remaining == [pytest.approx(0.30), pytest.approx(0.40)]
+
+
+def test_prune_mid_log_no_op_when_nothing_older(store):
+    store.append_mids(NOW, {"m1": 0.10})
+    deleted = store.prune_mid_log(NOW - timedelta(days=7))
+    assert deleted == 0
+    assert len(store.get_mids("m1")) == 1
+
+
+def test_prune_mid_log_after_report_leaves_rows_within_retention_intact(store):
+    # F3: paper_runner writes the markout report BEFORE pruning; this asserts
+    # the ordering invariant at the store level -- rows within the retention
+    # window used by a just-generated report survive a subsequent prune call,
+    # so a report generated immediately after pruning would see the same
+    # rows as one generated immediately before.
+    retention_s = 7 * 86400.0
+    now = NOW
+    within_row_ts = now - timedelta(seconds=retention_s - 3600.0)  # just inside retention
+    outside_row_ts = now - timedelta(seconds=retention_s + 3600.0)  # just outside retention
+    store.append_mids(within_row_ts, {"m1": 0.55})
+    store.append_mids(outside_row_ts, {"m1": 0.45})
+
+    # Simulate "read for the report" happening before the prune call.
+    pre_prune_rows = store.get_mids("m1")
+    assert len(pre_prune_rows) == 2
+
+    store.prune_mid_log(now - timedelta(seconds=retention_s))
+
+    post_prune_rows = store.get_mids("m1")
+    assert len(post_prune_rows) == 1
+    assert post_prune_rows[0].ts == within_row_ts
+
+
+# ---------------------------------------------------------------------------
 # Kill/restart round-trip
 # ---------------------------------------------------------------------------
 

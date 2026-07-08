@@ -292,9 +292,9 @@ class SettlementHandler:
             # SYNTHETIC CLOSING FILL (contract 4.11): side closes q; price is
             # the settlement value of a YES share (1.0 on YES, 0.0 on NO) --
             # the closing side (not the price) carries the sign, so the
-            # fold's per-side cost-basis conversion (price if BUY_YES else
-            # 1-price) yields the correct economics for whichever direction
-            # was held.
+            # fold's cost-basis, which uses this raw YES-scale price for
+            # every side (C0 fix -- no per-side complement), yields the
+            # correct economics for whichever direction was held.
             closing_side = Side.BUY_NO if m.q > 0.0 else Side.BUY_YES
             fill = Fill(
                 ts=now, market_id=m.market_id, order_id=f"settlement:{m.market_id}:{expiry_key}",

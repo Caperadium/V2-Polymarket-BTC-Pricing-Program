@@ -315,7 +315,7 @@ class PaperTradingLoop:
                 proposals[m], directives[m], decisions[m], self.venue_descriptor, cfg,
                 sigma2=float(snap.sigma2[k]), confidence_tier=snap.confidence_tier,
                 credibility=fv.credibility, consensus_p=float(fv.consensus_p[k]),
-                source_seq=self._tick, ts=now,
+                source_seq=self._tick, ts=now, tte_days=tte,
             )
             out.append((k, m, qs))
         return out
@@ -343,6 +343,7 @@ class PaperTradingLoop:
         # 1. book mirrors -> market states, liquidity update
         market_states = {}
         mids: Dict[float, float] = {}
+        mids_by_market: Dict[str, float] = {}
         for m, k in self.markets:
             self._apply_messages(m, messages_by_market.get(m, []), now)
             ms = self.books[m].emit(m, self.expiry_key, k)
@@ -353,6 +354,17 @@ class PaperTradingLoop:
             mm = _market_mid(ms)
             if mm is not None:
                 mids[k] = mm
+                mids_by_market[m] = mm
+
+        # C2 (mm_suitability_alignment_plan.md Change C): durably log this
+        # tick's per-market mids for the markout report BEFORE the
+        # `if fv is None: return` early-out below, so warmup ticks (no full
+        # book yet) still get their partial mids logged. `mids` above is
+        # STRIKE-keyed (consumed by fair-value/quote code below);
+        # `mids_by_market` is the separate market_id-keyed view the store
+        # needs.
+        if mids_by_market:
+            self.store.append_mids(now, mids_by_market)
 
         # 2. pricer snapshot (reuse previous on engine failure)
         hours = self._hours_to_expiry(now)
@@ -459,8 +471,15 @@ class PaperTradingLoop:
     # -- invariant helper -------------------------------------------------
 
     def fold_matches_inventory(self) -> bool:
-        """The 8.2 standing invariant: fold(fills).q == InventoryManager.q per
-        market (q_max/age are not fill-derived, so only q is compared)."""
+        """The 8.2 standing invariant: fold(fills).q == InventoryManager.q AND
+        fold(fills).avg_cost == InventoryManager.avg_cost per market, each to
+        1e-9 (q_max/age are not fill-derived, so only these two are
+        compared). The avg_cost leg was added by the C0 fix (mm_suitability_
+        alignment_plan.md pre-step C0): before it, state_store.
+        fold_fills_to_inventory complemented BUY_NO cost-basis prices while
+        InventoryManager did not, so the two could silently disagree on
+        avg_cost while still agreeing on q -- this invariant would not have
+        caught that class of bug."""
         folded = self.store.fold_fills_to_inventory()
         snap = self.inv.snapshot(self.clock.now())
         keys = set(folded) | set(snap.per_contract)
@@ -468,6 +487,10 @@ class PaperTradingLoop:
             fq = folded[k].q if k in folded else 0.0
             iq = snap.per_contract[k].q if k in snap.per_contract else 0.0
             if abs(fq - iq) > 1e-9:
+                return False
+            f_avg = folded[k].avg_cost if k in folded else 0.0
+            i_avg = snap.per_contract[k].avg_cost if k in snap.per_contract else 0.0
+            if abs(f_avg - i_avg) > 1e-9:
                 return False
         return True
 

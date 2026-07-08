@@ -473,6 +473,40 @@ def render_risk_panel(db_path: Optional[Path]) -> None:
         st.dataframe(settle_df, use_container_width=True, hide_index=True)
 
 
+def render_markout(out_dir: Optional[Path]) -> None:
+    """Read-only render of <out_dir>/markout_report.json (mm_suitability_
+    alignment_plan.md Change C5) -- per-region/tte-bucket/horizon markout
+    cells, written by paper_runner.py every PER_MARKET_SNAPSHOT_EVERY_N_TICKS
+    ticks. No new controls; a plain table like the other panels on this page.
+    """
+    if out_dir is None:
+        st.info("no run directory yet")
+        return
+    report = _load_json(out_dir / "markout_report.json")
+    if not report:
+        st.info("no markout_report.json yet")
+        return
+    cells = report.get("cells") or []
+    if not cells:
+        st.info("markout report has no cells yet")
+        return
+    cells_df = pd.DataFrame(cells)
+    # F2: explicit computed coverage column (n / n_attempted) -- a cell can
+    # have n_attempted > 0 with n == 0 (every lookup for it missed) so this is
+    # distinct from just showing the raw n/n_attempted columns.
+    if "n_attempted" in cells_df.columns:
+        n_attempted = pd.to_numeric(cells_df["n_attempted"], errors="coerce")
+        n = pd.to_numeric(cells_df["n"], errors="coerce")
+        cells_df["coverage"] = (n / n_attempted).where(n_attempted > 0, 0.0)
+    st.dataframe(cells_df, use_container_width=True, hide_index=True)
+    st.caption(
+        "mk_h = sign*(mid_h - fill price), sign=+1 BUY_YES / -1 BUY_NO (never "
+        "complemented -- stored fill price is already YES-scale for both "
+        "sides). coverage = n / n_attempted (share of eligible fills whose "
+        "horizon lookup found a mid). Generated %s." % report.get("generated_ts", "?")
+    )
+
+
 def render_quotes_latency(out_dir: Optional[Path]) -> None:
     if out_dir is None:
         st.info("no run directory yet")
@@ -564,6 +598,9 @@ def main() -> None:
 
     st.header("Quotes / Latency")
     render_quotes_latency(out_dir)
+
+    st.header("Markout")
+    render_markout(out_dir)
 
     st.sidebar.divider()
     auto_refresh = st.sidebar.checkbox("Auto-refresh", value=True, key="mm_monitor_auto_refresh")

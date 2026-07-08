@@ -26,6 +26,13 @@ Design notes (plan Section 5 + Section 8.2/8.9):
   observable without its resulting inventory state (plan Section 5
   "write-ahead of action" rule) -- any dependent quote/hedge action must be
   emitted only after this call returns.
+- `mid_log` (mm_suitability_alignment_plan.md Change C, mid-log design): a
+  durable per-tick, per-market mid history the harness appends to every tick
+  (`append_mids`), independent of the `fills`/`quotes` tables. It backs the
+  paper runner's markout report (`pnl_report.markout_report`), which joins a
+  fill's `ts + horizon` against this table via `mid_at_or_after` rather than
+  requiring any fill-mutation step -- restart-robust by construction since it
+  is computed from durable state at report time.
 - All datetimes are serialized as UTC ISO-8601 strings; dict/list-valued
   fields are serialized as JSON text columns.
 """
@@ -101,6 +108,13 @@ class QuoteRecord:
     x_ask: float
     p_bid_raw: float
     p_ask_raw: float
+
+
+@dataclass
+class MidLogRow:
+    ts: datetime
+    market_id: str
+    mid: float
 
 
 @dataclass
@@ -369,6 +383,24 @@ class MMStateStore:
                 )
                 """
             )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS mid_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts TEXT NOT NULL,
+                    market_id TEXT NOT NULL,
+                    mid REAL NOT NULL
+                )
+                """
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_mid_log_market_ts ON mid_log(market_id, ts)"
+            )
+            # prune_mid_log filters on ts alone; the composite index above is
+            # unusable there (market_id leads), so give the DELETE its own index.
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_mid_log_ts ON mid_log(ts)"
+            )
 
     # ------------------------------------------------------------------
     # inventory
@@ -618,6 +650,18 @@ class MMStateStore:
         returned as 0.0 placeholders here -- callers comparing against
         `get_all_inventory()` should compare `q` (and `avg_cost` if desired),
         not those two fields.
+
+        Cost-basis price (C0): `price` is already YES-scale for every fill --
+        MAKER/TAKER and SETTLEMENT alike, BUY_YES and BUY_NO alike (paper_
+        fill_sim stores the YES-book price for both sides; the harness bridge
+        un-complements order_lifecycle's sell-YES-via-buy-NO order-placement
+        convention before any fill reaches this table) -- so it is used
+        directly as `cost_basis_price`, with no per-side complement. This
+        matches inventory_manager._apply_contract_fill (the untouched
+        reference); prior to the C0 fix this used `1 - price` for BUY_NO,
+        which disagreed with that reference and produced a phantom -0.20/
+        share PnL on every open BUY_NO fill (see
+        mm_suitability_alignment_plan.md pre-step C0).
         """
         rows = self._conn.execute("SELECT * FROM fills ORDER BY id ASC").fetchall()
         state: Dict[str, Dict[str, float]] = {}
@@ -627,7 +671,7 @@ class MMStateStore:
             price = row["price"]
             size = row["size"]
             sign = 1.0 if side is Side.BUY_YES else -1.0
-            cost_basis_price = price if sign > 0 else (1.0 - price)
+            cost_basis_price = price
             delta_q = sign * size
 
             s = state.setdefault(market_id, {"q": 0.0, "avg_cost": 0.0})
@@ -1033,3 +1077,73 @@ class MMStateStore:
     def get_market_registry(self) -> Dict[str, Tuple[str, float]]:
         rows = self._conn.execute("SELECT market_id, expiry_key, strike FROM markets").fetchall()
         return {row["market_id"]: (row["expiry_key"], row["strike"]) for row in rows}
+
+    # ------------------------------------------------------------------
+    # mid_log (per-tick per-market mid history; mm_suitability_alignment_
+    # plan.md Change C mid-log design -- backs pnl_report.markout_report)
+    # ------------------------------------------------------------------
+
+    def append_mids(self, ts: datetime, mids: Dict[str, float]) -> None:
+        """Durably log this tick's per-market mids, one INSERT executemany
+        (plan C1/C2). No-op on an empty `mids` dict (harness only calls this
+        when at least one market had a mid this tick)."""
+        if not mids:
+            return
+        ts_str = _dt_to_iso(ts)
+        with self._conn:
+            self._conn.executemany(
+                "INSERT INTO mid_log (ts, market_id, mid) VALUES (?, ?, ?)",
+                [(ts_str, market_id, mid) for market_id, mid in mids.items()],
+            )
+
+    def get_mids(self, market_id: Optional[str] = None) -> List[MidLogRow]:
+        if market_id is None:
+            rows = self._conn.execute("SELECT * FROM mid_log ORDER BY id ASC").fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM mid_log WHERE market_id = ? ORDER BY id ASC", (market_id,)
+            ).fetchall()
+        return [
+            MidLogRow(ts=_iso_to_dt(row["ts"]), market_id=row["market_id"], mid=row["mid"])
+            for row in rows
+        ]
+
+    def mid_at_or_after(self, market_id: str, ts: datetime, ts_max: datetime) -> Optional[float]:
+        """First `mid_log` mid for `market_id` with `ts_log in [ts, ts_max)`
+        (the markout report's horizon-window join, plan C1/C3). The lower
+        bound is inclusive (`>=`), the upper bound is EXCLUSIVE (`<`, F1 fix)
+        -- adjacent horizon windows are constructed to abut at `ts_max`
+        (pnl_report.markout_report caps each horizon's window at the next
+        horizon's start), so an exclusive upper bound is what makes a mid
+        landing exactly on that boundary serve only the later horizon, never
+        both. BOTH bounds are serialized via `_dt_to_iso` -- never raw
+        `.isoformat()` -- since Python's `isoformat()` omits the microseconds
+        field entirely when `microsecond == 0`, which would otherwise produce
+        variable-width TEXT that a naive mixed serializer could compare
+        inconsistently; routing both bounds (and every stored row) through
+        the same `_dt_to_iso` call keeps the TEXT range compare below
+        correct. Backed by `idx_mid_log_market_ts (market_id, ts)`. Returns
+        None if no row falls in the window (NULL semantics -- that horizon is
+        excluded by the caller)."""
+        row = self._conn.execute(
+            """
+            SELECT mid FROM mid_log
+            WHERE market_id = ? AND ts >= ? AND ts < ?
+            ORDER BY ts LIMIT 1
+            """,
+            (market_id, _dt_to_iso(ts), _dt_to_iso(ts_max)),
+        ).fetchone()
+        return None if row is None else row["mid"]
+
+    def prune_mid_log(self, older_than: datetime) -> int:
+        """Delete `mid_log` rows strictly older than `older_than` (F3 -- the
+        markout report's own lookback bounds how far back mids are ever
+        needed, so anything older can be dropped to keep the table's growth
+        bounded on a persistent --state-db). Bound via `_dt_to_iso`, same
+        serialization as every other mid_log timestamp compare. Returns the
+        number of rows deleted."""
+        with self._conn:
+            cur = self._conn.execute(
+                "DELETE FROM mid_log WHERE ts < ?", (_dt_to_iso(older_than),)
+            )
+        return cur.rowcount

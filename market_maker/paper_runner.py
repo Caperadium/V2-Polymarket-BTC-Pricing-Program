@@ -46,8 +46,12 @@ Outputs under --out (default temp/paper_run/<UTC ts>/):
                  (quotes/fills/ticks csvs are appended to, header written only
                  once -- safe to reuse --out or --state-db across restarts)
     summary.md   end-of-run Stage-B report (fills, ending inventory, fold check)
-    paper_state.db  MMStateStore (orders/fills/inventory/quotes journal);
-                     relocated by --state-db
+    markout_report.json  per-region/tte-bucket/horizon markout report (plan
+                     Change C), rewritten every PER_MARKET_SNAPSHOT_EVERY_N_
+                     TICKS ticks (pnl_report.markout_report over store fills
+                     + mid_log via store.mid_at_or_after)
+    paper_state.db  MMStateStore (orders/fills/inventory/quotes/mid_log
+                     journal); relocated by --state-db
     run_meta.json    self-describing run config, written once after resolve_event
     heartbeat.json   liveness file, rewritten every tick (atomic); includes
                      btc_data_age_s and feed_restarts. An initial heartbeat is
@@ -83,7 +87,12 @@ from market_maker.config import MMConfig
 from market_maker.harness import PaperTradingLoop
 from market_maker.market_data_client import FeedCapability, PolymarketFeedAdapter
 from market_maker.order_lifecycle import SimClock
-from market_maker.pnl_report import PER_MARKET_SNAPSHOT_EVERY_N_TICKS, compute_pnl_rows
+from market_maker.pnl_report import (
+    MARKOUT_LOOKBACK_S,
+    PER_MARKET_SNAPSHOT_EVERY_N_TICKS,
+    compute_pnl_rows,
+    markout_report,
+)
 from market_maker.settlement_handler import TERMINAL_OUTCOMES, settlement_instant_utc
 from market_maker.shadow_runner import CachedEngine, resolve_event, resolve_next_event
 from market_maker.state_store import MMStateStore
@@ -609,30 +618,67 @@ def run(argv: Optional[List[str]] = None) -> int:
             except Exception:
                 logger.error("settlement step failed at tick %d", tick_n, exc_info=True)
 
+            # F5: ONE guarded fills fetch, hoisted above both the pnl and
+            # markout blocks below -- they used to each call store.get_fills()
+            # independently (redundant on every report tick); a bare reuse
+            # would have left fills_all unbound in the markout block whenever
+            # the pnl block's own fetch raised, so this fetch has its own
+            # try/except and both consumers explicitly skip on None rather
+            # than depending on each other's internals.
+            try:
+                fills_all = store.get_fills()
+            except Exception:
+                fills_all = None
+                logger.warning("get_fills failed at tick %d", tick_n, exc_info=True)
+
             # R3 invariant: PnL snapshot MUST run AFTER settle so realized
             # (from cash+avg_cost, B3) and inventory stay in sync -- a
             # settlement pseudo-fill's cash and its q->0 inventory update
             # must land in the SAME snapshot, never split across ticks.
             try:
-                fills_all = store.get_fills()
-                inv_all = store.get_all_inventory()
-                mids_by_market: Dict[str, Optional[float]] = {}
-                consensus_by_market: Dict[str, Optional[float]] = {}
-                for m, k in markets:
-                    mids_by_market[m] = _book_mid(loop.books[m])
-                    consensus_by_market[m] = fv.consensus_p.get(k) if fv is not None else None
-                settlements = store.get_all_settlements()
-                pnl_rows = compute_pnl_rows(
-                    now, expiry_key, fills_all, inv_all, mids_by_market, consensus_by_market,
-                    args.bankroll, settlements=settlements,
-                )
-                # W4 row-volume cap: TOTAL row every tick, per-market rows
-                # only every Nth tick.
-                for row in pnl_rows:
-                    if row.market_id is None or tick_n % PER_MARKET_SNAPSHOT_EVERY_N_TICKS == 0:
-                        store.append_pnl_snapshot(row)
+                if fills_all is not None:
+                    inv_all = store.get_all_inventory()
+                    mids_by_market: Dict[str, Optional[float]] = {}
+                    consensus_by_market: Dict[str, Optional[float]] = {}
+                    for m, k in markets:
+                        mids_by_market[m] = _book_mid(loop.books[m])
+                        consensus_by_market[m] = fv.consensus_p.get(k) if fv is not None else None
+                    settlements = store.get_all_settlements()
+                    pnl_rows = compute_pnl_rows(
+                        now, expiry_key, fills_all, inv_all, mids_by_market, consensus_by_market,
+                        args.bankroll, settlements=settlements,
+                    )
+                    # W4 row-volume cap: TOTAL row every tick, per-market rows
+                    # only every Nth tick.
+                    for row in pnl_rows:
+                        if row.market_id is None or tick_n % PER_MARKET_SNAPSHOT_EVERY_N_TICKS == 0:
+                            store.append_pnl_snapshot(row)
             except Exception:
                 logger.warning("pnl snapshot failed at tick %d", tick_n, exc_info=True)
+
+            # C4 (mm_suitability_alignment_plan.md Change C): per-region
+            # markout report, same PER_MARKET_SNAPSHOT_EVERY_N_TICKS cadence
+            # as the per-market PnL rows above (row-volume cap, W4) -- a
+            # fresh independent try/except so a markout failure never blocks
+            # the pnl snapshot (or vice versa). F3: `now` is passed through so
+            # the report's own lookback window shares the SAME anchor as the
+            # prune bound below (a defaulted now=max-fill-ts here would drift
+            # from the prune's wall-clock anchor on a stale-fill run); pruning
+            # happens only after the report using the still-unpruned rows has
+            # been written, and at this cadence (not every tick) so the hot
+            # path is unaffected.
+            if tick_n % PER_MARKET_SNAPSHOT_EVERY_N_TICKS == 0:
+                try:
+                    if fills_all is not None:
+                        report = markout_report(
+                            fills_all, store.mid_at_or_after,
+                            store.get_market_registry(), loop.config.belly_band,
+                            now=now,
+                        )
+                        _write_json_atomic(out_dir / "markout_report.json", report)
+                        store.prune_mid_log(now - timedelta(seconds=MARKOUT_LOOKBACK_S))
+                except Exception:
+                    logger.warning("markout report failed at tick %d", tick_n, exc_info=True)
 
             try:
                 _write_heartbeat(out_dir, now, tick_n, feed_healthy, n_msgs, n_fills_total,
