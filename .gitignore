@@ -67,3 +67,22 @@ backtested_probabilities/
 DATA/is_oos_cache/
 DATA/*.json
 backtested_probabilities/**/*.json
+backtested_probabilities_pre_h1_backup/
+batch_results/
+fitted_batch_results/
+
+# Build output (mkdocs)
+site/
+
+# Databases (SQLite runtime state)
+*.db
+
+# Logs (the *.log rule above misses .txt logs)
+backtest_log.txt
+
+# Research / scratch (not source)
+Text Files/
+Market Maker/
+
+# Test cache
+.pytest_cache/
