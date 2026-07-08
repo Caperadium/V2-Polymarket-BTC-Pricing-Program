@@ -89,6 +89,24 @@ PID is dead).
 (staleness of `DATA/btc_intraday_1m.csv`), `feed_restarts`,
 `noarb_violations`, `pulled_ticks`.
 
+### mm_monitor dashboard over an SSH tunnel (optional)
+
+The `app/pages/mm_monitor.py` Streamlit page has to run on the VPS (it
+reads the state db and control files locally) but should stay off the
+public internet: run it bound to loopback under a small systemd unit
+(`streamlit run app/pages/mm_monitor.py --server.address 127.0.0.1
+--server.port 8502 --server.headless true`; `pip install streamlit` into
+the venv first -- the base install skips it) and reach it with a local
+port forward:
+
+```bash
+ssh -L 8502:127.0.0.1:8502 <vps-host>   # keep open, browse http://localhost:8502
+```
+
+The loopback bind is the security boundary -- no firewall rule needed.
+Pick a port that is free on the box (8501 is Streamlit's default and may
+be taken). Full unit file in `deploy/README.md` section 2.
+
 ## Stopping / starting cleanly
 
 ```bash

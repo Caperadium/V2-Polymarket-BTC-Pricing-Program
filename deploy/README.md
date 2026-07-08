@@ -145,6 +145,47 @@ same 7-day window automatically at report cadence, so the db stays
 size-bounded on a month-long run; snapshot the db file first if you want
 full-history markout analysis later.
 
+### Optional: mm_monitor dashboard over an SSH tunnel
+
+The `app/pages/mm_monitor.py` Streamlit page must run on the VPS (it reads
+the state db and control files locally), but should never be exposed
+publicly -- bind it to loopback and reach it through an SSH tunnel instead.
+There is no template file for this unit (it is optional); create it
+directly:
+
+```bash
+/opt/mm/venv/bin/pip install streamlit   # not installed by the base steps
+
+sudo tee /etc/systemd/system/mm-monitor.service <<'EOF'
+[Unit]
+Description=MM monitor dashboard (Streamlit, loopback only)
+After=network-online.target
+
+[Service]
+User=debian
+WorkingDirectory=/opt/mm/V2-BTC-Contract-Pricing
+ExecStart=/opt/mm/venv/bin/streamlit run app/pages/mm_monitor.py --server.address 127.0.0.1 --server.port 8502 --server.headless true --browser.gatherUsageStats false
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+sudo systemctl daemon-reload
+sudo systemctl enable --now mm-monitor.service
+```
+
+Pick a free port for `--server.port` (8501 is Streamlit's default and may be
+taken by another app on the box). Then, from the local machine:
+
+```bash
+ssh -L 8502:127.0.0.1:8502 <vps-host>
+# keep that session open and browse http://localhost:8502
+```
+
+`--server.address 127.0.0.1` is the security boundary: the dashboard is
+reachable only through the tunnel, no firewall rule needed.
+
 ## 3. Stopping / starting cleanly
 
 ```bash
