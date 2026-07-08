@@ -52,6 +52,7 @@ nav:
     - Backtesting: guides/backtesting.md
     - Parameter Sweeps: guides/parameter-sweeps.md
     - Signal Diagnostics: guides/signal-diagnostics.md
+    - Market-Maker Deployment: guides/market-maker-deployment.md
     - Troubleshooting: guides/troubleshooting.md
   - API Reference:
     - Core:

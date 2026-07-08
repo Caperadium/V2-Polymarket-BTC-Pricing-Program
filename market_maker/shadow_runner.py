@@ -31,6 +31,7 @@ import json
 import logging
 import sys
 import time
+import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -39,6 +40,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from market_maker.config import MMConfig
 from market_maker.harness import PaperTradingLoop
 from market_maker.order_lifecycle import SimClock
+from market_maker.settlement_handler import settlement_instant_utc
 from market_maker.state_store import MMStateStore
 
 logger = logging.getLogger("mm.shadow")
@@ -47,6 +49,15 @@ UA = {"User-Agent": "btc-prediction-market/2.0"}
 GAMMA_API = "https://gamma-api.polymarket.com"
 CLOB_API = "https://clob.polymarket.com"
 
+_MONTH_NAMES = [
+    "january", "february", "march", "april", "may", "june", "july",
+    "august", "september", "october", "november", "december",
+]
+
+_RETRY_ATTEMPTS = 5
+_RETRY_BACKOFF0_S = 2.0
+_RETRY_BACKOFF_CAP_S = 30.0
+
 
 def _get(url: str) -> Any:
     req = urllib.request.Request(url, headers=UA)
@@ -54,10 +65,44 @@ def _get(url: str) -> Any:
         return json.loads(r.read().decode("utf-8"))
 
 
+def _get_retry(url: str) -> Any:
+    """`_get(url)` with exponential backoff (2s -> 30s cap, 5 attempts) on
+    transient failures (M4). A 404 (HTTPError code 404) means "no such
+    event/slug" -- it is NOT retried and propagates immediately so callers
+    (notably `resolve_next_event`'s per-candidate probing) can tell "not
+    found yet" apart from "venue/network unreachable". After the final
+    attempt of a non-404 failure this raises SystemExit -- `_get` itself
+    stays the sole patchable network seam for tests."""
+    backoff = _RETRY_BACKOFF0_S
+    last_exc: Optional[BaseException] = None
+    for attempt in range(1, _RETRY_ATTEMPTS + 1):
+        try:
+            return _get(url)
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                raise
+            last_exc = exc
+        except Exception as exc:  # noqa: BLE001 - deliberately broad, retried below
+            last_exc = exc
+        if attempt < _RETRY_ATTEMPTS:
+            logger.warning(
+                "fetch attempt %d/%d failed for %s: %s; retrying in %.0fs",
+                attempt, _RETRY_ATTEMPTS, url, last_exc, backoff,
+            )
+            time.sleep(backoff)
+            backoff = min(backoff * 2.0, _RETRY_BACKOFF_CAP_S)
+    raise SystemExit(f"fetch failed after {_RETRY_ATTEMPTS} attempts: {url}: {last_exc}")
+
+
 def resolve_event(event_slug: str) -> Tuple[str, List[Tuple[str, float, str]]]:
     """Return (expiry_key, [(market_slug, strike, clob_token_id)]) for a
     bitcoin-above event. Strike parsed from the question text."""
-    evs = _get(f"{GAMMA_API}/events?slug={event_slug}")
+    try:
+        evs = _get_retry(f"{GAMMA_API}/events?slug={event_slug}")
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            raise SystemExit(f"event not found: {event_slug}")
+        raise
     if not evs:
         raise SystemExit(f"event not found: {event_slug}")
     e = evs[0]
@@ -80,20 +125,81 @@ def resolve_event(event_slug: str) -> Tuple[str, List[Tuple[str, float, str]]]:
     return expiry_key, out
 
 
+def _candidate_event_slugs(day: datetime) -> List[str]:
+    """Both padded and unpadded day forms for a `bitcoin-above-on-<month>-
+    <day>-<year>` slug -- the venue's zero-padding convention is unverified
+    (plan 2.2 / reviewer suggestion 7), so both are probed. De-duplicated for
+    days >= 10 where both forms are identical."""
+    month = _MONTH_NAMES[day.month - 1]
+    unpadded = f"bitcoin-above-on-{month}-{day.day}-{day.year}"
+    padded = f"bitcoin-above-on-{month}-{day.day:02d}-{day.year}"
+    return list(dict.fromkeys([unpadded, padded]))
+
+
+def resolve_next_event(
+    now: datetime, lead_days: int, config: Optional[MMConfig] = None
+) -> Tuple[str, List[Tuple[str, float, str]]]:
+    """Auto-select the next bitcoin-above event with a real quoting window
+    (plan 2.2). Probes Gamma for candidate slugs on `now+1 .. now+lead_days+4`
+    (both padded and unpadded day forms) and picks the first whose
+    settlement instant clears `near_resolution_pull_hours + 12h` past `now`
+    -- i.e. there is at least half a day of quoting left after the
+    near-resolution pull window closes. Reuses `resolve_event` (which does
+    its own retrying fetch + full ladder parse) once a candidate is chosen."""
+    cfg = config if config is not None else MMConfig()
+    near_h = cfg.near_resolution_pull_hours
+    min_lead = timedelta(hours=near_h + 12.0)
+    horizon_days = int(lead_days) + 4
+
+    for offset in range(1, horizon_days + 1):
+        day = now + timedelta(days=offset)
+        for slug in _candidate_event_slugs(day):
+            try:
+                evs = _get_retry(f"{GAMMA_API}/events?slug={slug}")
+            except urllib.error.HTTPError as exc:
+                if exc.code == 404:
+                    continue  # no event published yet for this date/form
+                raise
+            if not evs:
+                continue
+            end = (evs[0].get("endDate") or "")
+            expiry_key = end[:10]
+            if not expiry_key:
+                continue
+            try:
+                settle_at = settlement_instant_utc(expiry_key)
+            except Exception:
+                continue
+            if settle_at > now + min_lead:
+                logger.info("auto-selected event %s (expiry %s, settles %s)",
+                            slug, expiry_key, settle_at.isoformat())
+                return resolve_event(slug)
+    raise SystemExit(
+        f"resolve_next_event: no suitable bitcoin-above event found in the next {horizon_days} days"
+    )
+
+
 class CachedEngine:
     """Re-price at most every reprice_s; return the cached raw ladder between.
 
     Wraps the REAL calculate_probabilities with the production live feature
     set (SVCJ + skewed-t + FIGARCH, naive prior; regime/XGB off) and a
     per-run garch_cache. Records per-call latency.
+
+    `garch_refit_s` (H2, default 6h): the GARCH/FIGARCH cache is cleared once
+    it has lived at least this long, so the MLE fit from tick 1 does not
+    silently price the whole run -- S0 already reloads every reprice
+    (s0_override=None), only the fit itself was frozen.
     """
 
-    def __init__(self, reprice_s: float, seed: int = 42) -> None:
+    def __init__(self, reprice_s: float, seed: int = 42, garch_refit_s: float = 21_600.0) -> None:
         self.reprice_s = reprice_s
         self.seed = seed
+        self.garch_refit_s = garch_refit_s
         self._cache: Optional[Dict[Any, Any]] = None
         self._cached_at: float = 0.0
         self._garch_cache: Dict[Any, Any] = {}
+        self._garch_fitted_at: Optional[float] = None
         self.latencies: List[float] = []
 
     def __call__(self, strikes, hours_to_expiry, **kwargs):
@@ -102,6 +208,13 @@ class CachedEngine:
             return dict(self._cache)
         from core.pricing.btc_pricing_engine import calculate_probabilities
 
+        if (self._garch_fitted_at is not None
+                and (now - self._garch_fitted_at) >= self.garch_refit_s):
+            self._garch_cache.clear()
+            self._garch_fitted_at = None
+            logger.info("GARCH cache age >= %.0fs; cleared for refit", self.garch_refit_s)
+
+        cache_was_empty = not self._garch_cache
         t0 = time.time()
         res = calculate_probabilities(
             list(strikes),
@@ -114,6 +227,8 @@ class CachedEngine:
             garch_cache=self._garch_cache,
         )
         self.latencies.append(time.time() - t0)
+        if cache_was_empty and self._garch_cache:
+            self._garch_fitted_at = time.time()
         self._cache = dict(res)
         self._cached_at = time.time()
         logger.info("re-priced ladder in %.1fs", self.latencies[-1])

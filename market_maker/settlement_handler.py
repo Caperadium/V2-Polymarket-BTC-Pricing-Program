@@ -271,9 +271,11 @@ class SettlementHandler:
                 )
                 continue
 
-            # Documented deviation: >= (P(S_T >= K)) not the backtester's
-            # strict > -- matches the pricing engine's convention (see
-            # module docstring); explicit task spec.
+            # Strict ">" per the venue-confirmed rule (Polymarket resolves
+            # YES only if price is strictly above the strike; see module
+            # docstring) and matching the backtester's resolve_outcome_yes.
+            # The pricing engine's P(S_T >= K) differs only on the
+            # measure-zero boundary and is intentionally left unchanged.
             outcome = SettlementOutcome.YES if spot > m.strike else SettlementOutcome.NO
             payoff_yes = 1.0 if outcome is SettlementOutcome.YES else 0.0
 

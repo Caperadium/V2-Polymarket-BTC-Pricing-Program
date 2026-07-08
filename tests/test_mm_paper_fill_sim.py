@@ -210,8 +210,10 @@ def test_feed_gap_exposure_no_fills():
     sim.place("o1", "m1", "bid", 0.50, 10.0, T0)
     sim.on_market_state(_ms(T0 + _sec(3), bid_depth=[]))  # activate, last_ts=T0+3s
 
-    # 7s gap (> 5s threshold): a would-be filling print is IGNORED inside gap.
-    f_gap = sim.on_market_state(_ms(T0 + _sec(10), bid_depth=[],
+    # feed_healthy=False (gap is feed-health-only, not dt-based -- see
+    # PaperFillSimulator._detect_gap): a would-be filling print is IGNORED
+    # inside the gap.
+    f_gap = sim.on_market_state(_ms(T0 + _sec(10), bid_depth=[], feed_healthy=False,
                                     prints=[(T0 + _sec(10), 0.49, 20.0)]))
     assert f_gap == []
     assert sim.fills() == []
@@ -324,3 +326,82 @@ def test_ask_side_fill_semantics():
     assert len(f) == 1
     assert f[0].size == pytest.approx(15.0)
     assert f[0].side == Side.BUY_NO
+
+
+# ---------------------------------------------------------------------------
+# 13. Shared-ladder regression: one sim instance fed per-market MarketStates
+# in a loop each tick (harness pattern). Per-market gap/queue state must not
+# leak across markets -- this is the bug the fix in on_market_state /
+# _detect_gap / _activate_pending / _apply_cancel_ahead / _prune addresses.
+# ---------------------------------------------------------------------------
+
+def test_shared_sim_ladder_a_ticks_never_touch_b_state():
+    sim = PaperFillSimulator(_cfg())
+    sim.place("oa", "mA", "bid", 0.50, 20.0, T0)
+    sim.place("ob", "mB", "bid", 0.60, 10.0, T0)
+
+    t1 = T0 + _sec(15)
+    # Tick 1: activate both orders via their own market's snapshot.
+    f = sim.on_market_state(_ms(t1, market_id="mA", bid_depth=[(0.50, 100.0)]))
+    assert f == []
+    f = sim.on_market_state(_ms(t1, market_id="mB", bid_depth=[(0.60, 50.0)]))
+    assert f == []
+
+    ob_order = sim._orders["ob"]
+    assert ob_order.queue_ahead == pytest.approx(50.0)
+    assert ob_order.last_level_size == pytest.approx(50.0)
+    assert ob_order.activated is True
+
+    # Ticks 2 and 3: ONLY mA is fed, at 15s spacing, feed_healthy=True. Per
+    # the fix, a shared "last timestamp" no longer exists -- mA's own dt is
+    # irrelevant (gap = feed_healthy only) and mB's order must be untouched.
+    t2 = T0 + _sec(30)
+    f2 = sim.on_market_state(_ms(t2, market_id="mA", bid_depth=[(0.50, 100.0)]))
+    assert f2 == []
+
+    t3 = T0 + _sec(45)
+    # Print of 130 at our price: consumes the 100 queue_ahead, then fills the
+    # full remaining 20.
+    f3 = sim.on_market_state(_ms(t3, market_id="mA", bid_depth=[(0.50, 100.0)],
+                                 prints=[(t3, 0.50, 130.0)]))
+    assert len(f3) == 1
+    assert f3[0].size == pytest.approx(20.0)
+    assert f3[0].market_id == "mA"
+
+    # No false gap was ever raised on mA across the 15s-spaced ticks.
+    assert sim.exposure_incidents() == []
+
+    # mB's queue/baseline are exactly as left by mB's OWN last snapshot --
+    # mA's snapshots at t2/t3 must not have touched them.
+    ob_order_after = sim._orders["ob"]
+    assert ob_order_after.queue_ahead == pytest.approx(50.0)
+    assert ob_order_after.last_level_size == pytest.approx(50.0)
+
+
+def test_gap_on_one_market_does_not_affect_sibling_market():
+    sim = PaperFillSimulator(_cfg())
+    sim.place("oa", "mA", "bid", 0.50, 10.0, T0)
+    sim.place("ob", "mB", "bid", 0.60, 10.0, T0)
+
+    t1 = T0 + _sec(3)
+    sim.on_market_state(_ms(t1, market_id="mA", bid_depth=[(0.50, 100.0)]))
+    sim.on_market_state(_ms(t1, market_id="mB", bid_depth=[]))  # queue 0
+
+    # mA's feed drops; mB stays healthy and gets a filling print in the SAME
+    # tick.
+    t2 = T0 + _sec(18)
+    f_a = sim.on_market_state(_ms(t2, market_id="mA", bid_depth=[(0.50, 100.0)],
+                                  feed_healthy=False,
+                                  prints=[(t2, 0.49, 50.0)]))
+    assert f_a == []
+    f_b = sim.on_market_state(_ms(t2, market_id="mB", bid_depth=[],
+                                  prints=[(t2, 0.60, 10.0)]))
+    assert len(f_b) == 1
+    assert f_b[0].size == pytest.approx(10.0)
+    assert f_b[0].market_id == "mB"
+
+    # Exactly one incident, for mA only, listing only mA's live order.
+    incs = sim.exposure_incidents()
+    assert len(incs) == 1
+    assert incs[0].order_ids == ("oa",)
+    assert incs[0].n_live_orders == 1

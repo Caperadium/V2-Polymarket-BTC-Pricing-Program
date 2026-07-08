@@ -156,6 +156,8 @@ class PaperTradingLoop:
         trade_through_only: bool = False,
         feed_capability: FeedCapability = FeedCapability.FULL_L2,
         tick: float = 0.01,
+        journal_maxlen: Optional[int] = 20_000,
+        x_hist_maxlen: Optional[int] = 20_000,
     ) -> None:
         self.store = store
         self.expiry_key = expiry_key
@@ -166,12 +168,27 @@ class PaperTradingLoop:
         self.tick_dt_s = tick_dt_s
         self.quote_variant = quote_variant
         self.tick_size = tick
+        # B4-memory: bound the in-memory journals (unbounded => ~1GB+ of
+        # QuoteSets over a month-long unattended run, harness.py:399-401 /
+        # :208,274). None means unbounded (legacy behavior); everything
+        # trimmed here is already durably persisted via store.append_quote,
+        # so trimming loses no data (only in-memory journal convenience).
+        self.journal_maxlen = journal_maxlen
+        self.x_hist_maxlen = x_hist_maxlen
 
         # markets sorted ascending by strike (ladder order)
         self.markets: List[Tuple[str, float]] = sorted(markets, key=lambda t: t[1])
         self.strikes: List[float] = [k for _, k in self.markets]
         self.mid_by_strike: Dict[float, str] = {k: m for m, k in self.markets}
         self.strike_by_mid: Dict[str, float] = {m: k for m, k in self.markets}
+
+        # Persist the market registry (plan B3-schema 1.3): idempotent,
+        # one-time per construction -- enables a restarted process's
+        # settlement catch_up() to find THIS run's markets even before any
+        # quoting activity, and (merged with the store's prior contents in
+        # settle()) a PREVIOUS run's markets too.
+        for m, k in self.markets:
+            self.store.upsert_market(m, expiry_key, k)
 
         self.venue_descriptor = VenueDescriptor(
             tick_size=tick, min_size=1.0, price_band=self.config.p_clamp,
@@ -271,6 +288,10 @@ class PaperTradingLoop:
 
         for m, k in self.markets:
             self._x_hist[m].append(float(fv.consensus_x[k]))
+            if self.x_hist_maxlen is not None and len(self._x_hist[m]) > self.x_hist_maxlen:
+                # Trim from the front -- keep the newest entries (the sigma_b
+                # estimator below is itself newest-anchored, plan B4-memory).
+                del self._x_hist[m][: len(self._x_hist[m]) - self.x_hist_maxlen]
             hist = self._x_hist[m][::-1][::stride][::-1]  # newest-anchored subsample
             sigma_b = estimate_sigma_b(
                 hist, sample_dt_days, cfg.sigma_b_floor, cfg.sigma_b_cap
@@ -398,6 +419,15 @@ class PaperTradingLoop:
         if checked is not None:
             self.checked_ladders.append((strikes_sorted, checked))
             self.all_checked_quote_sets.extend(checked)
+            if self.journal_maxlen is not None:
+                # Trim from the front -- keep the newest entries. Both stay
+                # plain lists (not deques) so callers can still index/slice
+                # them (plan B4-memory 1.2); everything trimmed here is
+                # already durably persisted via store.append_quote below.
+                if len(self.checked_ladders) > self.journal_maxlen:
+                    del self.checked_ladders[: len(self.checked_ladders) - self.journal_maxlen]
+                if len(self.all_checked_quote_sets) > self.journal_maxlen:
+                    del self.all_checked_quote_sets[: len(self.all_checked_quote_sets) - self.journal_maxlen]
             for (k, m, _), qs in zip(composed, checked):
                 p = self.last_proposals[m]
                 self.store.append_quote(
@@ -449,7 +479,15 @@ class PaperTradingLoop:
         fold invariant survives resolution."""
         now = now or self.clock.now()
         if catch_up:
-            registry = {m: (self.expiry_key, k) for m, k in self.markets}
+            # Registry-merge (plan B3 / 1.4): the persisted registry (which
+            # may still carry a PREVIOUS run's markets, e.g. a rolled-over
+            # event) is merged UNDER this run's current-ladder markets, so a
+            # stale persisted (expiry_key, strike) for a market_id this run
+            # also owns can never shadow the current, authoritative values.
+            registry = {
+                **self.store.get_market_registry(),
+                **{m: (self.expiry_key, k) for m, k in self.markets},
+            }
             result = self.settlement.catch_up(now, registry)
         else:
             positions: List[MarketPosition] = []
@@ -464,7 +502,31 @@ class PaperTradingLoop:
                 positions.append(MarketPosition(market_id=m, strike=k, q=q, avg_cost=avg_cost))
             result = self.settlement.settle_expiry(self.expiry_key, positions, now)
 
-        # sync in-memory inventory with the store's SETTLEMENT pseudo-fills
+        # Sync in-memory inventory with the store's SETTLEMENT pseudo-fills.
+        # UNFILTERED by design (plan 1.4, reviewer round-2 finding: an
+        # earlier proposed current-ladder filter here was inverted on the
+        # real resume path). Correctness argument:
+        #   - The resume path (WS2.1) ALWAYS runs `loop.restart()` BEFORE
+        #     `settle(catch_up=True)`. `restart()` replays the ENTIRE fills
+        #     table (`store.get_fills()` is unfiltered), so a PREVIOUS-event
+        #     position enters in-memory inventory at its true q (auto-created
+        #     by `InventoryManager.apply_fill`). This unfiltered sync then
+        #     applies the closing SETTLEMENT pseudo-fill and drives it to 0,
+        #     matching `fold_fills_to_inventory` (which folds SETTLEMENT
+        #     fills too, state_store.py's `fold_fills_to_inventory`) -- so
+        #     `fold_matches_inventory()` holds for the previous event too.
+        #   - Clean-rollover path (prior run exited 42 after settling): the
+        #     prior market is already terminal, so `catch_up` finds it
+        #     terminal and emits no event for it -- this sync is inert for
+        #     that market.
+        #   - Fresh-DB path: no prior fills exist, the registry contains
+        #     only this run's current markets -- this sync is inert.
+        # INVARIANT: `settle(catch_up=True)` must only be called after
+        # `restart()` on a RESUMED store (the WS2.1 sequence guarantees
+        # this). Calling it on a fresh `InventoryManager` (no prior
+        # `restart()`) with a non-empty `fills` table would desync
+        # in-memory inventory from the store, since the previous event's
+        # opening fills would never have been replayed in.
         for ev in result.events:
             if ev.outcome.value in ("YES", "NO") and ev.q_settled != 0.0:
                 closing_side = Side.BUY_NO if ev.q_settled > 0.0 else Side.BUY_YES

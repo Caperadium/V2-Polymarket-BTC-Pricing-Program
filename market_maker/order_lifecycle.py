@@ -170,10 +170,8 @@ class OrderLifecycleManager:
     # -- churn / placement ---------------------------------------------------
 
     def _live_order_for(self, market_id: str, side: Side) -> Optional[OrderRecord]:
-        for rec in self.store.get_all_orders():
-            if rec.market_id == market_id and rec.side == side and rec.status in _LIVE_STATUSES:
-                return rec
-        return None
+        recs = self.store.get_live_orders(market_id, side)
+        return recs[0] if recs else None
 
     def _reconcile_side(
         self, market_id: str, side: Side, desired: Optional[Tuple[float, float]], source_seq: int
@@ -221,11 +219,7 @@ class OrderLifecycleManager:
     def cancel_all(self, market_id: Optional[str] = None) -> None:
         """Cancel every PENDING/LIVE order (optionally scoped to one
         market). Called on PULLED directives and on process shutdown."""
-        for rec in self.store.get_all_orders():
-            if rec.status not in _LIVE_STATUSES:
-                continue
-            if market_id is not None and rec.market_id != market_id:
-                continue
+        for rec in self.store.get_live_orders(market_id):
             self._cancel_order(rec)
 
     # -- restart reconciliation (plan Section 5, steps 2-3) -----------------

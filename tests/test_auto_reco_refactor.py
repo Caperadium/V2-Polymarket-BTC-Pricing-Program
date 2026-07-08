@@ -22,7 +22,7 @@ from core.strategy.auto_reco import (
     TargetPosition,
     TargetRole,
     build_targets,
-    compute_current_exposure_usd,
+    compute_current_exposure_mtm,
     compute_deltas,
     generate_key,
     recommend_trades,
@@ -84,14 +84,14 @@ class TestCurrentExposure(TestCase):
     
     def test_empty_positions(self):
         """Empty positions returns empty dict."""
-        result = compute_current_exposure_usd(None, 1000)
+        result = compute_current_exposure_mtm(None, 1000)
         self.assertEqual(result, {})
-        
-        result = compute_current_exposure_usd(pd.DataFrame(), 1000)
+
+        result = compute_current_exposure_mtm(pd.DataFrame(), 1000)
         self.assertEqual(result, {})
-    
+
     def test_single_position(self):
-        """Single position returns correct cost basis."""
+        """Single position returns correct MTM with entry-price fallback."""
         positions = pd.DataFrame([{
             "slug": "test-market",
             "expiry_key": "2025-01-15",
@@ -100,12 +100,12 @@ class TestCurrentExposure(TestCase):
             "entry_price": 0.50,
             "size_shares": 100,
         }])
-        result = compute_current_exposure_usd(positions, 1000)
+        result = compute_current_exposure_mtm(positions, 1000)
         key = "test-market|2025-01-15|100000.00|YES"
         self.assertAlmostEqual(result[key], 50.0)  # 0.50 * 100
-    
+
     def test_clamped_at_zero(self):
-        """Cost basis should be clamped at 0."""
+        """MTM with entry-price fallback should be clamped at 0."""
         # For now sells aren't tracked, but structure is in place
         positions = pd.DataFrame([{
             "slug": "test-market",
@@ -115,7 +115,7 @@ class TestCurrentExposure(TestCase):
             "entry_price": 0.50,
             "size_shares": 100,
         }])
-        result = compute_current_exposure_usd(positions, 1000)
+        result = compute_current_exposure_mtm(positions, 1000)
         for v in result.values():
             self.assertGreaterEqual(v, 0.0)
 
@@ -161,6 +161,7 @@ class TestDeltaSignHandling(TestCase):
                 model_prob=0.60,
                 market_price=0.50,
                 entry_price=0.50,
+                exit_price=0.50,
                 effective_edge=0.10,
                 allocation_score=0.10,
                 exit_score=0.10,
@@ -196,6 +197,7 @@ class TestDeltaSignHandling(TestCase):
                 model_prob=0.40,
                 market_price=0.50,
                 entry_price=0.50,
+                exit_price=0.50,
                 effective_edge=-0.10,
                 allocation_score=0.0,
                 exit_score=-0.10,
@@ -231,6 +233,7 @@ class TestDeltaSignHandling(TestCase):
                 model_prob=0.55,
                 market_price=0.50,
                 entry_price=0.50,
+                exit_price=0.50,
                 effective_edge=0.05,
                 allocation_score=0.05,
                 exit_score=0.05,
@@ -265,6 +268,7 @@ class TestDeltaSignHandling(TestCase):
                 model_prob=0.55,
                 market_price=0.50,
                 entry_price=0.50,
+                exit_price=0.50,
                 effective_edge=0.05,
                 allocation_score=0.05,
                 exit_score=0.05,
@@ -329,6 +333,7 @@ class TestVolGateEntryBlock(TestCase):
                 model_prob=0.60,
                 market_price=0.50,
                 entry_price=0.50,
+                exit_price=0.50,
                 effective_edge=0.10,
                 allocation_score=0.10,
                 exit_score=0.10,
@@ -336,7 +341,7 @@ class TestVolGateEntryBlock(TestCase):
             )
         }
         current_exposure = {"test-key": 50.0}
-        
+
         intents = compute_deltas(
             targets=targets,
             current_exposure=current_exposure,
@@ -363,6 +368,7 @@ class TestVolGateEntryBlock(TestCase):
                 model_prob=0.60,
                 market_price=0.50,
                 entry_price=0.50,
+                exit_price=0.50,
                 effective_edge=0.10,
                 allocation_score=0.10,
                 exit_score=0.10,
@@ -497,6 +503,7 @@ class TestChurnThresholds(TestCase):
                 model_prob=0.55,
                 market_price=0.50,
                 entry_price=0.50,
+                exit_price=0.50,
                 effective_edge=0.05,
                 allocation_score=0.05,
                 exit_score=0.05,
@@ -536,6 +543,7 @@ class TestChurnThresholds(TestCase):
                 model_prob=0.50,
                 market_price=0.50,
                 entry_price=0.50,
+                exit_price=0.50,
                 effective_edge=0.00,
                 allocation_score=0.00,
                 exit_score=0.00,

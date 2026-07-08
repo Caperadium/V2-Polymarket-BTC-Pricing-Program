@@ -423,6 +423,92 @@ def test_fold_fills_matches_persisted_inventory_after_transactional_writes(store
 
 
 # ---------------------------------------------------------------------------
+# get_live_orders (plan B4-CPU / 1.1)
+# ---------------------------------------------------------------------------
+
+
+def _seed_mixed_status_orders(store):
+    store.upsert_order("c-pending", "mkt-1", Side.BUY_YES, 0.40, 10.0, "PENDING", ts_placed=NOW)
+    store.upsert_order("c-live-yes", "mkt-1", Side.BUY_YES, 0.42, 5.0, "LIVE", ts_placed=NOW)
+    store.upsert_order("c-live-no", "mkt-1", Side.BUY_NO, 0.55, 5.0, "LIVE", ts_placed=NOW)
+    store.upsert_order("c-cancelled", "mkt-1", Side.BUY_YES, 0.30, 1.0, "CANCELLED", ts_placed=NOW)
+    store.upsert_order("c-filled", "mkt-1", Side.BUY_YES, 0.35, 2.0, "FILLED", ts_placed=NOW)
+    store.upsert_order("c-unknown", "mkt-1", Side.BUY_YES, 0.36, 2.0, "UNKNOWN", ts_placed=NOW)
+    store.upsert_order("c-other-mkt", "mkt-2", Side.BUY_YES, 0.60, 8.0, "LIVE", ts_placed=NOW)
+
+
+def test_get_live_orders_status_filter(store):
+    _seed_mixed_status_orders(store)
+    live = store.get_live_orders()
+    ids = {o.client_order_id for o in live}
+    assert ids == {"c-pending", "c-live-yes", "c-live-no", "c-other-mkt"}
+
+
+def test_get_live_orders_market_and_side_filters(store):
+    _seed_mixed_status_orders(store)
+    by_market = store.get_live_orders(market_id="mkt-1")
+    assert {o.client_order_id for o in by_market} == {"c-pending", "c-live-yes", "c-live-no"}
+
+    by_side = store.get_live_orders(market_id="mkt-1", side=Side.BUY_NO)
+    assert [o.client_order_id for o in by_side] == ["c-live-no"]
+
+    by_market_2 = store.get_live_orders(market_id="mkt-2")
+    assert [o.client_order_id for o in by_market_2] == ["c-other-mkt"]
+
+    none_match = store.get_live_orders(market_id="mkt-nope")
+    assert none_match == []
+
+
+def test_get_live_orders_matches_old_scan_and_filter(store):
+    """Regression guard: get_live_orders() must return exactly what the
+    prior `[r for r in get_all_orders() if ...]` scan pattern produced,
+    in the same order (plan 1.1 -- guards tests/test_mm_integration.py's
+    exact-stability assertions)."""
+    _seed_mixed_status_orders(store)
+    for market_id in (None, "mkt-1", "mkt-2", "mkt-nope"):
+        for side in (None, Side.BUY_YES, Side.BUY_NO):
+            expected = [
+                r for r in store.get_all_orders()
+                if r.status in ("PENDING", "LIVE")
+                and (market_id is None or r.market_id == market_id)
+                and (side is None or r.side == side)
+            ]
+            got = store.get_live_orders(market_id, side)
+            assert [o.client_order_id for o in got] == [o.client_order_id for o in expected]
+
+
+def test_idx_orders_status_index_exists(store):
+    rows = store._conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'orders'"
+    ).fetchall()
+    names = {r["name"] for r in rows}
+    assert "idx_orders_status" in names
+
+
+# ---------------------------------------------------------------------------
+# markets registry (plan B3-schema / 1.3)
+# ---------------------------------------------------------------------------
+
+
+def test_markets_registry_round_trip(store):
+    store.upsert_market("m-98k", "2026-07-20", 98000.0)
+    store.upsert_market("m-100k", "2026-07-20", 100000.0)
+    reg = store.get_market_registry()
+    assert reg == {"m-98k": ("2026-07-20", 98000.0), "m-100k": ("2026-07-20", 100000.0)}
+
+
+def test_markets_registry_upsert_overwrites(store):
+    store.upsert_market("m-98k", "2026-07-20", 98000.0)
+    store.upsert_market("m-98k", "2026-08-03", 99000.0)  # market_id reused for a new event
+    reg = store.get_market_registry()
+    assert reg == {"m-98k": ("2026-08-03", 99000.0)}
+
+
+def test_markets_registry_empty_by_default(store):
+    assert store.get_market_registry() == {}
+
+
+# ---------------------------------------------------------------------------
 # Kill/restart round-trip
 # ---------------------------------------------------------------------------
 

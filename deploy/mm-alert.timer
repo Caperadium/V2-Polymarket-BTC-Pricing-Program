@@ -1,0 +1,11 @@
+# mm-alert.timer -- run mm-alert.service every 5 minutes.
+
+[Unit]
+Description=Timer for mm-alert.service (fault check every 5 min)
+
+[Timer]
+OnCalendar=*:0/5
+Persistent=false
+
+[Install]
+WantedBy=timers.target

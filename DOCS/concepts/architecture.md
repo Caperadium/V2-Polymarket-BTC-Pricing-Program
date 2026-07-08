@@ -99,6 +99,23 @@ The strategy layer converts model probabilities into actionable trade recommenda
 | `dashboard.py` | 8-tab Streamlit monitoring dashboard |
 | `pages/backtesting.py` | Backtest results tab |
 | `pages/polymarket_console.py` | Operator workflow: generate → approve → submit → monitor |
+| `pages/mm_monitor.py` | Read-only monitor + start/stop control for the market-maker paper runner |
+
+### 8. Market-Maker (`market_maker/`)
+
+A separate, self-contained system: binary BTC market-making against
+Polymarket `bitcoin-above` ladders, paper-traded only (no live orders
+sent). It reuses `core/pricing/btc_pricing_engine.py` as its sole fair-value
+source (`pricer_adapter.py`) but has its own quoting (Dalen AS/GLFT), no-arb
+repair, sizing (Kelly -> Baker-McHale), risk gating, and SQLite-backed
+state/PnL tracking, orchestrated one tick at a time by
+`harness.PaperTradingLoop`. Two runner variants share this wiring:
+`shadow_runner.py` (Stage A, REST-polled, fill-free) and `paper_runner.py`
+(Stage B, live WebSocket feed, simulated fills -- the VPS deployment
+target). See the [Market-Maker Deployment guide](../guides/market-maker-deployment.md)
+for the operator runbook and the repo's `CLAUDE.md` for the full component
+breakdown, control-file protocol, and resumable-state/exit-code
+conventions.
 
 ## Data Flow
 

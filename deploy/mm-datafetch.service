@@ -1,0 +1,22 @@
+# mm-datafetch.service -- refresh DATA/btc_daily.csv + DATA/btc_intraday_1m.csv
+#
+# Oneshot, triggered by mm-datafetch.timer every 30 minutes. Nothing else on
+# the VPS refreshes this data (plan B2) -- without it the vol gate and
+# settlement checks run on stale BTC prices and every future ladder
+# eventually goes UNSETTLEABLE. Template unit; EDIT the placeholders below.
+#
+#   sudo cp deploy/mm-datafetch.service deploy/mm-datafetch.timer /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now mm-datafetch.timer
+
+[Unit]
+Description=Refresh BTC price data for the Stage-B paper runner
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# <EDIT> path to the repo clone on this VPS -- must match mm-paper.service.
+WorkingDirectory=/opt/mm/V2-BTC-Contract-Pricing
+# <EDIT> path to the venv's python.
+ExecStart=/opt/mm/venv/bin/python core/data/data_fetcher.py

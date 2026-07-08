@@ -21,17 +21,39 @@ first):
     # or from a fixed config file (VPS deployment; see paper_run_config.json):
     python -m market_maker.paper_runner --config market_maker/paper_run_config.json
 
---minutes 0 runs indefinitely (until a stop file / SIGTERM / Ctrl-C).
+--minutes 0 runs indefinitely (until a stop file / SIGTERM / Ctrl-C / ladder
+settlement / feed-death / tick-error-circuit-breaker).
+
+--event-slug auto resolves the next bitcoin-above event automatically
+(market_maker.shadow_runner.resolve_next_event, --auto-event-lead-days).
+
+--state-db points MMStateStore at a persistent path (VPS config:
+market_maker/mm_paper_state.db) instead of the default per-run
+out_dir/paper_state.db; a pre-existing db at that path triggers the resume
+protocol (mark_all_live_orders_unknown -> loop.restart -> loop.settle(
+catch_up=True)) so a crash/restart rebuilds in-memory state from the fills
+table instead of starting flat. Exit code 42 (ladder_settled /
+settlement_timeout) tells the systemd unit (deploy/mm-paper.service,
+RestartForceExitStatus=42) to roll over to the next event; 1 (feed_dead /
+tick_errors / early failure) is a normal supervised restart; everything
+else (completed / stop_file / sigterm / sigint) is 0, no restart.
 
 Outputs under --out (default temp/paper_run/<UTC ts>/):
     quotes.csv   one row per (tick, market): market touch vs our quote, mode,
                  credibility, no-arb status
     fills.csv    one row per simulated fill (queue/print/latency detail)
     ticks.csv    one row per tick: wall latency, reprice latency, feed health
+                 (quotes/fills/ticks csvs are appended to, header written only
+                 once -- safe to reuse --out or --state-db across restarts)
     summary.md   end-of-run Stage-B report (fills, ending inventory, fold check)
-    paper_state.db  MMStateStore (orders/fills/inventory/quotes journal)
+    paper_state.db  MMStateStore (orders/fills/inventory/quotes journal);
+                     relocated by --state-db
     run_meta.json    self-describing run config, written once after resolve_event
-    heartbeat.json   liveness file, rewritten every tick (atomic)
+    heartbeat.json   liveness file, rewritten every tick (atomic); includes
+                     btc_data_age_s and feed_restarts. An initial heartbeat is
+                     written immediately after out_dir creation, before
+                     resolve_event/warmup, so slow auto-resolve/warmup does not
+                     trip a false STALLED alert.
 
 Control-file protocol (--control-dir, default temp/paper_run/control/):
     mm_paper.pid      this process's PID; removed in the finally block
@@ -63,7 +85,7 @@ from market_maker.market_data_client import FeedCapability, PolymarketFeedAdapte
 from market_maker.order_lifecycle import SimClock
 from market_maker.pnl_report import PER_MARKET_SNAPSHOT_EVERY_N_TICKS, compute_pnl_rows
 from market_maker.settlement_handler import TERMINAL_OUTCOMES, settlement_instant_utc
-from market_maker.shadow_runner import CachedEngine, resolve_event
+from market_maker.shadow_runner import CachedEngine, resolve_event, resolve_next_event
 from market_maker.state_store import MMStateStore
 
 logger = logging.getLogger("mm.paper")
@@ -151,6 +173,7 @@ def _write_heartbeat(
     out_dir: Path, ts: datetime, tick: int, feed_healthy: bool, n_msgs: int,
     fills_total: int, noarb_violations: int, unhealthy_ticks: int, pulled_ticks: int,
     tick_s: float, reprice_s: float,
+    btc_data_age_s: Optional[float] = None, feed_restarts: int = 0,
 ) -> None:
     # tick_s/reprice_s feed run_control._heartbeat_threshold: a reprice tick
     # blocks in calculate_probabilities for minutes, so the STALLED threshold
@@ -160,6 +183,7 @@ def _write_heartbeat(
         "n_msgs": n_msgs, "fills_total": fills_total, "noarb_violations": noarb_violations,
         "unhealthy_ticks": unhealthy_ticks, "pulled_ticks": pulled_ticks,
         "tick_s": tick_s, "reprice_s": reprice_s,
+        "btc_data_age_s": btc_data_age_s, "feed_restarts": feed_restarts,
     })
 
 
@@ -186,6 +210,26 @@ def run(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--btc-refresh-s", type=float, default=900.0,
                     help="re-read DATA/btc_intraday_1m.csv when its mtime changes, checked at most "
                          "this often (R1)")
+    ap.add_argument("--state-db", default="",
+                    help="path to a persistent MMStateStore db; \"\" (default) keeps the current "
+                         "per-run out_dir/paper_state.db behavior. A pre-existing db triggers the "
+                         "restart()->settle(catch_up=True) resume protocol (plan 2.1)")
+    ap.add_argument("--max-settlement-wait-h", type=float, default=26.0,
+                    help="hard fallback: exit settlement_timeout if the ladder is still not fully "
+                         "terminal this long after settlement_instant_utc (plan 2.2)")
+    ap.add_argument("--auto-event-lead-days", type=int, default=3,
+                    help="used only when --event-slug auto: probe this many days ahead (+4 margin) "
+                         "for the next bitcoin-above event (plan 2.2)")
+    ap.add_argument("--btc-stale-max-s", type=float, default=7200.0,
+                    help="if DATA/btc_intraday_1m.csv's mtime is older than this (or missing), pull "
+                         "quotes via manual_override until fresh data lands (plan 2.3)")
+    ap.add_argument("--feed-dead-ticks", type=int, default=40,
+                    help="consecutive unhealthy-feed ticks before the adapter is restarted; a second "
+                         "trip with zero healthy ticks since the restart exits feed_dead (plan 2.4)")
+    ap.add_argument("--garch-refit-s", type=float, default=21_600.0,
+                    help="CachedEngine GARCH cache max age before it is cleared and refit (plan 2.5)")
+    ap.add_argument("--max-consecutive-tick-errors", type=int, default=20,
+                    help="consecutive TICK_ERRORs before exiting tick_errors (plan 2.6)")
 
     # --config pre-scan (parse_known_args so unrelated flags don't error out
     # here): load the JSON, apply as argparse defaults BEFORE the real parse
@@ -260,12 +304,38 @@ def run(argv: Optional[List[str]] = None) -> int:
     noarb_violations = 0
     pulled_ticks = 0
     unhealthy_ticks = 0
+    # 2.4 feed watchdog: dedicated counter (NOT the lifetime unhealthy_ticks
+    # accumulator above, which never resets) plus a restart-generation flag.
+    consec_unhealthy_feed = 0
+    feed_restarts = 0
+    healthy_since_restart = True
+    # 2.6 tick-failure circuit breaker.
+    consec_tick_errors = 0
+    # 2.3 BTC staleness guard.
+    btc_data_age_s: Optional[float] = None
+    last_btc_stale_warn_wall = 0.0
 
     try:
         out_dir = Path(args.out) if args.out else Path("temp/paper_run") / start.strftime("%Y%m%d_%H%M%S")
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        expiry_key, ladder = resolve_event(args.event_slug)
+        # 2.2: write an initial heartbeat BEFORE resolve_event/warmup -- auto
+        # event resolution (retries, up to ~150s) plus warmup can exceed
+        # run_control's _STARTING_GRACE_S and trip a false STALLED alert on
+        # every rollover otherwise. tick=0, feed_healthy=False is fine here.
+        try:
+            _write_heartbeat(out_dir, start, 0, False, 0, 0, 0, 0, 0,
+                              args.tick_s, args.reprice_s,
+                              btc_data_age_s=None, feed_restarts=0)
+        except Exception:
+            logger.warning("initial heartbeat write failed", exc_info=True)
+
+        if args.event_slug == "auto":
+            expiry_key, ladder = resolve_next_event(
+                datetime.now(timezone.utc), int(args.auto_event_lead_days)
+            )
+        else:
+            expiry_key, ladder = resolve_event(args.event_slug)
         markets = [(slug, strike) for slug, strike, _tok in ladder]
         tokens = {slug: tok for slug, _strike, tok in ladder}
         logger.info("event %s expiry %s: %d strikes %s", args.event_slug, expiry_key,
@@ -284,8 +354,14 @@ def run(argv: Optional[List[str]] = None) -> int:
         }
         _write_json_atomic(out_dir / "run_meta.json", run_meta)
 
-        engine = CachedEngine(reprice_s=args.reprice_s)
-        store = MMStateStore(str(out_dir / "paper_state.db"))
+        engine = CachedEngine(reprice_s=args.reprice_s, garch_refit_s=args.garch_refit_s)
+
+        # 2.1: resumable state. The existence check MUST happen before
+        # MMStateStore is constructed -- its __init__ creates the file, so
+        # checking afterwards would never see db_existed=True.
+        state_db_path = Path(args.state_db) if args.state_db else (out_dir / "paper_state.db")
+        db_existed = state_db_path.exists()
+        store = MMStateStore(str(state_db_path))
         clock = SimClock(start - timedelta(seconds=args.tick_s))
 
         from core.strategy.vol_gate import compute_vol_gate
@@ -311,6 +387,18 @@ def run(argv: Optional[List[str]] = None) -> int:
             feed_capability=FeedCapability.FULL_L2,
         )
 
+        if db_existed:
+            # 2.1 resume protocol. ORDER MATTERS: restart() strictly before
+            # settle(catch_up=True) -- restart() replays the full fills
+            # table into a fresh InventoryManager; settle's registry-merge
+            # catch-up then closes out any previous-event position it finds
+            # still open (harness.py settle() docstring/invariant comment).
+            resume_now = datetime.now(timezone.utc)
+            logger.info("state db %s already existed; running resume protocol", state_db_path)
+            store.mark_all_live_orders_unknown()
+            loop.restart(resume_now)
+            loop.settle(resume_now, catch_up=True)
+
         adapter = PolymarketFeedAdapter(tokens)
         adapter.start()
         warm_end = time.time() + args.warmup_s
@@ -319,23 +407,33 @@ def run(argv: Optional[List[str]] = None) -> int:
         if not adapter.healthy():
             logger.warning("feed not healthy after %.0fs warmup; starting anyway", args.warmup_s)
 
-        quotes_csv = (out_dir / "quotes.csv").open("w", newline="", encoding="ascii")
-        fills_csv = (out_dir / "fills.csv").open("w", newline="", encoding="ascii")
-        ticks_csv = (out_dir / "ticks.csv").open("w", newline="", encoding="ascii")
+        # 2.1: append, not truncate -- a fixed --out reused across resumed
+        # runs must not lose prior rows. Header written only for a new/empty
+        # file.
+        quotes_path, fills_path, ticks_path = out_dir / "quotes.csv", out_dir / "fills.csv", out_dir / "ticks.csv"
+        quotes_new = (not quotes_path.exists()) or quotes_path.stat().st_size == 0
+        fills_new = (not fills_path.exists()) or fills_path.stat().st_size == 0
+        ticks_new = (not ticks_path.exists()) or ticks_path.stat().st_size == 0
+        quotes_csv = quotes_path.open("a", newline="", encoding="ascii")
+        fills_csv = fills_path.open("a", newline="", encoding="ascii")
+        ticks_csv = ticks_path.open("a", newline="", encoding="ascii")
         qw = csv.writer(quotes_csv)
         fw = csv.writer(fills_csv)
         tw = csv.writer(ticks_csv)
-        qw.writerow([
-            "ts", "market", "strike", "mkt_bid", "mkt_ask", "mkt_spread",
-            "our_bid", "our_ask", "our_spread", "bid_size", "ask_size",
-            "mode", "credibility", "p_hat", "consensus_p", "noarb_ok",
-        ])
-        fw.writerow([
-            "ts", "market", "order_id", "side", "price", "size", "liquidity",
-            "queue_ahead_at_fill", "print_size", "latency_applied_ms",
-            "mid_at_fill", "assumption_set",
-        ])
-        tw.writerow(["ts", "tick", "wall_s", "reprice_s", "feed_healthy", "n_msgs", "n_fills"])
+        if quotes_new:
+            qw.writerow([
+                "ts", "market", "strike", "mkt_bid", "mkt_ask", "mkt_spread",
+                "our_bid", "our_ask", "our_spread", "bid_size", "ask_size",
+                "mode", "credibility", "p_hat", "consensus_p", "noarb_ok",
+            ])
+        if fills_new:
+            fw.writerow([
+                "ts", "market", "order_id", "side", "price", "size", "liquidity",
+                "queue_ahead_at_fill", "print_size", "latency_applied_ms",
+                "mid_at_fill", "assumption_set",
+            ])
+        if ticks_new:
+            tw.writerow(["ts", "tick", "wall_s", "reprice_s", "feed_healthy", "n_msgs", "n_fills"])
 
         end_time = None if args.minutes == 0 else (time.time() + args.minutes * 60.0)
 
@@ -371,23 +469,82 @@ def run(argv: Optional[List[str]] = None) -> int:
             feed_healthy = adapter.healthy()
             if not feed_healthy:
                 unhealthy_ticks += 1
+                consec_unhealthy_feed += 1
+            else:
+                consec_unhealthy_feed = 0
+                healthy_since_restart = True
             n_msgs = sum(len(v) for v in messages.values())
+
+            # 2.4 feed watchdog: an exception escaping the adapter's asyncio
+            # loop kills the feed thread once and forever, so healthy()
+            # stays False silently for the rest of the month unless
+            # something restarts it.
+            if consec_unhealthy_feed >= args.feed_dead_ticks:
+                if not healthy_since_restart:
+                    logger.error(
+                        "feed still dead %d ticks after restart #%d; exiting feed_dead",
+                        consec_unhealthy_feed, feed_restarts,
+                    )
+                    exit_reason = "feed_dead"
+                    break
+                logger.warning(
+                    "feed unhealthy for %d consecutive ticks; restarting adapter (restart #%d)",
+                    consec_unhealthy_feed, feed_restarts + 1,
+                )
+                try:
+                    adapter.stop()
+                except Exception:
+                    logger.warning("adapter.stop() failed during watchdog restart", exc_info=True)
+                adapter = PolymarketFeedAdapter(tokens)
+                adapter.start()
+                feed_restarts += 1
+                consec_unhealthy_feed = 0
+                healthy_since_restart = False
+
+            # 2.3 BTC staleness guard: stat the csv FRESH every tick (not the
+            # R1-cached btc_mtime, which only refreshes every btc_refresh_s
+            # and would keep quoting up to ~15min after fresh data lands).
+            fresh_btc_mtime = _safe_mtime(_BTC_INTRADAY_PATH)
+            if fresh_btc_mtime is None:
+                btc_data_age_s = None
+                btc_stale = True
+            else:
+                btc_data_age_s = loop_start - fresh_btc_mtime
+                btc_stale = btc_data_age_s > args.btc_stale_max_s
+            if btc_stale and (loop_start - last_btc_stale_warn_wall) >= 600.0:
+                logger.warning(
+                    "BTC intraday csv stale (age=%s, max=%.0fs); pulling quotes via manual_override",
+                    "missing" if fresh_btc_mtime is None else f"{btc_data_age_s:.0f}s",
+                    args.btc_stale_max_s,
+                )
+                last_btc_stale_warn_wall = loop_start
 
             clock.set(now - timedelta(seconds=args.tick_s))
             n_lat_before = len(engine.latencies)
             try:
-                loop.tick(messages, feed_healthy=feed_healthy)
+                loop.tick(messages, feed_healthy=feed_healthy, manual_override=btc_stale)
             except Exception:
-                logger.error("tick %d failed", tick_n, exc_info=True)
+                consec_tick_errors += 1
+                logger.error("tick %d failed (consecutive tick errors=%d)", tick_n,
+                             consec_tick_errors, exc_info=True)
                 tw.writerow([now.isoformat(), tick_n, f"{time.time() - loop_start:.2f}",
                              "", int(feed_healthy), n_msgs, "TICK_ERROR"])
                 ticks_csv.flush()
-                _write_heartbeat(out_dir, now, tick_n, feed_healthy, n_msgs, n_fills_total,
-                                  noarb_violations, unhealthy_ticks, pulled_ticks,
-                                  args.tick_s, args.reprice_s)
+                try:
+                    _write_heartbeat(out_dir, now, tick_n, feed_healthy, n_msgs, n_fills_total,
+                                      noarb_violations, unhealthy_ticks, pulled_ticks,
+                                      args.tick_s, args.reprice_s,
+                                      btc_data_age_s=btc_data_age_s, feed_restarts=feed_restarts)
+                except Exception:
+                    logger.warning("heartbeat write failed", exc_info=True)
+                if consec_tick_errors >= args.max_consecutive_tick_errors:
+                    logger.error("%d consecutive tick errors; exiting tick_errors", consec_tick_errors)
+                    exit_reason = "tick_errors"
+                    break
                 time.sleep(max(0.0, args.tick_s - (time.time() - loop_start)))
                 continue
 
+            consec_tick_errors = 0
             repriced = engine.latencies[n_lat_before:] if len(engine.latencies) > n_lat_before else []
             snap = loop.last_snapshot
             fv = loop.last_fair_value
@@ -445,8 +602,9 @@ def run(argv: Optional[List[str]] = None) -> int:
             # every market already being terminally settled (loop.settle is
             # idempotent regardless, this just avoids the store round trip
             # every tick once the ladder is fully resolved).
+            settlement_instant = settlement_instant_utc(expiry_key)
             try:
-                if now >= settlement_instant_utc(expiry_key) and not _all_settled_terminal(store, markets, expiry_key):
+                if now >= settlement_instant and not _all_settled_terminal(store, markets, expiry_key):
                     loop.settle(now)
             except Exception:
                 logger.error("settlement step failed at tick %d", tick_n, exc_info=True)
@@ -476,15 +634,42 @@ def run(argv: Optional[List[str]] = None) -> int:
             except Exception:
                 logger.warning("pnl snapshot failed at tick %d", tick_n, exc_info=True)
 
-            _write_heartbeat(out_dir, now, tick_n, feed_healthy, n_msgs, n_fills_total,
-                              noarb_violations, unhealthy_ticks, pulled_ticks,
-                              args.tick_s, args.reprice_s)
+            try:
+                _write_heartbeat(out_dir, now, tick_n, feed_healthy, n_msgs, n_fills_total,
+                                  noarb_violations, unhealthy_ticks, pulled_ticks,
+                                  args.tick_s, args.reprice_s,
+                                  btc_data_age_s=btc_data_age_s, feed_restarts=feed_restarts)
+            except Exception:
+                logger.warning("heartbeat write failed", exc_info=True)
+
+            # 2.2: exit-after-settlement + rollover. A 30min grace after the
+            # settlement instant lets the settlement step above (and any
+            # retry) actually land before declaring the ladder done; the
+            # hard --max-settlement-wait-h fallback prevents a stuck
+            # UNSETTLEABLE market from blocking rollover for the rest of the
+            # month (unsettled positions stay open in the persisted DB and
+            # are retried by the next run's resume catch-up, WS1.4).
+            if (now >= settlement_instant + timedelta(minutes=30)
+                    and _all_settled_terminal(store, markets, expiry_key)):
+                exit_reason = "ladder_settled"
+                break
+            if now >= settlement_instant + timedelta(hours=args.max_settlement_wait_h):
+                exit_reason = "settlement_timeout"
+                break
 
             elapsed = time.time() - loop_start
             time.sleep(max(0.0, args.tick_s - elapsed))
     except KeyboardInterrupt:
         exit_reason = "sigint"
     finally:
+        # L4: best-effort cancel of any still-LIVE paper orders so no DB rows
+        # are left LIVE after shutdown (crash-before-cancel would otherwise
+        # confuse the next resume's restart_reconcile).
+        if loop is not None:
+            try:
+                loop.lifecycle.cancel_all()
+            except Exception:
+                logger.warning("cancel_all() failed during shutdown", exc_info=True)
         if adapter is not None:
             adapter.stop()
         for fh in (quotes_csv, fills_csv, ticks_csv):
@@ -543,11 +728,20 @@ def run(argv: Optional[List[str]] = None) -> int:
         f"- self-inflicted no-arb violations (post-repair): {noarb_violations}\n"
         f"- PULLED (market,tick) rows: {pulled_ticks}\n"
         f"- re-price latencies (s): {['%.1f' % v for v in engine.latencies]}\n"
-        f"- data: quotes.csv / fills.csv / ticks.csv / paper_state.db in this directory\n",
+        f"- feed restarts: {feed_restarts}\n"
+        f"- data: quotes.csv / fills.csv / ticks.csv in this directory; state db: {state_db_path}\n",
         encoding="ascii",
     )
     logger.info("paper run complete: %s (exit_reason=%s)", out_dir, exit_reason)
     print(str(out_dir))
+    # 2.2 exit-code mapping: ladder_settled/settlement_timeout -> 42 (systemd
+    # RestartForceExitStatus rolls to the next event); feed_dead/tick_errors
+    # -> 1 (supervised restart, clean re-init); everything else -- completed,
+    # stop_file, sigterm, sigint -- -> 0 (no restart on an intentional stop).
+    if exit_reason in ("ladder_settled", "settlement_timeout"):
+        return 42
+    if exit_reason in ("feed_dead", "tick_errors"):
+        return 1
     return 0
 
 

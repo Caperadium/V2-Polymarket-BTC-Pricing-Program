@@ -86,3 +86,5 @@ Market Maker/
 
 # Test cache
 .pytest_cache/
+*.db-shm
+*.db-wal

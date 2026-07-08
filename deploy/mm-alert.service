@@ -1,0 +1,32 @@
+# mm-alert.service -- fault detection for mm-paper.service (plan H3)
+#
+# Oneshot, triggered by mm-alert.timer every 5 minutes. Runs
+# scripts/mm_alert_check.py, which reads market_maker.run_control's
+# engine_status() + heartbeat.json and POSTs a webhook alert on a handful of
+# fault conditions (engine CRASHED/STALLED, feed unhealthy >15min, stale BTC
+# data, low disk, settlement_timeout). ALWAYS exits 0 -- see the script's
+# module docstring. Template unit; EDIT the placeholders below.
+#
+#   sudo cp deploy/mm-alert.service deploy/mm-alert.timer /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now mm-alert.timer
+#
+# Set MM_ALERT_WEBHOOK (Environment= below, or a drop-in -- see
+# deploy/README.md) to a Discord/Slack/ntfy-style incoming-webhook URL that
+# accepts a JSON POST body of {"text": "<message>"}. If unset, alerts are
+# only printed to stdout (visible via `journalctl -u mm-alert`).
+
+[Unit]
+Description=Alert check for mm-paper.service
+
+[Service]
+Type=oneshot
+# <EDIT> path to the repo clone on this VPS -- must match mm-paper.service.
+WorkingDirectory=/opt/mm/V2-BTC-Contract-Pricing
+# <EDIT> path to the venv's python.
+ExecStart=/opt/mm/venv/bin/python scripts/mm_alert_check.py --control-dir temp/paper_run/control
+# <EDIT> your webhook URL. Prefer a drop-in override
+# (/etc/systemd/system/mm-alert.service.d/webhook.conf) over editing this
+# file in place, so re-copying an updated unit template does not clobber
+# your secret -- see deploy/README.md.
+Environment=MM_ALERT_WEBHOOK=https://example.invalid/CHANGE-ME

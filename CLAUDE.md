@@ -57,6 +57,24 @@ python core/validation/rolling_evaluator.py --window-days 90 --step-days 7 --hor
 # Bayesian posterior estimation for pricing parameters
 python core/pricing/bayesian_estimation.py --strikes 90000,100000 --hours 336 --n-posterior 50
 
+# Market-maker Stage-B paper runner (live WS feed, simulated fills; BTC data must be fresh first)
+python -m market_maker.paper_runner --event-slug bitcoin-above-on-july-10-2026 --minutes 240 --tick-s 15
+python -m market_maker.paper_runner --config market_maker/paper_run_config.json  # VPS/unattended mode (event_slug "auto")
+
+# Market-maker Stage-A shadow runner (read-only REST polling, no fills)
+python -m market_maker.shadow_runner --event-slug bitcoin-above-on-july-10-2026 --minutes 40 --tick-s 30
+
+# Market-maker engine control (same protocol the mm_monitor dashboard page and deploy/ systemd units use)
+python -c "from market_maker import run_control; print(run_control.start_engine())"
+python -c "from market_maker import run_control; print(run_control.engine_status())"
+python -c "from market_maker import run_control; print(run_control.stop_engine())"
+
+# Market-maker VPS deploy-kit alert check (stdlib only, cron/timer-safe, always exits 0)
+python scripts/mm_alert_check.py --control-dir temp/paper_run/control
+
+# Launch MM monitor dashboard page
+streamlit run app/pages/mm_monitor.py
+
 # Run tests
 python -m pytest tests/ -v
 
@@ -73,7 +91,8 @@ mkdocs serve
 │   ├── dashboard.py              #   Main 8-tab monitoring dashboard
 │   └── pages/
 │       ├── backtesting.py        #   Backtesting page
-│       └── polymarket_console.py #   Trade execution operator console
+|       |-- polymarket_console.py #   Trade execution operator console
+|       `-- mm_monitor.py         #   Market-maker Stage-B paper-run monitor + engine control
 ├── core/                         # Domain logic (no scripts/pipelines)
 │   ├── backtesting/              #   Unified backtesting module
 │   │   ├── __init__.py           #     Public API exports
@@ -102,6 +121,33 @@ mkdocs serve
 │   │   └── signal_diagnostics.py #   Deprecation shim → core.backtesting.diagnostics
 │   └── validation/
 │       └── rolling_evaluator.py  #   Rolling-window model evaluation (Brier + VaR)
+|-- market_maker/                 # Binary BTC market-making (Polymarket, paper-traded; see architecture below)
+|   |-- config.py                 #   MMConfig launch defaults
+|   |-- contracts.py              #   Interface dataclasses/enums + VenueAdapter ABC
+|   |-- market_data_client.py     #   Live CLOB WebSocket feed adapter (BookMirror)
+|   |-- pricer_adapter.py         #   Sole boundary to core/pricing/btc_pricing_engine.py
+|   |-- fair_value_anchor.py      #   Beuoy bankroll-credibility consensus
+|   |-- quote_engine.py           #   Dalen AS / GLFT quoting
+|   |-- spread_builder.py         #   Additive spread terms -> QuoteSet
+|   |-- ladder_hedger.py          #   No-arb repair + cross-strike hedging
+|   |-- robustness_sizing.py      #   Kelly -> Baker-McHale -> caps sizing
+|   |-- inventory_manager.py      #   Per-contract/per-ladder inventory (q, avg_cost)
+|   |-- liquidity_monitor.py      #   Depth/impact/arb-half-life regime tags
+|   |-- risk_controller.py        #   Vol-gate-driven risk directives
+|   |-- order_lifecycle.py        #   QuoteSet -> venue actions, restart reconciliation
+|   |-- paper_fill_sim.py         #   Conservative queue-behind fill simulator
+|   |-- settlement_handler.py     #   12:00 ET settlement + synthetic closing fills
+|   |-- state_store.py            #   SQLite/WAL state (orders/fills/inventory/markets/...)
+|   |-- pnl_report.py             #   Settlement-aware PnL snapshots
+|   |-- harness.py                #   PaperTradingLoop -- one-tick orchestration + settle/restart
+|   |-- run_control.py            #   Stdlib start/stop/status control-file protocol
+|   |-- shadow_runner.py          #   Stage-A read-only REST runner + resolve_event/resolve_next_event
+|   `-- paper_runner.py           #   Stage-B live-WS paper runner (VPS deployment target)
+|-- deploy/                       # Systemd deployment kit for the Stage-B paper runner (see CLAUDE.md below)
+|   |-- mm-paper.service          #   Engine unit template
+|   |-- mm-datafetch.service/.timer #  BTC data refresh every 30 min
+|   |-- mm-alert.service/.timer   #   Fault-check + webhook alert every 5 min
+|   `-- README.md                 #   Install/runbook/72h acceptance test
 ├── scripts/                      # Executable scripts & pipelines
 │   ├── backtesting/
 │   │   ├── backtest_engine.py    #   Deprecation shim → core.backtesting.backtest_engine
@@ -116,7 +162,8 @@ mkdocs serve
 │   │   ├── plot_batch_curves.py  #   Probability curve plots
 │   │   └── aggregate_old_batch_data.py # Legacy data aggregation
 │   ├── migrate_db.py
-│   └── migrate_contract_store_midnight.py # One-shot: floor store dates to midnight + re-dedup
+|   |-- migrate_contract_store_midnight.py # One-shot: floor store dates to midnight + re-dedup
+|   `-- mm_alert_check.py         # Stdlib-only market-maker fault/alert check (deploy/mm-alert.timer)
 ├── polymarket/                   # CLOB execution layer
 │   ├── accounting.py             #   Collateral and fill tracking
 │   ├── intent_builder.py         #   auto_reco → OrderIntent conversion
@@ -279,6 +326,41 @@ Streamlit app with 8 tabs: Curves & Edges, Stability, Volatility & Regimes, Cali
 - `db.py`: SQLite persistence for runs, intents, submissions, account states
 - `models.py`: Dataclasses — OrderIntent, Submission, AccountState, etc.
 - `app/pages/polymarket_console.py`: Streamlit operator workflow (generate → approve → submit → monitor)
+
+### Market-Maker Stage-B Paper Runner (`market_maker/`)
+
+Binary BTC market-making against Polymarket `bitcoin-above` ladders -- paper-traded only (no live orders sent). Components, one-liner each:
+
+- `config.py` -- `MMConfig` launch defaults (spread terms, caps, refresh intervals).
+- `contracts.py` -- interface dataclasses/enums shared by every component (`QuoteSet`, `RiskDirective`, `Side`, `VenueAdapter` ABC, ...).
+- `market_data_client.py` -- `PolymarketFeedAdapter`: live CLOB WebSocket client, one connection per ladder; feed health is WS ping/pong liveness (`healthy()`), NOT message arrival (quiet books go silent 80s+).
+- `pricer_adapter.py` -- sole boundary to `core/pricing/btc_pricing_engine.py`; builds a `PricerSnapshot` over a densified strike grid.
+- `fair_value_anchor.py` -- Beuoy bankroll-credibility consensus probability + Bayes bankroll update.
+- `quote_engine.py` / `spread_builder.py` -- Dalen AS/GLFT quoting in log-odds space, composed into a `QuoteSet` per market.
+- `ladder_hedger.py` -- mandatory PAV isotonic no-arb repair across the ladder before any order goes out.
+- `robustness_sizing.py` -- Kelly -> Baker-McHale shrinkage -> joint-ladder/bankroll caps -> fractional-Kelly.
+- `inventory_manager.py` -- per-contract/per-ladder position (q, avg_cost); `harness.py` (`PaperTradingLoop`) is the one-tick orchestrator wiring all of the above.
+- `liquidity_monitor.py` / `risk_controller.py` -- depth/impact/arb-half-life regime tags feeding vol-gate-driven risk directives (PULL/widen/cancel-all).
+- `order_lifecycle.py` -- `QuoteSet`+`RiskDirective` -> venue actions with minimal churn; restart reconciliation (LIVE->UNKNOWN->reconciled).
+- `paper_fill_sim.py` -- conservative queue-behind fill model (no live orders; fills are simulated from the WS trade-print stream).
+- `settlement_handler.py` -- 12:00 ET settlement instant; a market resolves YES only if spot is **strictly above** the strike (venue-confirmed rule, matches the backtester's `resolve_outcome_yes`); emits a synthetic closing fill through the normal fill channel so `fold(fills) == inventory` holds through resolution.
+- `state_store.py` -- SQLite/WAL `MMStateStore` (orders/fills/inventory/quotes/pnl/settlements/**markets** registry -- the last persists `{market_id: (expiry_key, strike)}` so a restarted process can find a previous run's ladder to settle).
+- `pnl_report.py` -- settlement-aware PnL snapshots (realized = cash + q*avg_cost, folded from the durable fills table every tick).
+- `run_control.py` -- stdlib-only start/stop/status control-file protocol (used by both `app/pages/mm_monitor.py` and `deploy/`'s systemd units).
+- `shadow_runner.py` -- Stage-A read-only REST-polling runner (fill-free by construction) plus `resolve_event`/`resolve_next_event` (shared with `paper_runner.py`) and `CachedEngine` (re-price cache over the real pricing engine, GARCH cache refit every `garch_refit_s`, default 6h).
+- `paper_runner.py` -- Stage-B runner: same wiring as Stage-A but fed from the live WS adapter, so trade prints reach the fill simulator. This is the VPS deployment target.
+
+**Control-file protocol** (default dir `temp/paper_run/control/`, overridable via `--control-dir`): `mm_paper.pid` (this run's PID, removed on clean exit), `mm_paper.stop` (touch to request a graceful stop; optionally PID-stamped so a stale file from a prior run in the same dir can't kill a fresh one), `mm_paper.starting` (O_CREAT|O_EXCL start lock), `current_run.json` (pid/argv/config/out_dir + `exit_reason` once ended -- never deleted, always points at the latest run). Per-run `heartbeat.json` under `<out_dir>/` is rewritten every tick and carries `tick`, `feed_healthy`, `btc_data_age_s`, `feed_restarts`, `tick_s`, `reprice_s` (the last two size `run_control.engine_status()`'s STALLED threshold, since a reprice tick blocks the loop for minutes). `engine_status()` derives one of `RUNNING`/`STARTING`/`STALLED`/`STOPPED`/`CRASHED` from these files.
+
+**Resumable state + restart protocol**: `--state-db <path>` (VPS config: `market_maker/mm_paper_state.db`) makes `MMStateStore` persistent across restarts instead of per-run. A pre-existing db at that path triggers, in strict order: `store.mark_all_live_orders_unknown()` -> `loop.restart(now)` (replays the full fills table into a fresh `InventoryManager`) -> `loop.settle(now, catch_up=True)` (registry-merge catch-up: the persisted `markets` registry, which may still carry a previous event's ladder, is merged under the current run's markets, so a previous event's still-open positions get settled before quoting resumes). **Invariant**: `settle(catch_up=True)`'s post-catch-up inventory sync is unfiltered by design and MUST only run after `restart()` on a resumed store -- calling it on a fresh `InventoryManager` with a non-empty fills table would desync in-memory inventory from the store (see the code comment on `harness.PaperTradingLoop.settle()`).
+
+**Exit-code convention** (`paper_runner.run()`): `ladder_settled` (ladder fully settled + 30min grace) or `settlement_timeout` (`--max-settlement-wait-h`, default 26h, elapsed with the ladder still not terminal) -> **42**, an expected rollover signal -- `deploy/mm-paper.service` sets `RestartForceExitStatus=42` so systemd restarts and (with `--event-slug auto`) rolls onto the next event. `feed_dead` (feed watchdog gave up after a rebuild) or `tick_errors` (`--max-consecutive-tick-errors` consecutive failures) -> **1**, a normal supervised restart. `completed`/`stop_file`/`sigterm`/`sigint` -> **0**, no restart.
+
+**Auto event mode**: `--event-slug auto` calls `shadow_runner.resolve_next_event(now, lead_days)`, which probes the Gamma API for `bitcoin-above-on-<date>` candidates (both zero-padded and unpadded day forms -- the venue's convention is unverified) out to `lead_days + 4` days and picks the first with a real quoting window past `near_resolution_pull_hours + 12h`. Network fetches (`resolve_event`/`resolve_next_event`) retry with exponential backoff (5 attempts, 2s->30s; 404 is not retried).
+
+**Staleness guard**: every tick, `paper_runner.py` freshly stats `DATA/btc_intraday_1m.csv`; if its age exceeds `--btc-stale-max-s` (default 7200s) or the file is missing, the tick runs with `manual_override=True`, which pulls all quotes and cancels resting orders until fresh data lands. `DATA/btc_intraday_1m.csv` is refreshed by a separate cron/timer (`deploy/mm-datafetch.timer`), never by the runner itself.
+
+**The `deploy/` kit** (systemd unit templates + `scripts/mm_alert_check.py`): `mm-paper.service` runs the engine (`RestartForceExitStatus=42` for rollover, `TimeoutStopSec=900` since SIGTERM is only observed between ticks); `mm-datafetch.service`+`.timer` refresh BTC data every 30 min; `mm-alert.service`+`.timer` run `scripts/mm_alert_check.py` every 5 min -- a stdlib-only, always-exits-0 script that pages a generic JSON webhook (`$MM_ALERT_WEBHOOK`) on engine CRASHED/STALLED, a feed-unhealthy streak >15min, stale BTC data (>2x `--btc-stale-max-s`), low disk, or a `settlement_timeout` exit while stopped, de-duped 6h per alert key via `temp/paper_run/control/alert_state.json`. See `deploy/README.md` for the install walkthrough and the 72h VPS acceptance test procedure.
 
 ### Position Tracking (`core/data/positions.py`)
 

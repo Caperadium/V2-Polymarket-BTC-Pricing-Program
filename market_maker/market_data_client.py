@@ -282,6 +282,7 @@ class PolymarketFeedAdapter:
             {"type": "market", "assets_ids": list(self.market_by_token)}
         )
         backoff = 1.0
+        reconnect_streak = 0  # M2-spam: full traceback only on the streak's FIRST failure
         while not self._stop_evt.is_set():
             try:
                 async with websockets.connect(
@@ -292,6 +293,7 @@ class PolymarketFeedAdapter:
                     await ws.send(sub)
                     self._connected = True
                     backoff = 1.0
+                    reconnect_streak = 0
                     self._logger.info(
                         "subscribed %d tokens on %s", len(self.market_by_token), self.ws_url
                     )
@@ -301,13 +303,20 @@ class PolymarketFeedAdapter:
                         except asyncio.TimeoutError:
                             continue  # quiet book; liveness is ping/pong's job
                         self._handle_raw(raw if isinstance(raw, str) else raw.decode())
-            except Exception:
+            except Exception as exc:
                 if self._stop_evt.is_set():
                     break
                 self._connected = False
-                self._logger.warning(
-                    "feed connection lost; reconnecting in %.0fs", backoff, exc_info=True
-                )
+                reconnect_streak += 1
+                if reconnect_streak == 1:
+                    self._logger.warning(
+                        "feed connection lost; reconnecting in %.0fs", backoff, exc_info=True
+                    )
+                else:
+                    self._logger.warning(
+                        "feed connection lost (retry #%d): %s; reconnecting in %.0fs",
+                        reconnect_streak, exc, backoff,
+                    )
                 self._stop_evt.wait(backoff)
                 backoff = min(backoff * 2.0, self.max_backoff_s)
             finally:

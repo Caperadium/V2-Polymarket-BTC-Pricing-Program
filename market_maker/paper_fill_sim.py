@@ -26,9 +26,13 @@ Fill-model assumptions (6.3), implemented verbatim:
      quotes). Defaults from MMConfig (2000/2000 ms).
   5. Adverse-selection marks -- every PaperFill records mid_at_fill; mark_fills()
      backfills mid_p1m/mid_p10m/mid_p1h once their horizons elapse (None until).
-  6. Feed gaps -- when feed_healthy is False or a gap > threshold is detected,
-     all live quotes are marked "exposed" (an exposure incident is recorded with
-     start/end + duration); NO fills are simulated inside a gap.
+  6. Feed gaps -- when a market's feed_healthy flag is False on a snapshot,
+     that market's live quotes are marked "exposed" (an exposure incident is
+     recorded with start/end + duration); NO fills are simulated for that
+     market inside a gap. Gap state is tracked PER market_id (one simulator
+     instance commonly serves a whole ladder, fed per-market MarketStates in
+     a loop each tick) -- see _detect_gap for why this is feed_healthy-only,
+     not dt-based.
   7. Self-impact -- NONE. Our simulated orders never tighten the sim book, so the
      displayed sizes we queue behind are the real book's (this is optimistic in
      the OTHER direction, mitigated by assumptions 1 and 3; residual optimism is
@@ -195,6 +199,14 @@ class PaperFillSimulator:
     trade_through_only=True selects the strictly-more-conservative top-of-book
     fallback variant (plan 2.14): fills only on a print strictly through our
     level.
+
+    One instance may serve an entire ladder (the harness feeds it per-market
+    MarketStates in a loop each tick). All gap-tracking state (_last_ms_ts,
+    _in_gap, _open_incident) is therefore keyed PER market_id -- a single
+    shared "previous timestamp" would make the first market processed each
+    tick see dt = the full tick interval against the LAST market processed
+    last tick, a false gap unrelated to that market's own feed. See
+    _detect_gap for the gap criterion itself.
     """
 
     def __init__(self, config: Optional[MMConfig] = None,
@@ -208,9 +220,10 @@ class PaperFillSimulator:
         self._orders: Dict[str, _Order] = {}
         self._fills: List[_FillRecord] = []
         self._incidents: List[ExposureIncident] = []
-        self._open_incident: Optional[dict] = None
-        self._last_ms_ts: Optional[datetime] = None
-        self._in_gap: bool = False
+        # Per-market_id gap state (see class docstring).
+        self._open_incident: Dict[str, Optional[dict]] = {}
+        self._last_ms_ts: Dict[str, Optional[datetime]] = {}
+        self._in_gap: Dict[str, bool] = {}
 
     # -- lifecycle -------------------------------------------------------
 
@@ -243,15 +256,21 @@ class PaperFillSimulator:
     # -- market data -----------------------------------------------------
 
     def on_market_state(self, ms: MarketState) -> List[PaperFill]:
-        """Advance the sim by one snapshot; return PaperFills produced now."""
+        """Advance the sim by one snapshot; return PaperFills produced now.
+
+        All gap/activation/queue-maintenance bookkeeping below is scoped to
+        ms.market_id -- one simulator instance may serve a whole ladder, and
+        a snapshot for market A must never read or mutate market B's state.
+        """
+        mkt = ms.market_id
         gap = self._detect_gap(ms)
 
         if gap:
             self._enter_gap(ms)
-            self._last_ms_ts = ms.ts
+            self._last_ms_ts[mkt] = ms.ts
             return []
 
-        recovering = self._in_gap
+        recovering = self._in_gap.get(mkt, False)
         if recovering:
             self._exit_gap(ms)
 
@@ -260,7 +279,11 @@ class PaperFillSimulator:
             self._apply_cancel_ahead(ms)
         else:
             # Reset level baselines across the gap; do NOT attribute the jump.
+            # Scoped to this market only -- other markets' orders were never
+            # in a gap and their baselines must not move on this snapshot.
             for o in self._orders.values():
+                if o.market_id != mkt:
+                    continue
                 if o.activated:
                     o.last_level_size = _level_size(
                         ms.bid_depth if o.is_bid() else ms.ask_depth, o.price)
@@ -268,45 +291,59 @@ class PaperFillSimulator:
         new_records = self._process_prints(ms)
 
         self._prune(ms)
-        self._last_ms_ts = ms.ts
+        self._last_ms_ts[mkt] = ms.ts
         return [r.to_paperfill() for r in new_records]
 
     # -- gap handling (6.3.6) -------------------------------------------
 
     def _detect_gap(self, ms: MarketState) -> bool:
-        if not ms.feed_healthy:
-            return True
-        if self._last_ms_ts is not None:
-            dt = (ms.ts - self._last_ms_ts).total_seconds()
-            if dt > self._cfg.feed_gap_threshold_s:
-                return True
-        return False
+        """Per-market feed-loss check.
+
+        Gap = `not ms.feed_healthy` ONLY. There is deliberately no dt-based
+        arm: feed_healthy is the connection-liveness override threaded in by
+        the runner (P0b design) -- message silence on a quiet book is NOT
+        feed loss, and BookMirror already owns message staleness. This sim
+        only ever sees tick-cadence snapshots, so the elapsed time between
+        two calls carries no gap information of its own; a shared simulator
+        fed multiple markets per tick would otherwise see the FIRST market
+        of a tick appear dt = tick_interval after the LAST market of the
+        PREVIOUS tick and be wrongly declared gapped every single tick.
+        `feed_gap_threshold_s` stays in MMConfig for BookMirror.is_stale
+        only -- it is not consulted here.
+        """
+        return not ms.feed_healthy
 
     def _enter_gap(self, ms: MarketState) -> None:
-        self._in_gap = True
-        if self._open_incident is None:
-            live = self._live_order_ids(ms.ts)
-            start = self._last_ms_ts if self._last_ms_ts is not None else ms.ts
-            self._open_incident = {
+        mkt = ms.market_id
+        self._in_gap[mkt] = True
+        if self._open_incident.get(mkt) is None:
+            live = self._live_order_ids(ms.ts, mkt)
+            prev = self._last_ms_ts.get(mkt)
+            start = prev if prev is not None else ms.ts
+            self._open_incident[mkt] = {
                 "start": start,
                 "order_ids": tuple(live),
             }
 
     def _exit_gap(self, ms: MarketState) -> None:
-        self._in_gap = False
-        if self._open_incident is not None:
-            start = self._open_incident["start"]
-            oids = self._open_incident["order_ids"]
+        mkt = ms.market_id
+        self._in_gap[mkt] = False
+        inc = self._open_incident.get(mkt)
+        if inc is not None:
+            start = inc["start"]
+            oids = inc["order_ids"]
             self._incidents.append(ExposureIncident(
                 start=start, end=ms.ts,
                 duration_s=(ms.ts - start).total_seconds(),
                 n_live_orders=len(oids), order_ids=oids,
             ))
-            self._open_incident = None
+            self._open_incident[mkt] = None
 
-    def _live_order_ids(self, now: datetime) -> List[str]:
+    def _live_order_ids(self, now: datetime, market_id: str) -> List[str]:
         out = []
         for o in self._orders.values():
+            if o.market_id != market_id:
+                continue
             if now < o.placed_effective_ts:
                 continue
             if o.cancel_effective_ts is not None and now >= o.cancel_effective_ts:
@@ -320,6 +357,8 @@ class PaperFillSimulator:
 
     def _activate_pending(self, ms: MarketState) -> None:
         for o in self._orders.values():
+            if o.market_id != ms.market_id:
+                continue
             if o.activated:
                 continue
             if ms.ts >= o.placed_effective_ts:
@@ -334,6 +373,8 @@ class PaperFillSimulator:
         (6.3.2): only when NO fill-triggering print at our level this update."""
         prints = ms.last_prints
         for o in self._orders.values():
+            if o.market_id != ms.market_id:
+                continue
             if not o.activated:
                 continue
             depth = ms.bid_depth if o.is_bid() else ms.ask_depth
@@ -417,6 +458,8 @@ class PaperFillSimulator:
     def _prune(self, ms: MarketState) -> None:
         dead = []
         for oid, o in self._orders.items():
+            if o.market_id != ms.market_id:
+                continue
             if o.remaining <= _PRICE_TOL:
                 dead.append(oid)
             elif o.cancel_effective_ts is not None and ms.ts >= o.cancel_effective_ts:
@@ -457,10 +500,12 @@ class PaperFillSimulator:
 
     def exposure_incidents(self) -> List[ExposureIncident]:
         out = list(self._incidents)
-        if self._open_incident is not None:
-            start = self._open_incident["start"]
-            oids = self._open_incident["order_ids"]
-            end = self._last_ms_ts
+        for mkt, inc in self._open_incident.items():
+            if inc is None:
+                continue
+            start = inc["start"]
+            oids = inc["order_ids"]
+            end = self._last_ms_ts.get(mkt)
             dur = (end - start).total_seconds() if end is not None else None
             out.append(ExposureIncident(
                 start=start, end=None, duration_s=dur,

@@ -1,2 +1,3 @@
-{"event_slug": "bitcoin-above-on-july-10-2026", "minutes": 0, "tick_s": 15.0,
- "reprice_s": 300.0, "bankroll": 1000.0, "warmup_s": 15.0}
+{"event_slug": "auto", "minutes": 0, "tick_s": 15.0,
+ "reprice_s": 300.0, "bankroll": 1000.0, "warmup_s": 15.0,
+ "state_db": "market_maker/mm_paper_state.db", "auto_event_lead_days": 3}

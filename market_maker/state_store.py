@@ -357,6 +357,18 @@ class MMStateStore:
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_liquidity_windows_market_id ON liquidity_windows(market_id)"
             )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status, market_id)"
+            )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS markets (
+                    market_id TEXT PRIMARY KEY,
+                    expiry_key TEXT NOT NULL,
+                    strike REAL NOT NULL
+                )
+                """
+            )
 
     # ------------------------------------------------------------------
     # inventory
@@ -504,6 +516,29 @@ class MMStateStore:
 
     def get_all_orders(self) -> List[OrderRecord]:
         rows = self._conn.execute("SELECT * FROM orders").fetchall()
+        return [self._order_from_row(r) for r in rows]
+
+    def get_live_orders(
+        self, market_id: Optional[str] = None, side: Optional[Side] = None
+    ) -> List[OrderRecord]:
+        """Orders currently PENDING/LIVE, optionally scoped to one market
+        and/or side (plan B4-CPU: avoids the full-table deserialize
+        `get_all_orders()` does -- `order_lifecycle.py`'s per-tick hot paths
+        use this instead). `ORDER BY rowid` reproduces the row order
+        `get_all_orders()`'s unordered `SELECT *` happens to yield (insertion
+        order), so callers that used to scan-and-filter see byte-identical
+        first-hit results.
+        """
+        query = "SELECT * FROM orders WHERE status IN ('PENDING', 'LIVE')"
+        params: List[Any] = []
+        if market_id is not None:
+            query += " AND market_id = ?"
+            params.append(market_id)
+        if side is not None:
+            query += " AND side = ?"
+            params.append(side.value)
+        query += " ORDER BY rowid"
+        rows = self._conn.execute(query, params).fetchall()
         return [self._order_from_row(r) for r in rows]
 
     def mark_all_live_orders_unknown(self) -> int:
@@ -975,3 +1010,26 @@ class MMStateStore:
                 "SELECT * FROM liquidity_windows WHERE market_id = ? ORDER BY id ASC", (market_id,)
             ).fetchall()
         return [self._liquidity_window_from_row(r) for r in rows]
+
+    # ------------------------------------------------------------------
+    # markets (persisted market_id -> (expiry_key, strike) registry;
+    # plan B3-schema: enables settlement catch_up() to find a PREVIOUS
+    # run's markets after a restart, since `inventory` persists q/avg_cost
+    # per market_id but not its ladder membership).
+    # ------------------------------------------------------------------
+
+    def upsert_market(self, market_id: str, expiry_key: str, strike: float) -> None:
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO markets (market_id, expiry_key, strike)
+                VALUES (?, ?, ?)
+                ON CONFLICT(market_id) DO UPDATE SET
+                    expiry_key=excluded.expiry_key, strike=excluded.strike
+                """,
+                (market_id, expiry_key, strike),
+            )
+
+    def get_market_registry(self) -> Dict[str, Tuple[str, float]]:
+        rows = self._conn.execute("SELECT market_id, expiry_key, strike FROM markets").fetchall()
+        return {row["market_id"]: (row["expiry_key"], row["strike"]) for row in rows}

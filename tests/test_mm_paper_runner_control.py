@@ -77,8 +77,9 @@ class _FakeAdapter:
 class _FakeEngine:
     """Stands in for CachedEngine: same constructor signature, no GARCH."""
 
-    def __init__(self, reprice_s: float, seed: int = 42) -> None:
+    def __init__(self, reprice_s: float, seed: int = 42, garch_refit_s: float = 21_600.0) -> None:
         self.reprice_s = reprice_s
+        self.garch_refit_s = garch_refit_s
         self.latencies: List[float] = []
 
     def __call__(self, strikes, hours_to_expiry, **kwargs):
@@ -255,6 +256,21 @@ def test_settlement_populates_settlements_and_pnl_includes_payoff(tmp_path, monk
     intraday = pd.DataFrame({"close": [101000.0]}, index=pd.DatetimeIndex([settle_dt], tz="UTC"))
     data_provider = BTCDataProvider(intraday=intraday, daily=pd.DataFrame())
     monkeypatch.setattr(paper_runner, "_DATA_PROVIDER", data_provider)
+
+    # WS2.2: paper_runner now auto-exits (exit_reason=ladder_settled, code 42)
+    # once every market is terminal AND 30min have elapsed since the
+    # settlement instant -- true almost immediately for a genuinely
+    # backdated "yesterday" expiry_key, which would race the stop-file path
+    # this test exercises below. Patch ONLY paper_runner's imported
+    # settlement_instant_utc (its per-tick gate + grace-period check) to a
+    # fixed instant 5min in the past -- well past the gate (so settlement
+    # still runs on tick 1) but short of the 30min grace, so the runner
+    # keeps ticking and the stop-file shutdown path below still applies.
+    # settlement_handler's OWN internal resolution (a separate binding of
+    # the same function) is untouched, so it still resolves spot against the
+    # REAL "yesterday" settle_dt matching the data_provider fixture above.
+    fake_gate_instant = datetime.now(timezone.utc) - timedelta(minutes=5)
+    monkeypatch.setattr(paper_runner, "settlement_instant_utc", lambda expiry_key: fake_gate_instant)
 
     out_dir = tmp_path / "out"
     ctl_dir = tmp_path / "control"

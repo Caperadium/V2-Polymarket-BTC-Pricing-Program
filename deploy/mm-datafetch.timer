@@ -1,0 +1,14 @@
+# mm-datafetch.timer -- run mm-datafetch.service every 30 minutes.
+# Persistent=true: a missed run (VPS reboot/downtime) fires once on the next
+# boot instead of silently waiting for the next 30-minute boundary, so BTC
+# data does not go stale for up to 30 extra minutes after every reboot.
+
+[Unit]
+Description=Timer for mm-datafetch.service (BTC data refresh every 30 min)
+
+[Timer]
+OnCalendar=*:0/30
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -2,6 +2,103 @@
 
 <!-- Append one entry per logical task. Cleared after each push. -->
 
+- Stage-B unattended-VPS readiness (fix plan: B1-B4, H1-H3, M1-M5, L1-L2, L4,
+  three-workstream build): the paper runner and its supporting store/harness
+  layer are hardened to survive a month unattended on a headless VPS, and a
+  systemd deployment + alerting kit is added.
+  **Store/lifecycle/harness** (`market_maker/state_store.py`,
+  `order_lifecycle.py`, `harness.py`): new `get_live_orders(market_id=None,
+  side=None)` (`WHERE status IN ('PENDING','LIVE')` + `idx_orders_status`
+  index, `ORDER BY rowid` for byte-identical ordering) replaces
+  `order_lifecycle`'s per-tick full-table `get_all_orders()` scans in
+  `_live_order_for`/`cancel_all` (B4-CPU; `restart_reconcile` keeps the full
+  scan, startup-only). `PaperTradingLoop` gains `journal_maxlen`/
+  `x_hist_maxlen` (default 20,000, front-trimmed, lists stay indexable) so
+  `checked_ladders`/`all_checked_quote_sets`/`_x_hist` no longer grow
+  unbounded over a month (B4-memory; everything trimmed is already durable
+  via `store.append_quote`). New `markets` table + `upsert_market`/
+  `get_market_registry` persist `{market_id: (expiry_key, strike)}`
+  (B3-schema); `PaperTradingLoop.__init__` upserts its own ladder on
+  construction, and `settle(catch_up=True)` merges the persisted registry
+  UNDER the current ladder (so a restarted process can settle a PREVIOUS
+  event's still-open positions). The post-catch-up inventory sync stays
+  UNFILTERED by design -- documented as a code-comment invariant on
+  `settle()`: it must only run after `restart()` on a resumed store (WS2.1
+  guarantees the order), since `restart()` replays the full fills table
+  first.
+  **Runner/engine/control** (`market_maker/paper_runner.py`,
+  `shadow_runner.py`, `market_data_client.py`, `settlement_handler.py`,
+  `paper_run_config.json`): `--state-db` makes state persistent across
+  restarts -- a pre-existing db runs the resume protocol
+  (`mark_all_live_orders_unknown -> loop.restart -> loop.settle(catch_up=
+  True)`) before quoting resumes, and quotes/fills/ticks CSVs are appended
+  to (header written once) instead of truncated (B3, M5). The loop now exits
+  `ladder_settled`/`settlement_timeout` (code 42, systemd rollover) once the
+  ladder is fully settled + 30min grace, or `--max-settlement-wait-h`
+  (default 26h) elapses; `feed_dead`/`tick_errors` map to code 1;
+  everything else (`completed`/`stop_file`/`sigterm`/`sigint`) maps to 0
+  (B1). New `--event-slug auto` resolves the next `bitcoin-above` event via
+  `shadow_runner.resolve_next_event` (probes both padded/unpadded day-slug
+  forms, picks the first with a real quoting window past
+  `near_resolution_pull_hours + 12h`); a retrying `_get_retry()` wrapper (5
+  attempts, 2s->30s backoff, 404 passthrough) backs both `resolve_event` and
+  `resolve_next_event` (M4). A BTC-intraday-csv staleness guard
+  (`--btc-stale-max-s`, default 7200s, fresh per-tick stat, pulls quotes via
+  `manual_override` when stale/missing) and `btc_data_age_s` in
+  heartbeat.json address B2 on the runner side. A feed-thread watchdog
+  (dedicated consecutive-unhealthy-tick counter, restarts the adapter once,
+  exits `feed_dead` on a second trip with no intervening healthy tick;
+  `feed_restarts` in heartbeat.json) fixes H1's silent-forever-dead feed. A
+  tick-failure circuit breaker (`--max-consecutive-tick-errors`, default 20)
+  addresses M1. `CachedEngine` clears/refits its GARCH cache after
+  `garch_refit_s` (default 6h) instead of freezing the day-1 fit for the
+  whole run (H2). An initial heartbeat.json is now written immediately after
+  `out_dir` creation (before resolve_event/warmup) so slow auto-resolve
+  retries don't trip a false STALLED (L2 related); both `_write_heartbeat`
+  call sites are try/except-guarded (L2), and the shutdown `finally` block
+  best-effort cancels all live orders via `loop.lifecycle.cancel_all()`
+  (L4). `market_data_client.py`'s reconnect log now emits a full traceback
+  only on the first failure of a reconnect streak (M2-spam).
+  `settlement_handler.py`: fixed a stale comment (claimed ">=", code is and
+  remains strict ">" per the venue-confirmed rule) -- no behavior change
+  (L1). `paper_run_config.json`: `event_slug` -> `"auto"`, added `state_db`
+  (`market_maker/mm_paper_state.db`) and `auto_event_lead_days` (3).
+  **Deployment kit + alerting + docs** (new `deploy/` directory,
+  `scripts/mm_alert_check.py`, H3/M3/B2-ops/B3-ops): `deploy/mm-paper.service`
+  (systemd unit template: `Restart=on-failure` + `RestartForceExitStatus=42`
+  for rollover, `RestartSec=60`, `TimeoutStopSec=900` since SIGTERM is only
+  observed between ticks and a reprice can block minutes, `KillMode=mixed`),
+  `deploy/mm-datafetch.service`+`.timer` (runs `core/data/data_fetcher.py`
+  every 30 min, `Persistent=true`), `deploy/mm-alert.service`+`.timer`
+  (every 5 min). `scripts/mm_alert_check.py` (stdlib-only, always exits 0):
+  pages on engine state CRASHED/STALLED, `feed_healthy` false for >15min
+  (streak tracked across invocations in a small state file since the
+  heartbeat itself carries no streak), `btc_data_age_s` > 2x
+  `--btc-stale-max-s`, disk free < 1GB, and `exit_reason ==
+  "settlement_timeout"` while STOPPED; posts a generic JSON webhook
+  (`{"text": ...}`) to `$MM_ALERT_WEBHOOK` or prints to stdout if unset;
+  de-dupes identical alert keys for 6h via
+  `temp/paper_run/control/alert_state.json`. `deploy/README.md` documents
+  install, status checks, clean stop/start, the exit-42 rollover contract,
+  the known benign auto-event-not-yet-published crash-loop, a logrotate
+  example, and the 72h VPS acceptance test procedure.
+  New tests: `tests/test_mm_harness_ws1.py` (get_live_orders, journal caps,
+  registry round-trip, the crash-before-settle regression test exercising
+  the real `restart()` -> `settle(catch_up=True)` resume sequence),
+  `tests/test_mm_paper_runner_ws2.py` (resume protocol, CSV append,
+  ladder_settled/settlement_timeout/exit-code mapping, feed watchdog, tick
+  circuit breaker, staleness guard), `tests/test_mm_shadow_runner.py` (retry
+  wrapper, resolve_next_event date/form probing + near-resolution skip +
+  retry, GARCH cache expiry), `tests/test_mm_alert_check.py` (33 tests,
+  pure decision-logic coverage for every alert condition + dedupe + webhook
+  send/failure paths, no network). `tests/test_mm_paper_runner_control.py`
+  and `tests/test_mm_state_store.py` updated for the new `CachedEngine`
+  constructor kwarg / registry table. Full suite: 509 passed (476 baseline
+  + 33 new; `python -m pytest tests/ -v --ignore=tests/test_auto_reco_refactor.py`,
+  that file's pre-existing collection error untouched). `mkdocs build`
+  passes (one pre-existing griffe warning on an unrelated file, unchanged by
+  this task).
+
 - Stage-A shadow runs from the dev machine caught and fixed TWO real quoting
   defects (this is exactly what shadow mode is for): (1) sigma_b estimation
   annualized 30s REST-mid microstructure jitter into belief vol (~2.5-3.5 per
@@ -315,3 +412,53 @@
   the real runner) and a production STALLED false-alarm (reprice ticks block
   the loop for minutes; heartbeat now carries reprice_s and the threshold is
   max(3*tick_s, reprice_s + 60)).
+
+- Fix broken collection in `tests/test_auto_reco_refactor.py`: it imported
+  `compute_current_exposure_usd`, which a past refactor renamed to
+  `compute_current_exposure_mtm` (mark-to-market: market_price with
+  entry_price fallback), so the whole file was failing pytest collection.
+  Renamed the import and all 4 call sites, updated the affected docstrings
+  from "cost basis" to "MTM with entry-price fallback". Collection then
+  surfaced a second, unrelated drift: `TargetPosition` (core/strategy/
+  common.py) gained a required `exit_price` field with no default in the
+  3-stage refactor; added `exit_price=0.50` (matching entry_price/
+  market_price in each fixture, consistent with the 0.5 placeholder used
+  elsewhere in auto_reco.py) to all 8 `TargetPosition(...)` fixtures in
+  `TestDeltaSignHandling`, `TestVolGateEntryBlock`, and `TestChurnThresholds`.
+  No assertions changed. File now collects and passes 16/16; sanity run with
+  `tests/test_backtest_inversion.py` passes 18/18, no regressions.
+
+- Fix shared-state gap bug in `market_maker/paper_fill_sim.py`: one
+  `PaperFillSimulator` instance serves a whole ladder (the harness feeds it
+  per-market `MarketState`s in a loop each tick), but gap tracking
+  (`_last_ms_ts`/`_in_gap`/`_open_incident`) was a single global value.
+  `_detect_gap`'s dt-based arm compared each snapshot's ts against the
+  PREVIOUS market processed, so the first market of a tick (dt = tick
+  interval, e.g. 15s > the 5s `feed_gap_threshold_s`) was wrongly declared
+  gapped on every tick -- it never filled and spuriously logged an
+  `ExposureIncident` per tick, and the second market inherited a bogus
+  "recovering" baseline reset. Fixed by (1) keying all three gap-state dicts
+  per `market_id`; (2) dropping the dt-based arm of `_detect_gap` entirely --
+  gap is now `not ms.feed_healthy` only (feed_healthy is the
+  connection-liveness override threaded in by the runner; the sim only sees
+  tick-cadence snapshots so intra-call dt carries no gap information);
+  `feed_gap_threshold_s` stays in `MMConfig` for `BookMirror.is_stale`,
+  untouched here; (3) scoping every per-order loop in the snapshot path to
+  `ms.market_id` (`_activate_pending`, `_apply_cancel_ahead`, `_prune`, the
+  recovering-reset loop, `_live_order_ids` which now takes a `market_id`
+  param) so one market's snapshot can never read or mutate another market's
+  queue/baseline state; (4) `exposure_incidents()`/`total_exposure_seconds()`
+  now iterate the per-market `_open_incident` dict. `mark_fills`/`fills()`
+  were untouched (already market-tagged). Rewrote
+  `test_feed_gap_exposure_no_fills` in `tests/test_mm_paper_fill_sim.py` to
+  drive the gap via `feed_healthy=False` instead of a 7s dt jump (incident
+  timing assertions unchanged); added two new regression tests
+  (`test_shared_sim_ladder_a_ticks_never_touch_b_state`,
+  `test_gap_on_one_market_does_not_affect_sibling_market`) covering a
+  2-market shared-sim ladder at 15s tick spacing. The
+  `feed_gap_threshold_s=120.0` workaround in
+  `tests/test_mm_harness_ws1.py::test_crash_before_settle_recovery` (added
+  uncommitted earlier this session to mask the bug) is no longer needed and
+  the fixture now runs with `MMConfig` defaults. Full suite:
+  `pytest tests/ --ignore=tests/test_auto_reco_refactor.py` -> 511 passed
+  (509 baseline + 2 new).

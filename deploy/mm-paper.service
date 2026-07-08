@@ -1,0 +1,70 @@
+# mm-paper.service -- Stage-B paper-trading engine (market_maker.paper_runner)
+#
+# Template unit. EDIT the placeholders marked <...> below for your VPS, then:
+#   sudo cp deploy/mm-paper.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now mm-paper.service
+#
+# See deploy/README.md for the full install walkthrough and the 72h
+# acceptance test procedure.
+#
+# Exit-code contract (market_maker/paper_runner.py, plan Workstream 2):
+#   - exit 42 (ladder_settled / settlement_timeout): the ladder finished (or
+#     timed out waiting to finish) -- this is an EXPECTED rollover, not a
+#     fault. RestartForceExitStatus below makes systemd restart on 42 same
+#     as any other Restart=on-failure trigger; the next start re-resolves
+#     --event-slug auto to the next event.
+#   - exit 1 (feed_dead / tick_errors / early failure): a normal supervised
+#     restart -- Restart=on-failure covers this without extra config.
+#   - exit 0 (completed / stop_file / sigterm / sigint): an INTENTIONAL
+#     stop. `systemctl stop mm-paper` sends SIGTERM, the runner exits 0 on
+#     the next tick boundary, and Restart=on-failure does NOT restart a
+#     clean exit -- this is the correct "stay stopped" behavior.
+
+[Unit]
+Description=Stage-B BTC paper-trading market maker (Polymarket, paper fills only)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+# <EDIT> path to the repo clone on this VPS.
+WorkingDirectory=/opt/mm/V2-BTC-Contract-Pricing
+# <EDIT> path to the venv's python (see deploy/README.md install steps).
+# --config points at the checked-in template; --control-dir matches the
+# default market_maker.run_control.CONTROL_DIR (temp/paper_run/control,
+# relative to WorkingDirectory) so `python -m market_maker.run_control` and
+# the mm_monitor dashboard page agree on where to look.
+ExecStart=/opt/mm/venv/bin/python -m market_maker.paper_runner --config market_maker/paper_run_config.json --control-dir temp/paper_run/control
+
+# <EDIT, optional> extra environment (rarely needed -- the config file and
+# CLI defaults cover normal operation). Example:
+# Environment=PYTHONUNBUFFERED=1
+
+# TimeoutStopSec=900: SIGTERM is only observed BETWEEN ticks in the runner's
+# main loop, and a re-price tick (FIGARCH MLE fit) can block for several
+# minutes -- a short stop timeout would force a SIGKILL mid-reprice and skip
+# the runner's own graceful shutdown (best-effort cancel_all(), CSV flush,
+# PID-file cleanup). 900s (15 min) comfortably covers the worst-case reprice
+# plus a full tick.
+TimeoutStopSec=900
+
+# KillMode=mixed: SIGTERM goes to the main process only (the runner's own
+# signal handler sets exit_reason=sigterm and unwinds cleanly); if it is
+# still alive after TimeoutStopSec, systemd SIGKILLs the whole cgroup so no
+# orphaned child (e.g. a stuck WS thread) is left behind.
+KillMode=mixed
+KillSignal=SIGTERM
+
+# Restart policy: on-failure restarts on any non-zero exit AND on the extra
+# codes listed in RestartForceExitStatus (42 = expected rollover, which is
+# otherwise indistinguishable from success at the systemd level since the
+# runner intentionally chose a non-zero code for it). A clean exit 0 is
+# never restarted.
+Restart=on-failure
+RestartForceExitStatus=42
+RestartSec=60
+
+[Install]
+WantedBy=multi-user.target
