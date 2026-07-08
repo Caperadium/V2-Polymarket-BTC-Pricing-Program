@@ -394,6 +394,49 @@ def compute_analytical_garch_var(
 # MC Validation Mode -- full SVCJ simulator
 # ---------------------------------------------------------------------------
 
+def _mc_refit_point(args: tuple) -> Tuple[int, Optional[Dict[Tuple[int, float], float]]]:
+    """Fit GARCH/FIGARCH on returns[:t] and compute per-(horizon, alpha) VaR.
+
+    Module-level so ProcessPoolExecutor can pickle it (Windows spawn). Each
+    refit point is independent of the others (expanding-window fit on the
+    prefix of the returns array only), so points can run in parallel.
+    """
+    (t, hourly_returns, horizons, alphas, num_sims, seed,
+     use_figarch, use_svcj, use_skewed_t, use_naive_prior, jump_params) = args
+    from core.pricing.btc_pricing_engine import simulate_paths
+
+    garch_params = _fit_garch_on_window(hourly_returns[:t], use_figarch=use_figarch)
+    if garch_params is None:
+        return t, None
+
+    # Use last price from training data as S0
+    S0 = np.exp(np.cumsum(hourly_returns[:t]))[-1]
+    vals: Dict[Tuple[int, float], float] = {}
+    for h in horizons:
+        if h <= 0:
+            continue
+        # Simulate paths. FIX 6 (C2): pass the deployed feature flags so the
+        # validator tests what is actually traded (FIGARCH + SVCJ + skewed-t +
+        # naive prior), not bare GARCH/Student-t.
+        paths = simulate_paths(
+            S0, garch_params,
+            jump_params=jump_params,
+            hours_to_expiry=h,
+            n_sims=num_sims,
+            seed=seed,
+            use_naive_prior=use_naive_prior,
+            use_svcj=use_svcj,
+            use_skewed_t=use_skewed_t,
+            use_figarch=use_figarch,
+        )
+        # FIX 6 (C2): simulate_paths returns a 1-D array of TERMINAL prices, not a
+        # (n_sims, n_steps) matrix — `paths[:, -1]` raised IndexError. Use `paths`.
+        sim_returns = np.log(paths / S0)
+        for a in alphas:
+            vals[(h, a)] = float(np.percentile(sim_returns, a * 100))
+    return t, vals
+
+
 def compute_mc_var(
     hourly_returns: np.ndarray,
     horizons: List[int],
@@ -407,6 +450,7 @@ def compute_mc_var(
     use_svcj: bool = True,
     use_skewed_t: bool = True,
     use_naive_prior: bool = True,
+    n_workers: int = 1,
 ) -> Dict[Tuple[int, float], np.ndarray]:
     """
     Compute VaR forecasts using full Monte Carlo simulation (GARCH + SVCJ).
@@ -428,23 +472,13 @@ def compute_mc_var(
     Returns:
         Dict mapping (horizon, alpha) → array of VaR forecasts (length = n).
     """
-    from core.pricing.btc_pricing_engine import simulate_paths, load_calibrated_jumps
-    from core.pricing.jump_calibration import calibrate_jumps
+    from core.pricing.btc_pricing_engine import load_calibrated_jumps
 
     n = len(hourly_returns)
-    rng = np.random.default_rng(seed)
 
     var_forecasts: Dict[Tuple[int, float], np.ndarray] = {
         (h, a): np.full(n, np.nan) for h in horizons for a in alphas
     }
-
-    last_sim_params: Optional[dict] = None
-    last_refit_idx: int = -1
-    # VaR values computed at the last successful refit. Between refits the sim
-    # params AND the seed are unchanged, so simulate_paths would return
-    # identical paths at every t — recomputing per hour is pure waste (~500x).
-    # Fill these forward instead; output is byte-identical to the per-t loop.
-    last_var_values: Optional[Dict[Tuple[int, float], float]] = None
 
     # Pre-calibrate jumps on all data for efficiency
     try:
@@ -472,58 +506,50 @@ def compute_mc_var(
         logger.info("Jump calibration skipped: %s -- using default jumps", e)
         jump_params = None
 
-    for t in range(min_training, n):
-        if t == min_training or (t - last_refit_idx) >= refit_every:
-            train_data = hourly_returns[:t]
-            # FIX 6 (C2): fit the SAME variance variant the simulator will use.
-            garch_params = _fit_garch_on_window(train_data, use_figarch=use_figarch)
-            if garch_params is not None:
-                last_refit_idx = t
-                # Use last price from training data as S0
-                S0 = np.exp(np.cumsum(train_data))[-1]
-                effective_jumps = jump_params if use_jumps else None
-                last_sim_params = {
-                    "S0": S0,
-                    "garch": garch_params,
-                    "jumps": effective_jumps,
-                }
-                sp = last_sim_params
-                last_var_values = {}
-                for h in horizons:
-                    if h <= 0:
-                        continue
-                    # Simulate paths. FIX 6 (C2): pass the deployed feature flags so the
-                    # validator tests what is actually traded (FIGARCH + SVCJ + skewed-t +
-                    # naive prior), not bare GARCH/Student-t.
-                    paths = simulate_paths(
-                        sp["S0"], sp["garch"],
-                        jump_params=sp["jumps"],
-                        hours_to_expiry=h,
-                        n_sims=num_sims,
-                        seed=seed,
-                        use_naive_prior=use_naive_prior,
-                        use_svcj=use_svcj,
-                        use_skewed_t=use_skewed_t,
-                        use_figarch=use_figarch,
-                    )
-                    # FIX 6 (C2): simulate_paths returns a 1-D array of TERMINAL prices, not a
-                    # (n_sims, n_steps) matrix — `paths[:, -1]` raised IndexError. Use `paths`.
-                    sim_returns = np.log(paths / sp["S0"])
+    # Refit schedule: matches the sequential loop when every fit succeeds
+    # (t = min_training, +refit_every, ...). Each point is an independent
+    # expanding-window fit on returns[:t], so points parallelize cleanly.
+    # Behavior deviation vs the old loop: a FAILED fit no longer retries
+    # hour-by-hour — its window keeps the previous refit's values (fits
+    # essentially never fail; _fit_garch_on_window falls back FIGARCH→GARCH
+    # internally).
+    refit_points = list(range(min_training, n, refit_every))
+    effective_jumps = jump_params if use_jumps else None
+    worker_args = [
+        (t, hourly_returns, horizons, alphas, num_sims, seed,
+         use_figarch, use_svcj, use_skewed_t, use_naive_prior, effective_jumps)
+        for t in refit_points
+    ]
 
-                    for a in alphas:
-                        last_var_values[(h, a)] = float(
-                            np.percentile(sim_returns, a * 100)
-                        )
+    results: List[Tuple[int, Optional[Dict[Tuple[int, float], float]]]] = []
+    if n_workers > 1:
+        from concurrent.futures import ProcessPoolExecutor
+        with ProcessPoolExecutor(max_workers=n_workers) as executor:
+            for i, res in enumerate(executor.map(_mc_refit_point, worker_args)):
+                results.append(res)
                 logger.info(
-                    "MC refit at obs %d/%d: S0=%.2f, use_jumps=%s",
-                    t, n, S0, effective_jumps is not None,
+                    "MC refit %d/%d (obs %d/%d): %s",
+                    i + 1, len(refit_points), res[0], n,
+                    "ok" if res[1] else "FIT FAILED",
                 )
+    else:
+        for i, args in enumerate(worker_args):
+            res = _mc_refit_point(args)
+            results.append(res)
+            logger.info(
+                "MC refit %d/%d (obs %d/%d): %s",
+                i + 1, len(refit_points), res[0], n,
+                "ok" if res[1] else "FIT FAILED",
+            )
 
-        if last_var_values is None:
-            continue
-
-        for key, value in last_var_values.items():
-            var_forecasts[key][t] = value
+    # Fill forward: between successful refits the sim params AND the seed are
+    # unchanged, so simulate_paths would return identical paths at every t —
+    # recomputing per hour is pure waste (~500x).
+    successes = [(t, vals) for t, vals in results if vals]
+    for idx, (t0, vals) in enumerate(successes):
+        t1 = successes[idx + 1][0] if idx + 1 < len(successes) else n
+        for key, value in vals.items():
+            var_forecasts[key][t0:t1] = value
 
     return var_forecasts
 
@@ -545,6 +571,7 @@ def run_basel_backtest(
     use_svcj: bool = True,
     use_skewed_t: bool = True,
     use_naive_prior: bool = True,
+    n_workers: int = 1,
 ) -> BaselBacktestResult:
     """
     Run Teng-style Basel backtest on BTC hourly returns.
@@ -594,6 +621,7 @@ def run_basel_backtest(
             use_svcj=use_svcj,
             use_skewed_t=use_skewed_t,
             use_naive_prior=use_naive_prior,
+            n_workers=n_workers,
         )
     else:
         var_forecasts = compute_analytical_garch_var(
@@ -605,10 +633,27 @@ def run_basel_backtest(
 
     results = {}
 
+    # Realized h-hour FORWARD cumulative return starting at t: the VaR at t is
+    # a quantile of the h-hour cumulative return distribution, so it must be
+    # compared against sum(returns[t:t+h]), NOT the single 1-hour return at t
+    # (which for h>>1 can never breach an h-hour VaR — every long-horizon cell
+    # came out 0 exceedances / Red regardless of the model). For h=1 this
+    # reduces to the old behavior exactly.
+    csum = np.concatenate([[0.0], np.cumsum(returns)])
+
     for h in horizons:
+        fwd_h = np.full(n, np.nan)
+        if 0 < h <= n:
+            fwd_h[: n - h + 1] = csum[h:] - csum[: n + 1 - h]
+        if h > 1:
+            logger.info(
+                "h=%d: overlapping forward windows — exceedances are serially "
+                "correlated, POF p-values are optimistic; treat zones as "
+                "indicative.", h,
+            )
         for alpha in alphas:
             var_h = var_forecasts.get((h, alpha), np.full(n, np.nan))
-            valid = ~np.isnan(var_h)
+            valid = ~np.isnan(var_h) & ~np.isnan(fwd_h)
 
             n_valid = int(np.sum(valid))
             if n_valid < 10:
@@ -616,7 +661,7 @@ def run_basel_backtest(
                 continue
 
             var_values = var_h[valid]
-            ret_values = returns[valid]
+            ret_values = fwd_h[valid]
 
             # Count exceedances
             n_exceed = int(np.sum(ret_values < var_values))
@@ -686,6 +731,8 @@ if __name__ == "__main__":
     parser.add_argument("--garch-only", action="store_true",
                        help="MC mode: validate the plain GARCH variant (disable "
                             "FIGARCH/SVCJ/skewed-t) instead of the deployed config")
+    parser.add_argument("--workers", type=int, default=1,
+                       help="Parallel workers for MC-mode refit points (default: 1)")
     args = parser.parse_args()
 
     # Load returns
@@ -708,6 +755,7 @@ if __name__ == "__main__":
         use_figarch=_deployed,
         use_svcj=_deployed,
         use_skewed_t=_deployed,
+        n_workers=args.workers,
     )
 
     result.print_summary()
