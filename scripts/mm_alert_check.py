@@ -31,6 +31,12 @@ What it does, once per invocation:
      last 6h is suppressed, so a persistent fault pages once, not every 5
      minutes. State (last-sent timestamp per key, plus the feed-health
      streak baseline) is persisted to `<control-dir>/alert_state.json`.
+  5. Daily heartbeat: once per UTC day, at the first invocation at/after
+     08:00 UTC (override via $MM_HEARTBEAT_HOUR_UTC; disable via
+     $MM_HEARTBEAT_DISABLE=1), a one-line status summary is sent through the
+     same webhook regardless of engine state -- so webhook silence means
+     "alert pipeline dead", never "nothing to say". Not subject to the 6h
+     de-dupe; tracked separately as `heartbeat_last_date` in the state file.
 
 Usage (see deploy/mm-alert.service / deploy/mm-alert.timer):
     python scripts/mm_alert_check.py [--control-dir temp/paper_run/control]
@@ -45,6 +51,7 @@ import shutil
 import sys
 import time
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -62,6 +69,11 @@ FEED_UNHEALTHY_ALERT_S = 15 * 60.0
 DISK_FREE_MIN_BYTES = 1 * 1024 ** 3
 DEDUPE_WINDOW_S = 6 * 3600.0
 ALERT_STATE_FILENAME = "alert_state.json"
+# Daily "still alive" heartbeat: sent once per UTC day at the first timer
+# tick at/after this hour, regardless of engine state, so webhook silence is
+# distinguishable from a dead alert pipeline. Override the hour with
+# $MM_HEARTBEAT_HOUR_UTC; set $MM_HEARTBEAT_DISABLE=1 to turn it off.
+HEARTBEAT_HOUR_UTC_DEFAULT = 8
 
 
 # ---------------------------------------------------------------------------
@@ -193,6 +205,45 @@ def _check_settlement_timeout(status: Any) -> Optional[Tuple[str, str]]:
     return None
 
 
+def _heartbeat_due(state: Dict[str, Any], now_utc: "datetime",
+                   hour_utc: int = HEARTBEAT_HOUR_UTC_DEFAULT) -> bool:
+    """True if today's (UTC) heartbeat has not been sent yet and the current
+    UTC hour is at/after the send hour. Tracked as an ISO date string in the
+    alert state file (`heartbeat_last_date`), so exactly one heartbeat goes
+    out per UTC day no matter how often the timer fires."""
+    if now_utc.hour < hour_utc:
+        return False
+    return state.get("heartbeat_last_date") != now_utc.date().isoformat()
+
+
+def _mark_heartbeat_sent(state: Dict[str, Any], now_utc: "datetime") -> None:
+    state["heartbeat_last_date"] = now_utc.date().isoformat()
+
+
+def _heartbeat_message(status: Any, repo_root: Path) -> str:
+    """One-line daily status summary. Pure formatting -- tolerates a missing
+    heartbeat dict (engine stopped/crashed) and missing fields."""
+    parts = ["daily heartbeat: state=%s" % status.state]
+    run_info = status.run_info if isinstance(status.run_info, dict) else {}
+    if status.state == "STOPPED" and run_info.get("exit_reason"):
+        parts.append("exit_reason=%s" % run_info.get("exit_reason"))
+    hb = status.heartbeat if isinstance(status.heartbeat, dict) else {}
+    if hb:
+        parts.append("tick=%s" % hb.get("tick"))
+        parts.append("feed_healthy=%s" % hb.get("feed_healthy"))
+        parts.append("fills=%s" % hb.get("fills_total"))
+        age = hb.get("btc_data_age_s")
+        if isinstance(age, (int, float)):
+            parts.append("btc_age=%.0fs" % age)
+        parts.append("feed_restarts=%s" % hb.get("feed_restarts"))
+    try:
+        free_gb = shutil.disk_usage(str(repo_root)).free / (1024 ** 3)
+        parts.append("disk_free=%.1fGB" % free_gb)
+    except OSError:
+        pass
+    return " ".join(parts)
+
+
 def _collect_alerts(
     status: Any, state: Dict[str, Any], now: float, repo_root: Path,
     btc_stale_max_s: float = BTC_STALE_MAX_S_DEFAULT,
@@ -265,6 +316,16 @@ def _run(argv: Optional[List[str]]) -> None:
             continue
         if _send_webhook("[mm-paper] %s" % message):
             _mark_sent(key, state, now)
+
+    if os.environ.get("MM_HEARTBEAT_DISABLE") != "1":
+        try:
+            hb_hour = int(os.environ.get("MM_HEARTBEAT_HOUR_UTC", HEARTBEAT_HOUR_UTC_DEFAULT))
+        except ValueError:
+            hb_hour = HEARTBEAT_HOUR_UTC_DEFAULT
+        now_utc = datetime.now(timezone.utc)
+        if _heartbeat_due(state, now_utc, hb_hour):
+            if _send_webhook("[mm-paper] %s" % _heartbeat_message(status, _REPO_ROOT)):
+                _mark_heartbeat_sent(state, now_utc)
 
     _save_alert_state(control_dir, state)
 

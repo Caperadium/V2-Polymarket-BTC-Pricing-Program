@@ -299,6 +299,79 @@ def test_send_webhook_returns_false_on_network_error(monkeypatch, capsys):
 
 
 # ---------------------------------------------------------------------------
+# daily heartbeat
+# ---------------------------------------------------------------------------
+
+
+def _utc(hour: int, day: int = 15):
+    from datetime import datetime, timezone
+    return datetime(2026, 7, day, hour, 30, tzinfo=timezone.utc)
+
+
+def test_heartbeat_not_due_before_send_hour():
+    assert not mm_alert_check._heartbeat_due({}, _utc(7), hour_utc=8)
+
+
+def test_heartbeat_due_at_or_after_send_hour_when_never_sent():
+    assert mm_alert_check._heartbeat_due({}, _utc(8), hour_utc=8)
+    assert mm_alert_check._heartbeat_due({}, _utc(23), hour_utc=8)
+
+
+def test_heartbeat_not_due_twice_same_day():
+    state = {}
+    now = _utc(9)
+    assert mm_alert_check._heartbeat_due(state, now, hour_utc=8)
+    mm_alert_check._mark_heartbeat_sent(state, now)
+    assert not mm_alert_check._heartbeat_due(state, _utc(10), hour_utc=8)
+
+
+def test_heartbeat_due_again_next_day():
+    state = {}
+    mm_alert_check._mark_heartbeat_sent(state, _utc(9, day=15))
+    assert mm_alert_check._heartbeat_due(state, _utc(9, day=16), hour_utc=8)
+
+
+def test_heartbeat_message_running_engine():
+    hb = {"tick": 42, "feed_healthy": True, "fills_total": 3,
+          "btc_data_age_s": 305.7, "feed_restarts": 0}
+    msg = mm_alert_check._heartbeat_message(_status(heartbeat=hb), PROJECT_ROOT)
+    assert "state=RUNNING" in msg
+    assert "tick=42" in msg
+    assert "fills=3" in msg
+    assert "btc_age=306s" in msg
+    assert "disk_free=" in msg
+
+
+def test_heartbeat_message_stopped_with_exit_reason_and_no_heartbeat():
+    status = _status(state="STOPPED", run_info={"exit_reason": "sigterm"})
+    msg = mm_alert_check._heartbeat_message(status, PROJECT_ROOT)
+    assert "state=STOPPED" in msg
+    assert "exit_reason=sigterm" in msg
+    assert "tick=" not in msg
+
+
+def test_run_sends_heartbeat_once_per_day(tmp_path, monkeypatch, capsys):
+    monkeypatch.delenv("MM_ALERT_WEBHOOK", raising=False)
+    monkeypatch.setenv("MM_HEARTBEAT_HOUR_UTC", "0")
+    control_dir = tmp_path / "control"
+    assert mm_alert_check.main(["--control-dir", str(control_dir)]) == 0
+    first = capsys.readouterr().out
+    assert "daily heartbeat" in first
+    assert mm_alert_check.main(["--control-dir", str(control_dir)]) == 0
+    second = capsys.readouterr().out
+    assert "daily heartbeat" not in second
+
+
+def test_run_heartbeat_disabled_by_env(tmp_path, monkeypatch, capsys):
+    monkeypatch.delenv("MM_ALERT_WEBHOOK", raising=False)
+    monkeypatch.setenv("MM_HEARTBEAT_HOUR_UTC", "0")
+    monkeypatch.setenv("MM_HEARTBEAT_DISABLE", "1")
+    control_dir = tmp_path / "control"
+    assert mm_alert_check.main(["--control-dir", str(control_dir)]) == 0
+    assert "daily heartbeat" not in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
 # main() never raises / always exits 0
 # ---------------------------------------------------------------------------
 

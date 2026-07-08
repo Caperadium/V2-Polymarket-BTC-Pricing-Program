@@ -16,7 +16,7 @@ Paper Runner" section of the repo's `CLAUDE.md`.
 |------|---------|
 | `mm-paper.service` | The paper-trading engine unit. `Restart=on-failure` + `RestartForceExitStatus=42` (rollover), `RestartSec=60`, `TimeoutStopSec=900`, `KillMode=mixed`. |
 | `mm-datafetch.service` / `.timer` | Runs `core/data/data_fetcher.py` every 30 minutes (`Persistent=true`). Nothing else refreshes BTC data on the VPS. |
-| `mm-alert.service` / `.timer` | Runs `scripts/mm_alert_check.py` every 5 minutes. |
+| `mm-alert.service` / `.timer` | Runs `scripts/mm_alert_check.py` every 5 minutes. Fault alerts (CRASHED/STALLED, feed unhealthy >15min, stale BTC data, low disk, `settlement_timeout`) are de-duped 6h per condition; additionally one daily heartbeat message ("still alive" one-liner with state/tick/fills/disk) is sent at the first check at/after 08:00 UTC (`$MM_HEARTBEAT_HOUR_UTC` to change, `$MM_HEARTBEAT_DISABLE=1` to turn off), so webhook silence always means the alert pipeline itself is broken. |
 | `README.md` | Full install steps + the 72h acceptance test (reproduced below). |
 
 All unit files are templates: every `<EDIT>` placeholder (repo path, venv

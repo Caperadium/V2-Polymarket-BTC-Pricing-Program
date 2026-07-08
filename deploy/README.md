@@ -13,6 +13,11 @@ Files:
   does this).
 - `mm-alert.service` / `mm-alert.timer` -- runs `scripts/mm_alert_check.py`
   every 5 minutes and pages a webhook on a handful of fault conditions.
+  Also sends one daily "still alive" heartbeat (state/tick/fills/disk
+  one-liner) at the first check at/after 08:00 UTC -- `$MM_HEARTBEAT_HOUR_UTC`
+  changes the hour, `$MM_HEARTBEAT_DISABLE=1` turns it off -- so webhook
+  silence always means the alert pipeline itself is broken, never "nothing
+  to report".
 
 ## 1. Install
 
