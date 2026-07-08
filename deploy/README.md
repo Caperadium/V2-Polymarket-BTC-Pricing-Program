@@ -126,6 +126,20 @@ fields worth knowing: `ts_utc`, `tick`, `feed_healthy`, `n_msgs`,
 `DATA/btc_intraday_1m.csv` at the last tick), `feed_restarts` (how many
 times the WS feed thread has been rebuilt this run).
 
+`markout_report.json` (same `out_dir`, rewritten every 20 ticks) is the
+fill-quality report: signed markout at 1m/10m/1h horizons per region
+(belly/wing) and TTE bucket, over a rolling 7-day lookback. Each cell
+carries `n` (markouts computed) and `n_attempted` (fills eligible) -- a
+low `n / n_attempted` ratio means mid data was missing around those
+fills' horizons (feed outage or long reprice ticks), not that fills were
+absent. The mm_monitor page renders this with a coverage column.
+Persistently negative belly markouts are the signal that model bias is
+bleeding through the fair-value anchor -- the thing Stage B exists to
+measure. The backing `mid_log` table in the state db is pruned to the
+same 7-day window automatically at report cadence, so the db stays
+size-bounded on a month-long run; snapshot the db file first if you want
+full-history markout analysis later.
+
 ## 3. Stopping / starting cleanly
 
 ```bash
@@ -230,7 +244,8 @@ end-to-end, on the actual VPS (not the dev machine):
      "state db ... already existed; running resume protocol".
    - Post-restart inventory matches `fold(fills)` (the runner's own
      `summary.md` on the eventual clean exit reports `fold(fills) ==
-     inventory`; you can also query the state db directly).
+     inventory`; the check compares both `q` AND `avg_cost` per market;
+     you can also query the state db directly).
    - Exactly one alert fires for this event (mm-alert should catch the
      `CRASHED` state in the gap between the kill and the restart landing,
      assuming the 5-min timer polls during that window; a very fast restart
@@ -260,6 +275,11 @@ end-to-end, on the actual VPS (not the dev machine):
    is fine -- the runner's own staleness guard pulls quotes until fresh
    data lands; this should self-heal within one or two 30-min fetch
    cycles).
+7. Confirm `markout_report.json` is regenerating (mtime advances every
+   ~20 ticks) and, once fills have accumulated, that coverage
+   (`n / n_attempted`) is high (>0.9) outside of known feed-outage
+   windows -- persistently low coverage means the mid_log is gapping and
+   the markout numbers should not be trusted for the belly-bias readout.
 
 Record the outcome (settlement observed, kill-9 recovery, network-cut
 recovery, RSS/tick-time trend, alert count per fault) before promoting this
