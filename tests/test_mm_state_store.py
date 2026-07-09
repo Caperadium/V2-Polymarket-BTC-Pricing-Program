@@ -198,6 +198,47 @@ def test_quotes_round_trip(store):
     assert rec.params_id == "cfg-v1"
 
 
+def _quote_at(ts) -> QuoteSet:
+    return QuoteSet(
+        ts=ts, market_id="mkt-1", bid_price=0.44, ask_price=0.46,
+        bid_size=10.0, ask_size=10.0,
+        terms={"markup": 0.01, "eps": 0.0085, "skew": 0.0, "robust": 0.001},
+        risk_mode=QuoteMode.TWO_SIDED, noarb_checked=True, source_seq=1,
+    )
+
+
+def _append_quote_at(store, ts) -> None:
+    store.append_quote(
+        _quote_at(ts), r_x=0.1, delta_x=0.05, skew_x=0.0, sigma_b=0.2,
+        params_id="cfg-v1", x_bid=0.05, x_ask=0.15, p_bid_raw=0.44, p_ask_raw=0.46,
+    )
+
+
+def test_prune_quotes_deletes_only_rows_strictly_older_than_bound(store):
+    # W0.2: prune_quotes mirrors prune_mid_log exactly -- insert at two
+    # timestamps, prune, assert only the newer row(s) remain, and the
+    # returned count matches the number of deleted rows.
+    old_ts = NOW - timedelta(days=20)
+    new_ts = NOW - timedelta(days=1)
+    _append_quote_at(store, old_ts)
+    _append_quote_at(store, new_ts)
+
+    bound = NOW - timedelta(days=14)
+    deleted = store.prune_quotes(bound)
+    assert deleted == 1
+
+    remaining = store.get_quotes("mkt-1")
+    assert len(remaining) == 1
+    assert remaining[0].quote_set.ts == new_ts
+
+
+def test_prune_quotes_no_op_when_nothing_older(store):
+    _append_quote_at(store, NOW)
+    deleted = store.prune_quotes(NOW - timedelta(days=14))
+    assert deleted == 0
+    assert len(store.get_quotes("mkt-1")) == 1
+
+
 # ---------------------------------------------------------------------------
 # pnl
 # ---------------------------------------------------------------------------
@@ -330,6 +371,39 @@ def test_liquidity_windows_round_trip(store):
     got = store.get_liquidity_windows("mkt-1")
     assert len(got) == 1
     assert got[0] == ls
+
+
+def _liq_at(ts, market_id="mkt-1") -> LiquidityState:
+    return LiquidityState(
+        ts=ts, market_id=market_id, realized_depth_bid=50.0, realized_depth_ask=40.0,
+        kyle_lambda=None, arb_halflife_s=None, regime=LiquidityRegime.NORMAL,
+        window="5m", vol_discount=2.5,
+    )
+
+
+def test_prune_liquidity_windows_deletes_only_rows_strictly_older_than_bound(store):
+    # W1.1: prune_liquidity_windows mirrors prune_quotes exactly -- insert at
+    # two timestamps, prune, assert only the newer row(s) remain, and the
+    # returned count matches the number of deleted rows.
+    old_ts = NOW - timedelta(days=20)
+    new_ts = NOW - timedelta(days=1)
+    store.append_liquidity_window(_liq_at(old_ts))
+    store.append_liquidity_window(_liq_at(new_ts))
+
+    bound = NOW - timedelta(days=14)
+    deleted = store.prune_liquidity_windows(bound)
+    assert deleted == 1
+
+    remaining = store.get_liquidity_windows("mkt-1")
+    assert len(remaining) == 1
+    assert remaining[0].ts == new_ts
+
+
+def test_prune_liquidity_windows_no_op_when_nothing_older(store):
+    store.append_liquidity_window(_liq_at(NOW))
+    deleted = store.prune_liquidity_windows(NOW - timedelta(days=14))
+    assert deleted == 0
+    assert len(store.get_liquidity_windows("mkt-1")) == 1
 
 
 # ---------------------------------------------------------------------------

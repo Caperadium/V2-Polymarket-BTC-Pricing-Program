@@ -56,12 +56,13 @@ def _rc(latch=0.0):
 
 def _eval(rc, now=T0, *, tte=5.0, age=0.0, vg=None, breaches=None,
           liq=LiquidityRegime.NORMAL, feed=True, spot=None, strike=None,
-          manual=False):
+          manual=False, fv_age=None):
     return rc.evaluate(
         "m1", now, tte_days=tte, pricer_snapshot=_snap(now, age, tte),
         inventory_breaches=breaches, liquidity_regime=liq, feed_healthy=feed,
         spot=spot, strike=strike, manual_override=manual,
         vol_gate_result=vg if vg is not None else StubVG(),
+        fair_value_age_s=fv_age,
     )
 
 
@@ -155,6 +156,41 @@ def test_f_liquidity_degenerate_pulls():
     d = _eval(_rc(), liq=LiquidityRegime.DEGENERATE)
     assert d.mode == QuoteMode.PULLED
     assert RiskTrigger.LIQ_DEGENERATE in d.triggers
+
+
+# ---------------------------------------------------------------------------
+# (g) fair-value staleness (plan Wave 1 W1.2) -- mirrors rule (e).
+# ---------------------------------------------------------------------------
+
+
+def test_g_fair_value_stale_inert_when_none():
+    # Default fair_value_age_s=None must not affect behavior at all.
+    d = _eval(_rc())
+    assert d.mode == QuoteMode.TWO_SIDED
+    assert RiskTrigger.FAIR_VALUE_STALE not in d.triggers
+    assert d.eps_add == pytest.approx(0.0)
+
+
+def test_g_fair_value_stale_widens_between_1x_and_2x_max_age():
+    cfg = MMConfig()
+    d = _eval(_rc(), fv_age=cfg.fv_max_age_s + 50.0)
+    assert d.mode == QuoteMode.TWO_SIDED
+    assert d.eps_add == pytest.approx(0.01)  # same widen constant as pricer-stale
+    assert RiskTrigger.FAIR_VALUE_STALE in d.triggers
+
+
+def test_g_fair_value_stale_pulls_beyond_2x_max_age():
+    cfg = MMConfig()
+    d = _eval(_rc(), fv_age=2.0 * cfg.fv_max_age_s + 1.0)
+    assert d.mode == QuoteMode.PULLED
+    assert RiskTrigger.FAIR_VALUE_STALE in d.triggers
+
+
+def test_g_fair_value_stale_under_threshold_inert():
+    cfg = MMConfig()
+    d = _eval(_rc(), fv_age=cfg.fv_max_age_s - 1.0)
+    assert d.mode == QuoteMode.TWO_SIDED
+    assert RiskTrigger.FAIR_VALUE_STALE not in d.triggers
 
 
 def test_manual_override_pulls():

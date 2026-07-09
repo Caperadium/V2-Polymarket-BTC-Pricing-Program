@@ -136,6 +136,77 @@ def test_btc_stale_respects_custom_threshold_arg():
 
 
 # ---------------------------------------------------------------------------
+# _check_resume_discrepancies (W0.1)
+# ---------------------------------------------------------------------------
+
+
+def test_resume_discrepancies_no_heartbeat_is_silent():
+    assert mm_alert_check._check_resume_discrepancies(None) is None
+
+
+def test_resume_discrepancies_missing_field_is_silent():
+    assert mm_alert_check._check_resume_discrepancies({"tick": 1}) is None
+
+
+def test_resume_discrepancies_zero_is_silent():
+    assert mm_alert_check._check_resume_discrepancies({"resume_discrepancies": 0}) is None
+
+
+def test_resume_discrepancies_positive_alerts():
+    result = mm_alert_check._check_resume_discrepancies({"resume_discrepancies": 2})
+    assert result is not None
+    key, msg = result
+    assert key == "resume_discrepancies"
+    assert "2" in msg
+
+
+def test_resume_discrepancies_alert_dedupes_within_window():
+    # Mirrors the de-dupe pattern used by every other alert key: a key sent
+    # within DEDUPE_WINDOW_S is suppressed on the next check.
+    state = {}
+    assert mm_alert_check._should_send("resume_discrepancies", state, now=1000.0) is True
+    mm_alert_check._mark_sent("resume_discrepancies", state, now=1000.0)
+    assert mm_alert_check._should_send("resume_discrepancies", state, now=1000.0 + 100.0) is False
+    later = 1000.0 + mm_alert_check.DEDUPE_WINDOW_S + 1.0
+    assert mm_alert_check._should_send("resume_discrepancies", state, now=later) is True
+
+
+# ---------------------------------------------------------------------------
+# _check_bankroll_frozen (W1.3)
+# ---------------------------------------------------------------------------
+
+
+def test_bankroll_frozen_no_heartbeat_is_silent():
+    assert mm_alert_check._check_bankroll_frozen(None) is None
+
+
+def test_bankroll_frozen_missing_field_is_silent():
+    assert mm_alert_check._check_bankroll_frozen({"tick": 1}) is None
+
+
+def test_bankroll_frozen_false_is_silent():
+    assert mm_alert_check._check_bankroll_frozen({"bankroll_frozen": False}) is None
+
+
+def test_bankroll_frozen_true_alerts():
+    result = mm_alert_check._check_bankroll_frozen({"bankroll_frozen": True})
+    assert result is not None
+    key, msg = result
+    assert key == "bankroll_frozen"
+    assert "FROZEN" in msg
+
+
+def test_bankroll_frozen_alert_dedupes_within_window():
+    # Mirrors the de-dupe pattern used by every other alert key.
+    state = {}
+    assert mm_alert_check._should_send("bankroll_frozen", state, now=1000.0) is True
+    mm_alert_check._mark_sent("bankroll_frozen", state, now=1000.0)
+    assert mm_alert_check._should_send("bankroll_frozen", state, now=1000.0 + 100.0) is False
+    later = 1000.0 + mm_alert_check.DEDUPE_WINDOW_S + 1.0
+    assert mm_alert_check._should_send("bankroll_frozen", state, now=later) is True
+
+
+# ---------------------------------------------------------------------------
 # _check_disk_free
 # ---------------------------------------------------------------------------
 
@@ -213,11 +284,27 @@ def test_collect_alerts_multiple_conditions_all_fire(monkeypatch):
 
     monkeypatch.setattr(mm_alert_check.shutil, "disk_usage", lambda path: _Usage())
     threshold = mm_alert_check.BTC_STALE_MAX_S_DEFAULT * mm_alert_check.BTC_STALE_ALERT_MULT
-    status = _status(state="STALLED", heartbeat={"feed_healthy": False, "btc_data_age_s": threshold + 1})
+    status = _status(state="STALLED", heartbeat={
+        "feed_healthy": False, "btc_data_age_s": threshold + 1, "resume_discrepancies": 1,
+    })
     state = {"last_feed_healthy_ts": 0.0}
     alerts = mm_alert_check._collect_alerts(status, state, now=threshold + 1000.0, repo_root=Path("."))
     keys = {k for k, _m in alerts}
-    assert keys == {"state_stalled", "feed_unhealthy", "btc_stale", "disk_low"}
+    assert keys == {"state_stalled", "feed_unhealthy", "btc_stale", "resume_discrepancies", "disk_low"}
+
+
+def test_collect_alerts_includes_bankroll_frozen(monkeypatch):
+    class _Usage:
+        free = 10 * 1024 ** 3  # healthy disk, isolates the bankroll_frozen key
+
+    monkeypatch.setattr(mm_alert_check.shutil, "disk_usage", lambda path: _Usage())
+    status = _status(state="RUNNING", heartbeat={
+        "feed_healthy": True, "btc_data_age_s": 10.0, "bankroll_frozen": True,
+    })
+    state = {}
+    alerts = mm_alert_check._collect_alerts(status, state, now=1000.0, repo_root=Path("."))
+    keys = {k for k, _m in alerts}
+    assert keys == {"bankroll_frozen"}
 
 
 # ---------------------------------------------------------------------------

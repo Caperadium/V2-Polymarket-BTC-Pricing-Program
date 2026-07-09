@@ -154,7 +154,7 @@ There is no template file for this unit (it is optional); create it
 directly:
 
 ```bash
-/opt/mm/venv/bin/pip install streamlit   # not installed by the base steps
+/opt/mm/venv/bin/pip install streamlit plotly   # not installed by the base steps
 
 sudo tee /etc/systemd/system/mm-monitor.service <<'EOF'
 [Unit]

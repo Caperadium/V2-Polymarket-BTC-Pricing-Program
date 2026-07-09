@@ -57,6 +57,11 @@ class RiskTrigger(Enum):
     PRICER_STALE = "PRICER_STALE"
     LIQ_DEGENERATE = "LIQ_DEGENERATE"
     MANUAL = "MANUAL"
+    # Wave 1 W1.2: write-only additive member -- the only deserializer is
+    # state_store.get_risk_journal -> RiskTrigger(t), which reads values
+    # written by the same-or-older code, so adding a member here cannot
+    # break reads of an existing db.
+    FAIR_VALUE_STALE = "FAIR_VALUE_STALE"
 
 
 class LiquidityRegime(Enum):
@@ -378,7 +383,9 @@ class RiskDirective:
     market_id: str
     mode: QuoteMode
     eps_add: float  # extra adverse-selection widening (prob)
-    kelly_mult: float  # [0,1] from vol_gate
+    kelly_mult: float  # [0,1] from vol_gate; journaled-only by decision 2026-07-08 --
+    # NOT applied to sizing (sizing protection is Baker-McHale + caps + fractional-c;
+    # vol gate acts on quotes via eps_add + PULL instead). See risk_controller.py.
     triggers: List[RiskTrigger]
     latched_until: datetime  # hysteresis
     cancel_all: bool

@@ -19,11 +19,24 @@ with the MOST RESTRICTIVE mode, summed eps_add, min kelly_mult, any cancel_all:
   (e) pricer snapshot stale -> widen first (eps_add += pricer_stale_eps_add);
       older than 2x max age -> PULLED.
   (f) liquidity DEGENERATE -> PULLED.
+  (g) fair-value (consensus) staleness (plan Wave 1 W1.2) -- mirrors rule
+      (e): `fair_value_age_s` older than `fv_max_age_s` -> widen
+      (eps_add += pricer_stale_eps_add, the same widen constant reused);
+      older than 2x `fv_max_age_s` -> PULLED. `fair_value_age_s=None`
+      (default) is inert -- callers that do not thread it (e.g. Stage-A) see
+      no behavior change.
   manual override -> PULLED (MANUAL trigger).
 
 Any transition INTO a restrictive mode latches for latch_seconds (default 60s);
 transitions OUT require the latch expired AND the trigger cleared (no flapping).
 Every mode transition is journaled. stdlib + numpy only.
+
+kelly_mult (journaled-only, decision 2026-07-08): the vol-gate-derived
+kelly_mult carried on every RiskDirective is deliberately NOT applied to
+sizing -- the plan synthesis is silent on it, and sizing protection is
+already covered by Baker-McHale shrinkage + joint-ladder/bankroll caps +
+fractional-c (robustness_sizing.py). The vol gate instead acts on quotes via
+eps_add widening and PULL (rule a above).
 """
 from __future__ import annotations
 
@@ -120,7 +133,8 @@ class RiskController:
                  spot: Optional[float] = None,
                  strike: Optional[float] = None,
                  manual_override: bool = False,
-                 vol_gate_result: Optional[object] = None) -> RiskDirective:
+                 vol_gate_result: Optional[object] = None,
+                 fair_value_age_s: Optional[float] = None) -> RiskDirective:
         """Produce the RiskDirective for one market at one tick."""
         vg = vol_gate_result
         if vg is None and self._vol_gate_fn is not None:
@@ -187,6 +201,17 @@ class RiskController:
         if liquidity_regime == LiquidityRegime.DEGENERATE:
             req_mode = _more_restrictive(req_mode, QuoteMode.PULLED)
             triggers.append(RiskTrigger.LIQ_DEGENERATE)
+
+        # (g) fair-value (consensus) staleness -- mirrors rule (e); inert
+        # when fair_value_age_s is None (default).
+        if fair_value_age_s is not None:
+            fv_max_age = float(getattr(self._cfg, "fv_max_age_s", 300.0))
+            if fair_value_age_s > 2.0 * fv_max_age:
+                req_mode = _more_restrictive(req_mode, QuoteMode.PULLED)
+                triggers.append(RiskTrigger.FAIR_VALUE_STALE)
+            elif fair_value_age_s > fv_max_age:
+                eps_add += self._pricer_stale_eps_add
+                triggers.append(RiskTrigger.FAIR_VALUE_STALE)
 
         # manual override
         if manual_override:

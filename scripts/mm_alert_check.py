@@ -18,6 +18,10 @@ What it does, once per invocation:
          tracked across invocations in the alert state file below)
        - heartbeat.btc_data_age_s exceeds 2x the runner's --btc-stale-max-s
          (default 7200s, so alert threshold is 14400s)
+       - heartbeat.resume_discrepancies > 0 (the resume protocol found a
+         store/venue position mismatch on restart -- plan Wave 0 W0.1)
+       - heartbeat.bankroll_frozen is true (the Beuoy bankroll degenerated
+         and has not yet auto-unfrozen -- plan Wave 1 W1.3)
        - free disk on the repo-root filesystem is below 1 GB
        - the engine is STOPPED and the last run's current_run.json recorded
          exit_reason == "settlement_timeout" (an UNSETTLEABLE ladder that
@@ -179,6 +183,38 @@ def _check_btc_stale(
     return None
 
 
+def _check_resume_discrepancies(heartbeat: Optional[Dict[str, Any]]) -> Optional[Tuple[str, str]]:
+    """heartbeat.resume_discrepancies > 0 -- the resume protocol
+    (loop.restart()) found a store/venue position mismatch (plan Wave 0
+    W0.1). De-duped like every other check (6h window); the count itself is
+    NOT a streak (it is fixed for the life of the run, unlike feed health),
+    so no cross-invocation state is needed here."""
+    if not isinstance(heartbeat, dict):
+        return None
+    n = heartbeat.get("resume_discrepancies")
+    if not isinstance(n, (int, float)) or n <= 0:
+        return None
+    return ("resume_discrepancies",
+            "mm-paper resume found %d position discrepancy(ies) on restart -- "
+            "check the risk journal for MANUAL-trigger PULLED entries" % int(n))
+
+
+def _check_bankroll_frozen(heartbeat: Optional[Dict[str, Any]]) -> Optional[Tuple[str, str]]:
+    """heartbeat.bankroll_frozen is true -- the Beuoy bankroll credibility
+    consensus has degenerated and quoting has fallen back to
+    FIXED_BLEND_FALLBACK until enough consecutive clean BEUOY ticks
+    auto-unfreeze it (plan Wave 1 W1.3). De-duped like every other check (6h
+    window) -- the flag is a level, not a streak, so no cross-invocation
+    state is needed here."""
+    if not isinstance(heartbeat, dict):
+        return None
+    if not heartbeat.get("bankroll_frozen"):
+        return None
+    return ("bankroll_frozen",
+            "mm-paper bankroll is FROZEN -- Beuoy consensus degenerated; quoting is on "
+            "FIXED_BLEND_FALLBACK until enough consecutive clean BEUOY ticks auto-unfreeze it")
+
+
 def _check_disk_free(repo_root: Path) -> Optional[Tuple[str, str]]:
     try:
         free = shutil.disk_usage(str(repo_root)).free
@@ -254,6 +290,8 @@ def _collect_alerts(
         _check_engine_state(status),
         _check_feed_unhealthy(status.heartbeat, state, now),
         _check_btc_stale(status.heartbeat, btc_stale_max_s),
+        _check_resume_discrepancies(status.heartbeat),
+        _check_bankroll_frozen(status.heartbeat),
         _check_disk_free(repo_root),
         _check_settlement_timeout(status),
     ]

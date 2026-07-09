@@ -113,6 +113,23 @@ class MMConfig:
     requote_price_tol: float = 0.005  # price units (launch default)
     requote_size_tol: float = 0.10  # fractional size change (launch default)
 
+    # --- state-store retention (plan Section 5 / Wave 0 W0.2) ---
+    quotes_retention_s: float = 14 * 86400.0  # prune `quotes` rows older than this (14d default)
+
+    # --- fair-value staleness (plan Wave 1 W1.2) ---
+    fv_max_age_s: float = 300.0  # FairValue max age -> widen then pull (same value as pricer_max_age_s)
+
+    # --- bankroll auto-unfreeze (plan Wave 1 W1.3) ---
+    bankroll_unfreeze_clean_ticks: int = 20  # consecutive clean BEUOY ticks before an auto-unfreeze
+
+    # --- promoted phantom config (plan Wave 1 W1.4): these previously lived
+    # only as getattr-probed module defaults (fair_value_anchor.
+    # DEFAULT_BANKROLL_FLOOR, risk_controller._DEFAULT_LATCH_SECONDS); now
+    # real MMConfig fields so the getattr fallback is inert on a fresh
+    # config (values match the old module defaults exactly). ---
+    bankroll_floor: float = 0.02
+    risk_latch_seconds: float = 60.0
+
 
 def in_belly_band(p: float, belly_band: Tuple[float, float]) -> bool:
     """Inclusive belly-band membership: belly_lo <= p <= belly_hi.

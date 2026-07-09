@@ -13,7 +13,10 @@ Operates one expiry strike ladder as a single object (the risk-neutral CDF):
       fraction of its cap, emit a HedgeRecommendation to take the OPPOSITE side
       in an adjacent strike (converting naked binary risk into bounded band
       exposure). Also returns HedgeState (vertical offsets per (expiry_key,
-      bucket)) for the inventory manager.
+      bucket)) -- an AUDIT-ONLY view that must never cross a module boundary;
+      the module-level `hedge_offsets_by_market()` helper below builds the
+      market_id-keyed offsets the inventory manager actually consumes,
+      straight from the HedgeRecommendation list (plan W2.0).
   (c) Cross-strike beta hedge (L2, behind enable_beta_hedge, default False):
       instantaneous hedge ratio beta(i<-j), shrunk as S'(x) -> 0 and hard-clamped
       to +/- beta_max, zero outside the p-clamp band (risk 8.5 -- no explosive
@@ -378,3 +381,39 @@ class LadderHedger:
                 )
             )
         return recs
+
+
+# ---------------------------------------------------------------------------
+# W2.0 -- market_id-keyed offset builder (reviewer finding 1, CRITICAL)
+# ---------------------------------------------------------------------------
+
+
+def hedge_offsets_by_market(recs: List[HedgeRecommendation]) -> Dict[str, float]:
+    """Aggregate a list of HedgeRecommendations (vertical and/or beta) into a
+    market_id-keyed signed offset dict, the shape `InventoryManager.
+    set_hedge_state` / `net_band_exposure` and `store.upsert_ladder_state`
+    actually consume.
+
+    This is deliberately NOT the `(expiry_key, bucket)`-keyed second return of
+    `vertical_hedges` -- that HedgeState is an inter-strike-bucket audit view
+    for the hedger's own bookkeeping and must never cross a module boundary.
+    The market_id-keyed view here is built directly from the recommendation
+    list instead: `offsets[rec.target_market_id] += (+rec.size if
+    rec.side == Side.BUY_YES else -rec.size)`.
+
+    Semantics (plan W2.0): the returned offset is PENDING hedge demand on
+    that market -- recommended, not yet filled. It is rebuilt from scratch
+    each tick from that tick's fresh recs, so a recommendation's `expires`
+    is honored implicitly by per-tick re-evaluation (a stale rec is simply
+    not re-emitted, and the next tick's offsets dict no longer contains it).
+    Once a hedge order actually fills, the fill enters `q` through the
+    normal fill channel (InventoryManager.apply_fill) like any other fill --
+    it does NOT get folded into this offset dict -- and the hedger's next
+    excess computation (over the now-smaller |q|) naturally shrinks or drops
+    the recommendation.
+    """
+    offsets: Dict[str, float] = {}
+    for rec in recs:
+        signed = rec.size if rec.side == Side.BUY_YES else -rec.size
+        offsets[rec.target_market_id] = offsets.get(rec.target_market_id, 0.0) + signed
+    return offsets

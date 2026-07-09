@@ -239,33 +239,6 @@ def test_feed_unhealthy_flag_marks_gap():
 
 
 # ---------------------------------------------------------------------------
-# 10. Adverse-selection marks + assumption_set on every fill.
-# ---------------------------------------------------------------------------
-
-def test_adverse_marks_backfill_on_horizon():
-    sim = PaperFillSimulator(_cfg())
-    sim.place("o1", "m1", "bid", 0.50, 5.0, T0)
-    sim.on_market_state(_ms(T0 + _sec(3), bid_depth=[]))
-    fills = sim.on_market_state(_ms(T0 + _sec(4), bid_depth=[], best_bid=0.49,
-                                    best_ask=0.51,
-                                    prints=[(T0 + _sec(4), 0.50, 5.0)]))
-    assert len(fills) == 1
-    fill_ts = fills[0].ts
-    assert fills[0].mid_at_fill == pytest.approx(0.50)
-    assert fills[0].assumption_set == ASSUMPTION_QUEUEBEHIND
-
-    # Before 1 minute: p1m still None.
-    snap = sim.mark_fills(fill_ts + _sec(30), 0.52)
-    assert snap[0].mid_p1m is None
-
-    # After 1 minute: p1m backfilled; p10m/p1h still None.
-    snap = sim.mark_fills(fill_ts + _sec(61), 0.60)
-    assert snap[0].mid_p1m == pytest.approx(0.60)
-    assert snap[0].mid_p10m is None
-    assert snap[0].mid_p1h is None
-
-
-# ---------------------------------------------------------------------------
 # 11. Partial fills accumulate; overfill is impossible.
 # ---------------------------------------------------------------------------
 

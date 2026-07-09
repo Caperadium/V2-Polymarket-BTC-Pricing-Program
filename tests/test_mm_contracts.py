@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 import pytest
 
 from market_maker import contracts as c
+from market_maker.config import MMConfig
 
 
 NOW = datetime(2026, 7, 6, 12, 0, tzinfo=timezone.utc)
@@ -151,6 +152,18 @@ def test_enums_complete():
 def test_venue_adapter_is_abstract():
     with pytest.raises(TypeError):
         c.VenueAdapter()  # abstract; must not be instantiable
+
+
+def test_mmconfig_wave1_promoted_field_defaults():
+    # W1.4: promoted phantom-config fields must default to exactly the old
+    # module defaults (fair_value_anchor.DEFAULT_BANKROLL_FLOOR=0.02,
+    # risk_controller._DEFAULT_LATCH_SECONDS=60.0), plus the new W1.2/W1.3
+    # fields (reviewer finding 10).
+    cfg = MMConfig()
+    assert cfg.bankroll_floor == 0.02
+    assert cfg.risk_latch_seconds == 60.0
+    assert cfg.fv_max_age_s == 300.0
+    assert cfg.bankroll_unfreeze_clean_ticks == 20
 
 
 def test_venue_descriptor():

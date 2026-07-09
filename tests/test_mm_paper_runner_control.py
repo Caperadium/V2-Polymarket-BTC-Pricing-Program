@@ -189,6 +189,9 @@ def test_stop_file_graceful_shutdown(tmp_path, monkeypatch):
 
     run_meta = json.loads((out_dir / "run_meta.json").read_text(encoding="ascii"))
     assert run_meta["event_slug"] == "fake-event"
+    # No --state-db -> run_meta records the per-run default (used by
+    # app/pages/mm_monitor.py resolve_state_db to find the db).
+    assert run_meta["state_db"] == str(out_dir / "paper_state.db")
 
     store = MMStateStore(str(out_dir / "paper_state.db"))
     try:
@@ -386,6 +389,22 @@ def test_config_file_merge_and_cli_override(tmp_path, monkeypatch):
     meta2 = json.loads((out_dir2 / "run_meta.json").read_text(encoding="ascii"))
     assert meta2["tick_s"] == pytest.approx(0.3)  # CLI override wins
     assert meta2["bankroll"] == pytest.approx(555.0)  # untouched config value still applied
+
+    # Run 3: an explicit --state-db is recorded verbatim in run_meta so the
+    # mm_monitor page can find a persistent db that is NOT under out_dir.
+    out_dir3 = tmp_path / "out3"
+    ctl_dir3 = tmp_path / "ctl3"
+    db_path3 = tmp_path / "persistent_state.db"
+
+    code3 = paper_runner.run([
+        "--config", str(cfg_path), "--state-db", str(db_path3),
+        "--out", str(out_dir3), "--control-dir", str(ctl_dir3),
+    ])
+    assert code3 == 0
+    meta3 = json.loads((out_dir3 / "run_meta.json").read_text(encoding="ascii"))
+    assert meta3["state_db"] == str(db_path3)
+    assert db_path3.exists()
+    assert not (out_dir3 / "paper_state.db").exists()
 
 
 def test_event_slug_required_without_config():

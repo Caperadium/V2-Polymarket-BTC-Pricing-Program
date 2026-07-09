@@ -151,6 +151,34 @@ def load_csv(path: Path) -> pd.DataFrame:
     return load_csv_cached(str(path), m)
 
 
+def resolve_state_db(out_dir: Optional[Path], run_meta: Optional[dict]) -> Optional[Path]:
+    """Effective state-db path for a run. A run launched with --state-db
+    (e.g. the VPS config's persistent market_maker/mm_paper_state.db) does
+    NOT have its db under out_dir, so prefer, in order: the resolved
+    `state_db` the runner records in run_meta (newer runs), the `state_db`
+    in the run's config dict, a `--state-db` in the recorded argv (older
+    run_meta without the top-level key), then the per-run default
+    out_dir/paper_state.db. Relative paths are anchored at PROJECT_ROOT
+    (the runner's working directory). Note a shared persistent db shows
+    CURRENT inventory/PnL state even when viewing a historical run."""
+    candidates: List[Any] = []
+    if isinstance(run_meta, dict):
+        candidates.append(run_meta.get("state_db"))
+        cfg = run_meta.get("config")
+        if isinstance(cfg, dict):
+            candidates.append(cfg.get("state_db"))
+        argv = run_meta.get("argv")
+        if isinstance(argv, list) and "--state-db" in argv:
+            i = argv.index("--state-db")
+            if i + 1 < len(argv):
+                candidates.append(argv[i + 1])
+    for c in candidates:
+        if isinstance(c, str) and c:
+            p = Path(c)
+            return p if p.is_absolute() else (PROJECT_ROOT / p)
+    return (out_dir / "paper_state.db") if out_dir else None
+
+
 def load_db_table(
     db_path: Optional[Path], sql: str, params: Tuple[Any, ...] = ()
 ) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
@@ -579,7 +607,7 @@ def main() -> None:
         out_dir = entry["dir"] if entry else None
         run_meta = entry["run_meta"] if entry else None
 
-    db_path = (out_dir / "paper_state.db") if out_dir else None
+    db_path = resolve_state_db(out_dir, run_meta)
 
     if out_dir is None:
         st.info("no out_dir yet for this run (engine likely still STARTING)")

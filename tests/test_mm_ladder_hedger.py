@@ -8,12 +8,13 @@ from market_maker.config import MMConfig
 from market_maker.contracts import (
     ContractInv,
     HedgeReason,
+    HedgeRecommendation,
     InventoryState,
     QuoteMode,
     QuoteSet,
     Side,
 )
-from market_maker.ladder_hedger import LadderHedger
+from market_maker.ladder_hedger import LadderHedger, hedge_offsets_by_market
 
 TS = datetime(2026, 7, 7, 12, 0, tzinfo=timezone.utc)
 
@@ -194,3 +195,38 @@ def test_beta_hedge_notional_bounded_adversarial():
             assert r.size <= h.config.beta_max * qj + 1e-6
             assert 0.0 <= r.max_price <= 1.0
             assert r.reason == HedgeReason.BETA_HEDGE
+
+
+# --- W2.0 hedge_offsets_by_market -----------------------------------------
+
+
+def _rec(target_market_id, side, size, paired="paired", max_price=0.5):
+    return HedgeRecommendation(
+        ts=TS, expiry_key="e", target_market_id=target_market_id, side=side,
+        size=size, max_price=max_price, reason=HedgeReason.VERTICAL_OFFSET,
+        paired_market_id=paired, beta=None, expires=TS + timedelta(seconds=300.0),
+    )
+
+
+def test_hedge_offsets_by_market_signs():
+    recs = [
+        _rec("m0", Side.BUY_YES, 10.0),
+        _rec("m2", Side.BUY_NO, 7.0),
+    ]
+    offsets = hedge_offsets_by_market(recs)
+    assert offsets == {"m0": 10.0, "m2": -7.0}
+
+
+def test_hedge_offsets_by_market_aggregates_same_target():
+    recs = [
+        _rec("m0", Side.BUY_YES, 10.0, paired="m1"),
+        _rec("m0", Side.BUY_YES, 5.0, paired="m2"),
+        _rec("m0", Side.BUY_NO, 3.0, paired="m1"),
+    ]
+    offsets = hedge_offsets_by_market(recs)
+    # 10 + 5 - 3 = 12, all landing on the same target market_id
+    assert offsets == {"m0": 12.0}
+
+
+def test_hedge_offsets_by_market_empty_recs():
+    assert hedge_offsets_by_market([]) == {}

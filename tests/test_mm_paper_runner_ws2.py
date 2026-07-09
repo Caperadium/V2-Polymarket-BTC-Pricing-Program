@@ -349,6 +349,88 @@ def test_state_db_resume_runs_restart_and_settle_catchup(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# W0.1 -- ReconciliationResult consumption on resume
+# ---------------------------------------------------------------------------
+
+
+def test_resume_position_discrepancy_journals_manual_and_holds_override(tmp_path, monkeypatch):
+    """A scripted store/venue position mismatch on resume must: (1) surface
+    as heartbeat.resume_discrepancies > 0, (2) write a MANUAL-trigger PULLED
+    risk-journal row for the discrepant market, and (3) force
+    manual_override=True on ticks until the first clean tick completes, then
+    release it (plan Wave 0 W0.1).
+
+    Discrepancy is engineered by desyncing the `inventory` table (what
+    PaperVenueAdapter.fetch_positions reads -- "venue truth" in paper mode)
+    from the `fills` table (what fold_fills_to_inventory derives "store
+    truth" from): a fill records q=5, but the inventory row is overwritten to
+    q=8 afterward, so restart_reconcile's store-vs-venue compare disagrees.
+    """
+    old_expiry = (datetime.now(timezone.utc) - timedelta(days=10)).strftime("%Y-%m-%d")
+    old_market, old_strike = "m-old-98k", 98000.0
+
+    state_db = tmp_path / "persistent.db"
+    seed_store = MMStateStore(str(state_db))
+    seed_store.upsert_market(old_market, old_expiry, old_strike)
+    seed_ts = datetime.now(timezone.utc) - timedelta(days=11)
+    seed_store.record_fill_and_update_inventory(
+        Fill(ts=seed_ts, market_id=old_market, order_id="seed-fill-1", side=Side.BUY_YES,
+             price=0.40, size=5.0, liquidity=LiquiditySource.MAKER, venue_ts=seed_ts),
+        ContractInv(q=5.0, avg_cost=0.40, q_max=100.0, age_weighted_holding=0.0),
+    )
+    # Desync: inventory table now disagrees with fold(fills) for old_market.
+    seed_store.upsert_inventory(
+        old_market, ContractInv(q=8.0, avg_cost=0.40, q_max=100.0, age_weighted_holding=0.0),
+        updated_ts=seed_ts,
+    )
+    seed_store.close()
+
+    old_settle_dt = settlement_instant_utc(old_expiry)
+    idx = pd.to_datetime([
+        old_settle_dt - timedelta(minutes=2), old_settle_dt, old_settle_dt + timedelta(minutes=2),
+    ])
+    intraday = pd.DataFrame({"close": [99000.0, 99500.0, 99900.0]}, index=idx)
+    data_provider = BTCDataProvider(intraday=intraday, daily=pd.DataFrame())
+    monkeypatch.setattr(paper_runner, "_DATA_PROVIDER", data_provider)
+
+    _install_common_stubs(monkeypatch, tmp_path)  # current event 5 days out
+
+    out_dir = tmp_path / "out"
+    ctl_dir = tmp_path / "control"
+
+    t, result = _run_in_thread([
+        "--event-slug", "fake-event", "--minutes", "0", "--tick-s", "0.2",
+        "--warmup-s", "0", "--out", str(out_dir), "--control-dir", str(ctl_dir),
+        "--state-db", str(state_db),
+    ])
+    try:
+        tick = _wait_for_heartbeat_tick(out_dir, 2)
+        assert tick >= 2
+        (ctl_dir / "mm_paper.stop").write_text("", encoding="ascii")
+        t.join(timeout=20.0)
+        assert not t.is_alive()
+    finally:
+        if t.is_alive():  # pragma: no cover
+            t.join(timeout=5.0)
+    assert result.get("code") == 0
+
+    hb = json.loads((out_dir / "heartbeat.json").read_text(encoding="ascii"))
+    assert hb["resume_discrepancies"] == 1
+
+    store = MMStateStore(str(state_db))
+    try:
+        directives = store.get_risk_journal(old_market)
+        manual_rows = [
+            d for d in directives
+            if d.mode.value == "PULLED" and any(t.value == "MANUAL" for t in d.triggers)
+        ]
+        assert manual_rows, "expected a MANUAL-trigger PULLED risk-journal row for the discrepant market"
+        assert manual_rows[0].cancel_all is True
+    finally:
+        store.close()
+
+
+# ---------------------------------------------------------------------------
 # 2.2 -- exit after ladder settles + rollover + exit-code mapping
 # ---------------------------------------------------------------------------
 

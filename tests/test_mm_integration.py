@@ -274,8 +274,8 @@ def test_pricer_failure_reuses_snapshot_then_widens_then_pulls(store):
 def _crossing_patch(loop):
     orig = loop._compose_quote_sets
 
-    def patched(snap, fv, directives):
-        composed = orig(snap, fv, directives)  # keeps last_proposals populated
+    def patched(snap, fv, directives, liquidity=None):
+        composed = orig(snap, fv, directives, liquidity=liquidity)  # keeps last_proposals populated
         composed.sort(key=lambda t: t[0])
         out = []
         for i, (k, m, qs) in enumerate(composed):

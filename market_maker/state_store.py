@@ -230,6 +230,11 @@ class MMStateStore:
                 """
             )
             self._conn.execute(
+                # mid_p1m/mid_p10m/mid_p1h: legacy adverse-selection backfill
+                # columns for the now-deleted PaperFillSimulator.mark_fills()
+                # channel (plan Wave 0 W0.4) -- kept as legacy-NULL, no schema
+                # migration. Adverse-selection marking is superseded by the
+                # mid_log markout report (pnl_report.markout_report).
                 """
                 CREATE TABLE IF NOT EXISTS fills (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -283,6 +288,12 @@ class MMStateStore:
             )
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_quotes_market_id ON quotes(market_id)"
+            )
+            # prune_quotes filters on ts alone; the market_id index above is
+            # unusable there, so give the DELETE its own index (mirrors
+            # idx_mid_log_ts).
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_quotes_ts ON quotes(ts)"
             )
             self._conn.execute(
                 """
@@ -370,6 +381,12 @@ class MMStateStore:
             )
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_liquidity_windows_market_id ON liquidity_windows(market_id)"
+            )
+            # prune_liquidity_windows filters on ts alone; the market_id
+            # index above is unusable there, so give the DELETE its own
+            # index (mirrors idx_quotes_ts / idx_mid_log_ts).
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_liquidity_windows_ts ON liquidity_windows(ts)"
             )
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status, market_id)"
@@ -816,6 +833,18 @@ class MMStateStore:
             ).fetchall()
         return [self._quote_from_row(r) for r in rows]
 
+    def prune_quotes(self, older_than: datetime) -> int:
+        """Delete `quotes` rows strictly older than `older_than` (plan Wave 0
+        W0.2 -- the quotes table is otherwise unbounded on a persistent
+        --state-db). Mirrors `prune_mid_log` exactly: same `_dt_to_iso`
+        serialization, same `ts < ?` bound. Returns the number of rows
+        deleted."""
+        with self._conn:
+            cur = self._conn.execute(
+                "DELETE FROM quotes WHERE ts < ?", (_dt_to_iso(older_than),)
+            )
+        return cur.rowcount
+
     # ------------------------------------------------------------------
     # pnl (periodic snapshots)
     # ------------------------------------------------------------------
@@ -1054,6 +1083,18 @@ class MMStateStore:
                 "SELECT * FROM liquidity_windows WHERE market_id = ? ORDER BY id ASC", (market_id,)
             ).fetchall()
         return [self._liquidity_window_from_row(r) for r in rows]
+
+    def prune_liquidity_windows(self, older_than: datetime) -> int:
+        """Delete `liquidity_windows` rows strictly older than `older_than`
+        (plan Wave 1 W1.1 -- the table is otherwise unbounded on a
+        persistent --state-db). Mirrors `prune_quotes` exactly: same
+        `_dt_to_iso` serialization, same `ts < ?` bound. Returns the number
+        of rows deleted."""
+        with self._conn:
+            cur = self._conn.execute(
+                "DELETE FROM liquidity_windows WHERE ts < ?", (_dt_to_iso(older_than),)
+            )
+        return cur.rowcount
 
     # ------------------------------------------------------------------
     # markets (persisted market_id -> (expiry_key, strike) registry;

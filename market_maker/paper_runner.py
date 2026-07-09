@@ -54,10 +54,12 @@ Outputs under --out (default temp/paper_run/<UTC ts>/):
                      journal); relocated by --state-db
     run_meta.json    self-describing run config, written once after resolve_event
     heartbeat.json   liveness file, rewritten every tick (atomic); includes
-                     btc_data_age_s and feed_restarts. An initial heartbeat is
-                     written immediately after out_dir creation, before
-                     resolve_event/warmup, so slow auto-resolve/warmup does not
-                     trip a false STALLED alert.
+                     btc_data_age_s, feed_restarts, resume_discrepancies, and
+                     bankroll_frozen (plan Wave 1 W1.3 -- true while the Beuoy
+                     bankroll is degenerate and not yet auto-unfrozen). An
+                     initial heartbeat is written immediately after out_dir
+                     creation, before resolve_event/warmup, so slow
+                     auto-resolve/warmup does not trip a false STALLED alert.
 
 Control-file protocol (--control-dir, default temp/paper_run/control/):
     mm_paper.pid      this process's PID; removed in the finally block
@@ -84,6 +86,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from market_maker.config import MMConfig
+from market_maker.contracts import QuoteMode, RiskDirective, RiskTrigger
 from market_maker.harness import PaperTradingLoop
 from market_maker.market_data_client import FeedCapability, PolymarketFeedAdapter
 from market_maker.order_lifecycle import SimClock
@@ -183,6 +186,7 @@ def _write_heartbeat(
     fills_total: int, noarb_violations: int, unhealthy_ticks: int, pulled_ticks: int,
     tick_s: float, reprice_s: float,
     btc_data_age_s: Optional[float] = None, feed_restarts: int = 0,
+    resume_discrepancies: int = 0, bankroll_frozen: bool = False,
 ) -> None:
     # tick_s/reprice_s feed run_control._heartbeat_threshold: a reprice tick
     # blocks in calculate_probabilities for minutes, so the STALLED threshold
@@ -193,6 +197,8 @@ def _write_heartbeat(
         "unhealthy_ticks": unhealthy_ticks, "pulled_ticks": pulled_ticks,
         "tick_s": tick_s, "reprice_s": reprice_s,
         "btc_data_age_s": btc_data_age_s, "feed_restarts": feed_restarts,
+        "resume_discrepancies": resume_discrepancies,
+        "bankroll_frozen": bool(bankroll_frozen),
     })
 
 
@@ -323,6 +329,11 @@ def run(argv: Optional[List[str]] = None) -> int:
     # 2.3 BTC staleness guard.
     btc_data_age_s: Optional[float] = None
     last_btc_stale_warn_wall = 0.0
+    # W0.1: resume protocol position-discrepancy count (0 unless db_existed
+    # AND restart() found a venue/store position mismatch); once set, ticks
+    # are forced manual_override=True until the first clean tick completes.
+    resume_discrepancies = 0
+    awaiting_clean_resume_tick = False
 
     try:
         out_dir = Path(args.out) if args.out else Path("temp/paper_run") / start.strftime("%Y%m%d_%H%M%S")
@@ -356,10 +367,13 @@ def run(argv: Optional[List[str]] = None) -> int:
         })
         _write_json_atomic(run_json_path, current_run)
 
+        state_db_path = Path(args.state_db) if args.state_db else (out_dir / "paper_state.db")
+
         run_meta = {
             "bankroll": args.bankroll, "event_slug": args.event_slug, "expiry_key": expiry_key,
             "strikes": [k for _, k in markets], "tick_s": args.tick_s, "reprice_s": args.reprice_s,
             "argv": raw_argv, "started_utc": start.isoformat(), "config": config_dict,
+            "state_db": str(state_db_path),
         }
         _write_json_atomic(out_dir / "run_meta.json", run_meta)
 
@@ -368,7 +382,6 @@ def run(argv: Optional[List[str]] = None) -> int:
         # 2.1: resumable state. The existence check MUST happen before
         # MMStateStore is constructed -- its __init__ creates the file, so
         # checking afterwards would never see db_existed=True.
-        state_db_path = Path(args.state_db) if args.state_db else (out_dir / "paper_state.db")
         db_existed = state_db_path.exists()
         store = MMStateStore(str(state_db_path))
         clock = SimClock(start - timedelta(seconds=args.tick_s))
@@ -402,11 +415,40 @@ def run(argv: Optional[List[str]] = None) -> int:
             # table into a fresh InventoryManager; settle's registry-merge
             # catch-up then closes out any previous-event position it finds
             # still open (harness.py settle() docstring/invariant comment).
+            # W0.1: the redundant store.mark_all_live_orders_unknown() call
+            # that used to precede loop.restart() here is dropped --
+            # restart() already calls it internally (harness.py:574).
             resume_now = datetime.now(timezone.utc)
             logger.info("state db %s already existed; running resume protocol", state_db_path)
-            store.mark_all_live_orders_unknown()
-            loop.restart(resume_now)
+            recon = loop.restart(resume_now)
             loop.settle(resume_now, catch_up=True)
+
+            # W0.1: consume the ReconciliationResult -- log + journal any
+            # position discrepancy (store fold(fills) vs venue truth) as a
+            # MANUAL-trigger risk directive, and hold quoting at
+            # manual_override=True until the first post-resume tick
+            # completes cleanly (plan Section 5 "leave PULLED only when all
+            # health checks pass", scoped to this discrepancy case).
+            if recon.position_discrepancies:
+                resume_discrepancies = len(recon.position_discrepancies)
+                awaiting_clean_resume_tick = True
+                logger.warning(
+                    "resume reconciliation found %d position discrepancy(ies): %s",
+                    resume_discrepancies, recon.position_discrepancies,
+                )
+                for market_id, (store_q, venue_q) in recon.position_discrepancies.items():
+                    directive = RiskDirective(
+                        ts=resume_now, market_id=market_id, mode=QuoteMode.PULLED,
+                        eps_add=0.0, kelly_mult=1.0, triggers=[RiskTrigger.MANUAL],
+                        latched_until=resume_now, cancel_all=True,
+                    )
+                    try:
+                        store.append_risk_directive(directive)
+                    except Exception:
+                        logger.warning(
+                            "failed to journal MANUAL resume-discrepancy directive for %s",
+                            market_id, exc_info=True,
+                        )
 
         adapter = PolymarketFeedAdapter(tokens)
         adapter.start()
@@ -442,7 +484,8 @@ def run(argv: Optional[List[str]] = None) -> int:
                 "mid_at_fill", "assumption_set",
             ])
         if ticks_new:
-            tw.writerow(["ts", "tick", "wall_s", "reprice_s", "feed_healthy", "n_msgs", "n_fills"])
+            tw.writerow(["ts", "tick", "wall_s", "reprice_s", "feed_healthy", "n_msgs", "n_fills",
+                         "snapshot_failed"])
 
         end_time = None if args.minutes == 0 else (time.time() + args.minutes * 60.0)
 
@@ -530,20 +573,26 @@ def run(argv: Optional[List[str]] = None) -> int:
 
             clock.set(now - timedelta(seconds=args.tick_s))
             n_lat_before = len(engine.latencies)
+            # W0.1: hold quoting at manual_override=True on every post-resume
+            # tick until one tick completes cleanly (no exception) -- cleared
+            # right after that tick below, never inside the except branch.
+            tick_manual_override = btc_stale or awaiting_clean_resume_tick
             try:
-                loop.tick(messages, feed_healthy=feed_healthy, manual_override=btc_stale)
+                loop.tick(messages, feed_healthy=feed_healthy, manual_override=tick_manual_override)
             except Exception:
                 consec_tick_errors += 1
                 logger.error("tick %d failed (consecutive tick errors=%d)", tick_n,
                              consec_tick_errors, exc_info=True)
                 tw.writerow([now.isoformat(), tick_n, f"{time.time() - loop_start:.2f}",
-                             "", int(feed_healthy), n_msgs, "TICK_ERROR"])
+                             "", int(feed_healthy), n_msgs, "TICK_ERROR", ""])
                 ticks_csv.flush()
                 try:
                     _write_heartbeat(out_dir, now, tick_n, feed_healthy, n_msgs, n_fills_total,
                                       noarb_violations, unhealthy_ticks, pulled_ticks,
                                       args.tick_s, args.reprice_s,
-                                      btc_data_age_s=btc_data_age_s, feed_restarts=feed_restarts)
+                                      btc_data_age_s=btc_data_age_s, feed_restarts=feed_restarts,
+                                      resume_discrepancies=resume_discrepancies,
+                                      bankroll_frozen=loop.bankroll_state.frozen)
                 except Exception:
                     logger.warning("heartbeat write failed", exc_info=True)
                 if consec_tick_errors >= args.max_consecutive_tick_errors:
@@ -554,6 +603,12 @@ def run(argv: Optional[List[str]] = None) -> int:
                 continue
 
             consec_tick_errors = 0
+            if awaiting_clean_resume_tick:
+                # First post-resume tick completed without raising -- release
+                # the forced manual_override held since the resume protocol
+                # found position discrepancies (W0.1). resume_discrepancies
+                # itself is left intact for the heartbeat/alert record.
+                awaiting_clean_resume_tick = False
             repriced = engine.latencies[n_lat_before:] if len(engine.latencies) > n_lat_before else []
             snap = loop.last_snapshot
             fv = loop.last_fair_value
@@ -602,6 +657,7 @@ def run(argv: Optional[List[str]] = None) -> int:
                 now.isoformat(), tick_n, f"{time.time() - loop_start:.2f}",
                 f"{repriced[0]:.1f}" if repriced else "",
                 int(feed_healthy), n_msgs, len(loop.last_fills),
+                int(loop.snapshot_failed),
             ])
             quotes_csv.flush()
             fills_csv.flush()
@@ -680,11 +736,55 @@ def run(argv: Optional[List[str]] = None) -> int:
                 except Exception:
                     logger.warning("markout report failed at tick %d", tick_n, exc_info=True)
 
+                # W0.2: prune the quotes table at the same per-market snapshot
+                # cadence, own try/except so a failure here never blocks the
+                # markout report above (or vice versa).
+                try:
+                    store.prune_quotes(now - timedelta(seconds=loop.config.quotes_retention_s))
+                except Exception:
+                    logger.warning("prune_quotes failed at tick %d", tick_n, exc_info=True)
+
+                # W1.1: persist this tick's per-market LiquidityState (the
+                # dead liquidity_windows table, activated) at the same
+                # per-market snapshot cadence, own try/except per market so
+                # one market's failure never blocks its neighbors or the
+                # blocks above. Pruned with the same retention as quotes.
+                for m, _k in markets:
+                    liq = loop.last_liquidity.get(m)
+                    if liq is None:
+                        continue
+                    try:
+                        store.append_liquidity_window(liq)
+                    except Exception:
+                        logger.warning(
+                            "append_liquidity_window failed for %s at tick %d", m, tick_n,
+                            exc_info=True,
+                        )
+                try:
+                    store.prune_liquidity_windows(now - timedelta(seconds=loop.config.quotes_retention_s))
+                except Exception:
+                    logger.warning("prune_liquidity_windows failed at tick %d", tick_n, exc_info=True)
+
+                # W2.4: persist this expiry's ladder state (net_band_exposure,
+                # gross, phi, r3_histogram, plus the market_id-keyed pending
+                # hedge-demand offsets from W2.1's hedge stage) at the same
+                # per-market snapshot cadence, own try/except so a failure
+                # here never blocks the blocks above.
+                try:
+                    store.upsert_ladder_state(
+                        expiry_key, loop.inv.snapshot(now).per_ladder[expiry_key],
+                        vertical_offsets=loop.last_hedge_offsets,
+                    )
+                except Exception:
+                    logger.warning("upsert_ladder_state failed at tick %d", tick_n, exc_info=True)
+
             try:
                 _write_heartbeat(out_dir, now, tick_n, feed_healthy, n_msgs, n_fills_total,
                                   noarb_violations, unhealthy_ticks, pulled_ticks,
                                   args.tick_s, args.reprice_s,
-                                  btc_data_age_s=btc_data_age_s, feed_restarts=feed_restarts)
+                                  btc_data_age_s=btc_data_age_s, feed_restarts=feed_restarts,
+                                  resume_discrepancies=resume_discrepancies,
+                                  bankroll_frozen=loop.bankroll_state.frozen)
             except Exception:
                 logger.warning("heartbeat write failed", exc_info=True)
 

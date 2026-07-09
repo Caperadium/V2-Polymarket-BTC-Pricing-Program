@@ -14,14 +14,30 @@ between a fill and the controller's reaction, matching a real venue):
      snapshot on engine failure, keeping its stale ts so the risk controller's
      staleness path can fire)
   4. Beuoy fair-value anchor, threading BankrollState / forecasts / consensus
+     (plan Wave 1 W1.2/W1.3: only on a real recompute -- tracked via
+     `_fv_recomputed_this_tick` -- does the sigma_b x-history get a new
+     sample, the consecutive-clean-BEUOY streak advance, and
+     `_fv_recomputed_ts` update; a frozen/reused consensus tick skips all
+     three)
   5. risk directives per market (inventory breaches, liquidity regime, feed
-     health, pricer staleness)
-  6. quote proposals -> joint ladder sizing -> spread builder -> MANDATORY
-     ladder-hedger no-arb check/repair (a rejected/failed ladder never reaches
-     the lifecycle) -> order lifecycle over the PaperVenueAdapter
+     health, pricer staleness, fair-value staleness)
+  6. quote proposals -> joint ladder sizing (DEPTH-capped by this tick's
+     `last_liquidity`, plan Wave 1 W1.1) -> spread builder -> MANDATORY
+     ladder-hedger no-arb check/repair -> W2.2/W2.2b size-skew (inflates the
+     hedge side of a neighbor strike per the PREVIOUS tick's
+     `_pending_hedge_recs`, price-capped by `max_price`, never resurrecting a
+     suppressed side; a rejected/failed ladder never reaches the lifecycle,
+     so the skew never runs on one) -> order lifecycle over the
+     PaperVenueAdapter
   7. feed the same MarketState to the fill simulator; route fills atomically to
      the InventoryManager AND the state store
      (record_fill_and_update_inventory); reconcile fully-consumed store orders
+  8. W2.1 ladder-hedger stage: compute NEXT tick's vertical (and, behind
+     `enable_beta_hedge`, beta) hedge recommendations off this tick's
+     post-fill inventory; rebuild the market_id-keyed pending-hedge-demand
+     offsets (`hedge_offsets_by_market`, plan W2.0) from scratch and push them
+     into `inv.set_hedge_state`; wire this tick's joint-ladder phi into
+     `inv.set_phi`.
 
 `settle()` delegates to the SettlementHandler (with catch_up support) and syncs
 the settlement pseudo-fills back into the in-memory InventoryManager so the
@@ -33,6 +49,7 @@ last_quote_sets, last_proposals, last_fills, checked_ladders, ...).
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -41,11 +58,15 @@ import numpy as np
 
 from market_maker.config import MMConfig
 from market_maker.contracts import (
+    AnchorMethod,
     BankrollState,
     ContractInv,
     Fill,
+    HedgeRecommendation,
     LiquidityRegime,
     LiquiditySource,
+    LiquidityState,
+    QuoteMode,
     QuoteSet,
     Side,
     VenueDescriptor,
@@ -56,7 +77,7 @@ from market_maker.fair_value_anchor import (
     compute_fair_value,
 )
 from market_maker.inventory_manager import InventoryManager
-from market_maker.ladder_hedger import LadderHedger
+from market_maker.ladder_hedger import LadderHedger, hedge_offsets_by_market
 from market_maker.liquidity_monitor import LiquidityMonitor
 from market_maker.market_data_client import BookMirror, FeedCapability
 from market_maker.order_lifecycle import OrderLifecycleManager, PaperVenueAdapter, SimClock
@@ -73,6 +94,8 @@ from market_maker.settlement_handler import (
 )
 from market_maker.spread_builder import build_quote_set
 from market_maker.state_store import MMStateStore
+
+logger = logging.getLogger("mm.harness")
 
 _LIVE_STATUSES = ("PENDING", "LIVE")
 
@@ -225,6 +248,34 @@ class PaperTradingLoop:
         self._x_hist: Dict[str, List[float]] = {m: [] for m, _ in self.markets}
         self._seq: Dict[str, int] = {m: 0 for m, _ in self.markets}
 
+        # W1.2: last successful consensus recompute time + per-tick recompute
+        # flag (True only on the `len(mids) == len(self.markets)` branch).
+        self._fv_recomputed_ts: Optional[datetime] = None
+        self._fv_recomputed_this_tick: bool = False
+
+        # W1.3: consecutive-clean-BEUOY-tick streak for bankroll auto-unfreeze.
+        self._clean_beuoy_streak: int = 0
+
+        # W2.1: this tick's joint-ladder phi directive (from SizingDecision),
+        # cached in _compose_quote_sets and consumed by the hedge stage's
+        # inv.set_phi call. 0.0 until the first tick sizes anything.
+        self._last_phi_directive: float = 0.0
+
+        # W2.1 (plan reviewer note 14): defined empty so tick 1 and the
+        # `fv is None` early-return have a value.
+        self._pending_hedge_recs: List[HedgeRecommendation] = []
+
+        # W2.1/W2.4: market_id-keyed pending-hedge-demand offsets (W2.0
+        # builder output), exposed on the loop so paper_runner.py can persist
+        # them via store.upsert_ladder_state at the snapshot cadence.
+        self.last_hedge_offsets: Dict[str, float] = {}
+
+        # W2.2: bounded journal of hedge-skew apply/skip decisions -- same
+        # trim pattern as checked_ladders (journal_maxlen), everything
+        # trimmed here already reached its terminal state (applied or
+        # skipped) and is not separately persisted.
+        self.hedge_journal: List[dict] = []
+
         # journal
         self._tick = 0
         self.last_snapshot = None
@@ -269,9 +320,18 @@ class PaperTradingLoop:
                 breaches.append(InvBreach(market_id=m, is_long=ci.q > 0.0, ratio=ratio))
         return breaches
 
-    def _compose_quote_sets(self, snap, fv, directives) -> List[Tuple[float, str, QuoteSet]]:
+    def _compose_quote_sets(
+        self, snap, fv, directives,
+        liquidity: Optional[Dict[str, LiquidityState]] = None,
+    ) -> List[Tuple[float, str, QuoteSet]]:
         """Quote engine -> sizing -> spread builder for the whole ladder. A
-        seam the forced-no-arb test monkeypatches to inject a crossing ladder."""
+        seam the forced-no-arb test monkeypatches to inject a crossing ladder.
+
+        `liquidity` (W1.1): dict market_id -> LiquidityState, forwarded to
+        `size_ladder(liquidity=...)` so the DEPTH cap actually binds; the
+        tick passes `self.last_liquidity` (populated earlier in the same
+        tick's risk-directive loop, so it is fresh). None (default) keeps
+        the DEPTH cap inert, matching prior behavior."""
         cfg = self.config
         now = self.clock.now()
         tte = max(snap.tte_days, 0.0)
@@ -287,7 +347,12 @@ class PaperTradingLoop:
         sample_dt_days = (self.tick_dt_s * stride) / 86400.0
 
         for m, k in self.markets:
-            self._x_hist[m].append(float(fv.consensus_x[k]))
+            # W1.2: only feed the sigma_b estimator on ticks where consensus
+            # was actually recomputed -- a frozen anchor (incomplete-mids
+            # reuse) must not decay sigma_b toward the floor via a
+            # repeated-value append.
+            if self._fv_recomputed_this_tick:
+                self._x_hist[m].append(float(fv.consensus_x[k]))
             if self.x_hist_maxlen is not None and len(self._x_hist[m]) > self.x_hist_maxlen:
                 # Trim from the front -- keep the newest entries (the sigma_b
                 # estimator below is itself newest-anchored, plan B4-memory).
@@ -307,7 +372,14 @@ class PaperTradingLoop:
             )
         self.last_proposals = proposals
 
-        decisions, _audit = size_ladder(contracts, snap, self.bankroll, now, cfg, liquidity=None)
+        decisions, _audit = size_ladder(contracts, snap, self.bankroll, now, cfg, liquidity=liquidity)
+
+        # W2.1: phi_directive is the same joint-ladder value on every
+        # SizingDecision this tick (plan: "any decision carries it") -- cache
+        # it on the instance so the tick's hedge stage can wire it into
+        # inv.set_phi without re-deriving it.
+        if decisions:
+            self._last_phi_directive = next(iter(decisions.values())).phi_directive
 
         out: List[Tuple[float, str, QuoteSet]] = []
         for m, k in self.markets:
@@ -319,6 +391,84 @@ class PaperTradingLoop:
             )
             out.append((k, m, qs))
         return out
+
+    def _apply_hedge_skew(self, checked: List[QuoteSet], now: datetime) -> List[QuoteSet]:
+        """W2.2/W2.2b: inflate this tick's just-repaired ladder's passive
+        quote size on the hedge side of each PREVIOUS-tick hedge
+        recommendation's target market ("size-skew" hedge execution,
+        plan Wave 2 decision table). Pure w.r.t. `checked` (returns a new
+        list; QuoteSet is frozen) but appends to the bounded
+        `self.hedge_journal`.
+
+        Suppressed-side precedence (plan W2.2, NEVER resurrect a suppressed
+        side): a rec is skipped if the target QuoteSet's directive mode
+        forecloses the hedge side (BUY_YES needs bid allowed --
+        TWO_SIDED/BID_ONLY; BUY_NO needs ask allowed -- TWO_SIDED/ASK_ONLY;
+        PULLED always skips) OR the checked ladder already sized that side to
+        0 (a suppressed/zeroed side is never resurrected by the hedge skew).
+
+        W2.2b price rule (side-scale, exhaustive):
+          BUY_YES: apply iff qs.bid_price <= rec.max_price (both YES-scale).
+          BUY_NO:  the placed NO price is (1 - qs.ask_price)
+                   (order_lifecycle.py's sell-YES-via-buy-NO convention);
+                   apply iff (1 - qs.ask_price) <= rec.max_price (both
+                   NO-scale).
+        """
+        by_market = {qs.market_id: qs for qs in checked}
+        out = list(checked)
+        for rec in self._pending_hedge_recs:
+            qs = by_market.get(rec.target_market_id)
+            if qs is None:
+                self.hedge_journal.append({
+                    "ts": now, "target_market_id": rec.target_market_id,
+                    "side": rec.side.value, "size": rec.size,
+                    "applied": False, "reason": "target_not_in_ladder",
+                })
+                continue
+
+            if rec.side == Side.BUY_YES:
+                side_allowed = qs.risk_mode in (QuoteMode.TWO_SIDED, QuoteMode.BID_ONLY)
+                side_zeroed = qs.bid_size <= 0.0
+            else:
+                side_allowed = qs.risk_mode in (QuoteMode.TWO_SIDED, QuoteMode.ASK_ONLY)
+                side_zeroed = qs.ask_size <= 0.0
+
+            if qs.risk_mode == QuoteMode.PULLED or not side_allowed or side_zeroed:
+                self.hedge_journal.append({
+                    "ts": now, "target_market_id": rec.target_market_id,
+                    "side": rec.side.value, "size": rec.size,
+                    "applied": False, "reason": "suppressed_side",
+                })
+                continue
+
+            if rec.side == Side.BUY_YES:
+                applies = qs.bid_price <= rec.max_price
+            else:
+                applies = (1.0 - qs.ask_price) <= rec.max_price
+
+            if not applies:
+                self.hedge_journal.append({
+                    "ts": now, "target_market_id": rec.target_market_id,
+                    "side": rec.side.value, "size": rec.size,
+                    "applied": False, "reason": "price_above_max",
+                })
+                continue
+
+            if rec.side == Side.BUY_YES:
+                new_qs = replace(qs, bid_size=qs.bid_size + rec.size)
+            else:
+                new_qs = replace(qs, ask_size=qs.ask_size + rec.size)
+            by_market[rec.target_market_id] = new_qs
+            self.hedge_journal.append({
+                "ts": now, "target_market_id": rec.target_market_id,
+                "side": rec.side.value, "size": rec.size,
+                "applied": True, "reason": "ok",
+            })
+
+        if self.journal_maxlen is not None and len(self.hedge_journal) > self.journal_maxlen:
+            del self.hedge_journal[: len(self.hedge_journal) - self.journal_maxlen]
+
+        return [by_market[qs.market_id] for qs in out]
 
     def _route_fill(self, fill: Fill, now: datetime) -> None:
         self.inv.apply_fill(fill)
@@ -339,6 +489,11 @@ class PaperTradingLoop:
         self._tick += 1
         self.clock.set(self.clock.now() + timedelta(seconds=self.tick_dt_s))
         now = self.clock.now()
+
+        # W0.3: accrue age_weighted_holding / R3 between fills -- a held
+        # position must age even on a tick with no fill activity, so gate
+        # metrics that read it live stay current (plan Wave 0).
+        self.inv.mark(now)
 
         # 1. book mirrors -> market states, liquidity update
         market_states = {}
@@ -383,7 +538,13 @@ class PaperTradingLoop:
 
         # 3. fair value (thread bankroll state; reuse last consensus if the
         # market is momentarily incomplete, e.g. a feed gap)
-        if len(mids) == len(self.markets):
+        # W1.2/W1.3: recomputed-this-tick flag -- True only on this branch
+        # (a real consensus recompute), never on the reuse/incomplete-mids
+        # path below. Downstream (sigma_b append, unfreeze streak) key off
+        # this flag, not off fv.anchor_method alone (reviewer note 12):
+        # last_fair_value retains a stale BEUOY method on non-recompute ticks.
+        self._fv_recomputed_this_tick = len(mids) == len(self.markets)
+        if self._fv_recomputed_this_tick:
             result = compute_fair_value(
                 snap, mids, self.bankroll_state, self.config, market_ts=now,
                 prev_forecasts=self.prev_forecasts, prev_consensus=self.prev_consensus, ts=now,
@@ -392,7 +553,26 @@ class PaperTradingLoop:
             self.prev_forecasts = result.forecasts
             self.prev_consensus = result.consensus_bucket
             self.last_fair_value = result.fair_value
+            self._fv_recomputed_ts = now
             self.store.append_bankroll_state(self.expiry_key, self.bankroll_state)
+
+            # W1.3: bankroll auto-unfreeze streak. Resets to 0 on any
+            # recomputed tick whose anchor is non-BEUOY (fallback fired);
+            # non-recompute ticks (this branch not taken) neither increment
+            # nor reset -- see below, after the early return.
+            if result.fair_value.anchor_method == AnchorMethod.BEUOY:
+                self._clean_beuoy_streak += 1
+            else:
+                self._clean_beuoy_streak = 0
+
+            if (self.bankroll_state.frozen
+                    and self._clean_beuoy_streak >= self.config.bankroll_unfreeze_clean_ticks):
+                self.bankroll_state.frozen = False
+                logger.warning(
+                    "bankroll auto-unfrozen after %d consecutive clean BEUOY ticks (expiry %s)",
+                    self._clean_beuoy_streak, self.expiry_key,
+                )
+                self.store.append_bankroll_state(self.expiry_key, self.bankroll_state)
         fv = self.last_fair_value
         if fv is None:
             return  # nothing quotable yet
@@ -403,6 +583,13 @@ class PaperTradingLoop:
 
         # 4. risk directives
         breaches = self._breaches()
+        # W1.2: age of the last successful consensus recompute, fed to the
+        # risk controller's fair-value staleness rule; None until the first
+        # recompute ever happens (inert -- see RiskController.evaluate).
+        fair_value_age_s = (
+            (now - self._fv_recomputed_ts).total_seconds()
+            if self._fv_recomputed_ts is not None else None
+        )
         directives = {}
         for m, k in self.markets:
             liq = self.monitors[m].emit()
@@ -413,21 +600,41 @@ class PaperTradingLoop:
                 feed_healthy=market_states[m].feed_healthy,
                 spot=snap.s0, strike=k, manual_override=manual_override,
                 vol_gate_result=vol_gate_result,
+                fair_value_age_s=fair_value_age_s,
             )
             directives[m] = directive
             self.store.append_risk_directive(directive)
         self.last_directives = directives
 
         # 5. quotes -> sizing -> spread -> no-arb -> lifecycle
-        composed = self._compose_quote_sets(snap, fv, directives)
+        # W1.1: self.last_liquidity is populated fresh THIS tick by the
+        # risk-directive loop above (step 4 runs before this), so no re-emit
+        # is needed here.
+        composed = self._compose_quote_sets(snap, fv, directives, liquidity=self.last_liquidity)
         composed.sort(key=lambda t: t[0])
         strikes_sorted = [k for k, _, _ in composed]
         qs_list = [qs for _, _, qs in composed]
-        self.last_quote_sets = {m: qs for _, m, qs in composed}
         model_cdf = {k: float(fv.consensus_p[k]) for k in strikes_sorted}
 
         checked = self.hedger.repair(qs_list, strikes_sorted, model_cdf, expiry_key=self.expiry_key)
+        if checked is not None:
+            # W2.2/W2.2b: apply the PREVIOUS tick's hedge recommendations as a
+            # size-skew on this tick's just-repaired ladder, BEFORE it is
+            # journaled/persisted/sent to the lifecycle -- the replaced
+            # QuoteSet must be the single object every downstream consumer
+            # (append_quote, lifecycle.apply, last_quote_sets, checked_ladders,
+            # all_checked_quote_sets) sees. repair() only ever touches prices,
+            # never sizes, so no-arb stays valid after this skew too.
+            checked = self._apply_hedge_skew(checked, now)
         self.last_checked_quote_sets = checked
+        # last_quote_sets journals the FINAL (post-repair, post-skew) ladder
+        # when repair succeeded; falls back to the pre-repair/pre-skew ladder
+        # on a rejected ladder (checked is None) so callers still see
+        # something rather than a stale prior-tick value.
+        self.last_quote_sets = (
+            {m: qs for _, m, qs in composed} if checked is None
+            else {m: qs for (_, m, _), qs in zip(composed, checked)}
+        )
         if checked is not None:
             self.checked_ladders.append((strikes_sorted, checked))
             self.all_checked_quote_sets.extend(checked)
@@ -467,6 +674,49 @@ class PaperTradingLoop:
                     "FILLED", venue_order_id=rec.venue_order_id,
                     ts_placed=rec.ts_placed, ts_final=now,
                 )
+
+        # 7. W2.1: ladder hedger -- compute NEXT tick's hedge inputs. Runs
+        # AFTER fills routing (step 6) so inv_snapshot reflects this tick's
+        # fills. market_id-keyed offsets (W2.0) are rebuilt from scratch every
+        # tick from this tick's fresh recs -- see hedge_offsets_by_market's
+        # docstring for the PENDING-hedge-demand / expires semantics.
+        market_ids = [m for m, _ in self.markets]
+        inv_snapshot = self.inv.snapshot(now)
+        fair_p = {m: float(fv.consensus_p[k]) for m, k in self.markets}
+        # depth_hint: bid+ask realized depth from this tick's last_liquidity
+        # (step 4's fresh emit(), same source W1.1 wires into size_ladder);
+        # guard missing entries rather than assume every market reported.
+        depth_hint: Dict[str, float] = {}
+        for m in market_ids:
+            liq = self.last_liquidity.get(m)
+            if liq is not None:
+                depth_hint[m] = float(liq.realized_depth_bid) + float(liq.realized_depth_ask)
+
+        recs, _audit_state = self.hedger.vertical_hedges(
+            inv_snapshot, self.expiry_key, self.strikes, market_ids, fair_p,
+            ts=now, depth_hint=depth_hint,
+        )
+
+        # W2.5: beta-hedge call site, behind enable_beta_hedge (default
+        # False). Flag-off short-circuits BEFORE beta_hedges() is invoked at
+        # all -- no offsets, no journal entries (asserted inert by test).
+        # sigma_b plumbing deferred (reviewer note 13): enabling this flag for
+        # real requires threading per-market sigma_b out of
+        # _compose_quote_sets; the flag-on path here uses a placeholder
+        # constant (sigma_b_floor) purely so the flag is functional rather
+        # than dead code, per the plan's decision table.
+        if self.hedger.enable_beta_hedge:
+            sigma_b_placeholder = {m: self.config.sigma_b_floor for m in market_ids}
+            beta_recs = self.hedger.beta_hedges(
+                inv_snapshot, self.expiry_key, self.strikes, market_ids, fair_p,
+                sigma_b_placeholder, now, depth_hint=depth_hint,
+            )
+            recs = recs + beta_recs
+
+        self._pending_hedge_recs = recs
+        self.last_hedge_offsets = hedge_offsets_by_market(recs)
+        self.inv.set_hedge_state(self.expiry_key, self.last_hedge_offsets)
+        self.inv.set_phi(self.expiry_key, self._last_phi_directive)
 
     # -- invariant helper -------------------------------------------------
 

@@ -24,8 +24,10 @@ Fill-model assumptions (6.3), implemented verbatim:
      timestamp; cancels take effect cancel_latency_ms after the cancel decision.
      During the cancel window the quote is LIVE and can be hit (we own our stale
      quotes). Defaults from MMConfig (2000/2000 ms).
-  5. Adverse-selection marks -- every PaperFill records mid_at_fill; mark_fills()
-     backfills mid_p1m/mid_p10m/mid_p1h once their horizons elapse (None until).
+  5. Adverse-selection marks -- every PaperFill records mid_at_fill; the
+     mid_p1m/mid_p10m/mid_p1h backfill channel (mark_fills()) is superseded by
+     the mid_log markout report (pnl_report.markout_report, plan Wave 0
+     W0.4) and has been removed.
   6. Feed gaps -- when a market's feed_healthy flag is False on a snapshot,
      that market's live quotes are marked "exposed" (an exposure incident is
      recorded with start/end + duration); NO fills are simulated for that
@@ -59,11 +61,6 @@ ASSUMPTION_QUEUEBEHIND = "fillmodel-v1-queuebehind"
 ASSUMPTION_TRADETHROUGH = "fillmodel-v1-tradethrough"
 
 _PRICE_TOL = 1e-9
-_ADVERSE_HORIZONS = (
-    ("mid_p1m", 60.0),
-    ("mid_p10m", 600.0),
-    ("mid_p1h", 3600.0),
-)
 
 
 # ---------------------------------------------------------------------------
@@ -466,18 +463,6 @@ class PaperFillSimulator:
                 dead.append(oid)
         for oid in dead:
             del self._orders[oid]
-
-    # -- adverse-selection marks (6.3.5) --------------------------------
-
-    def mark_fills(self, now: datetime, mid: float) -> List[PaperFill]:
-        """Backfill mid_p1m/mid_p10m/mid_p1h for fills whose horizons have
-        elapsed at `now` (None until then). Returns the current fill snapshots."""
-        for r in self._fills:
-            elapsed = (now - r.ts).total_seconds()
-            for attr, horizon in _ADVERSE_HORIZONS:
-                if elapsed >= horizon and getattr(r, attr) is None:
-                    setattr(r, attr, float(mid))
-        return [r.to_paperfill() for r in self._fills]
 
     # -- accessors -------------------------------------------------------
 
