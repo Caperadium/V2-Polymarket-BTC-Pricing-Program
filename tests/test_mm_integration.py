@@ -321,7 +321,7 @@ def test_inventory_cap_goes_one_sided_then_pulls(store):
     # SMALL prints (3 shares/tick) PARTIALLY fill it so the same bid stays live
     # every tick. The ratio then steps through the (1,1.5] one-sided band and,
     # via a cancel-window fill, into the >1.5 pull band.
-    cfg = MMConfig(q_max_scale=20.0)  # q_max(ATM) = 20 * 0.25 = 5
+    cfg = MMConfig(q_max_scale=20.0, k_arrival=1.0)  # q_max(ATM) = 20 * 0.25 = 5; k pinned to launch value, scenario is tuned to the wide-quote geometry
     loop = _make_loop(store, config=cfg, bankroll=5000.0)
 
     modes = []

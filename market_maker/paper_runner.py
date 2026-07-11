@@ -744,6 +744,15 @@ def run(argv: Optional[List[str]] = None) -> int:
                 except Exception:
                     logger.warning("prune_quotes failed at tick %d", tick_n, exc_info=True)
 
+                # 2026-07-11: prune the trade_prints table (arrival-decay
+                # calibration input, see scripts/mm_calibrate_k.py) on the
+                # same cadence and retention as quotes, own try/except so a
+                # failure here never blocks the blocks above.
+                try:
+                    store.prune_trade_prints(now - timedelta(seconds=loop.config.quotes_retention_s))
+                except Exception:
+                    logger.warning("prune_trade_prints failed at tick %d", tick_n, exc_info=True)
+
                 # W1.1: persist this tick's per-market LiquidityState (the
                 # dead liquidity_windows table, activated) at the same
                 # per-market snapshot cadence, own try/except per market so

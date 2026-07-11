@@ -141,7 +141,11 @@ def test_resolve_next_event_skips_events_too_close_to_settlement(monkeypatch):
     monkeypatch.setattr(shadow_runner, "_get", _fake_get)
     monkeypatch.setattr(shadow_runner.time, "sleep", lambda s: None)
 
-    expiry_key, _ladder = shadow_runner.resolve_next_event(NOW, lead_days=5)
+    # Pin the pull window at 24h so the scenario (26h-out settles "too soon",
+    # threshold 24+12=36h) tests the skip MECHANISM independent of the config
+    # default (24h -> 6h, 2026-07-11).
+    cfg = MMConfig(near_resolution_pull_hours=24.0)
+    expiry_key, _ladder = shadow_runner.resolve_next_event(NOW, lead_days=5, config=cfg)
     assert expiry_key == "2026-07-12"
 
 

@@ -614,6 +614,43 @@ def test_idx_mid_log_market_ts_index_exists(store):
     assert "idx_mid_log_market_ts" in names
 
 
+# ---------------------------------------------------------------------------
+# trade_prints (2026-07-11, arrival-decay calibration input)
+# ---------------------------------------------------------------------------
+
+
+def test_append_trade_prints_round_trip(store):
+    n = store.append_trade_prints({
+        "m1": [(NOW, 0.61, 5.0), (NOW + timedelta(seconds=2), 0.62, 1.0)],
+        "m2": [(NOW, 0.11, 3.0)],
+    })
+    assert n == 3
+
+    all_rows = store.get_trade_prints()
+    assert len(all_rows) == 3
+    assert {r.market_id for r in all_rows} == {"m1", "m2"}
+
+    m1_rows = store.get_trade_prints("m1")
+    assert [(r.price, r.size) for r in m1_rows] == [(0.61, 5.0), (0.62, 1.0)]
+    assert m1_rows[0].ts == NOW
+
+
+def test_append_trade_prints_empty_is_noop(store):
+    assert store.append_trade_prints({}) == 0
+    assert store.append_trade_prints({"m1": []}) == 0
+    assert store.get_trade_prints() == []
+
+
+def test_prune_trade_prints_deletes_strictly_older(store):
+    store.append_trade_prints({"m1": [(NOW, 0.5, 1.0)]})
+    store.append_trade_prints({"m1": [(NOW + timedelta(seconds=60), 0.51, 1.0)]})
+    deleted = store.prune_trade_prints(NOW + timedelta(seconds=60))
+    assert deleted == 1
+    rows = store.get_trade_prints("m1")
+    assert len(rows) == 1
+    assert rows[0].price == 0.51
+
+
 def test_mid_at_or_after_picks_first_row_at_or_after_bound(store):
     store.append_mids(NOW, {"m1": 0.10})
     store.append_mids(NOW + timedelta(seconds=60), {"m1": 0.20})

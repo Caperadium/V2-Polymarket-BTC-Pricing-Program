@@ -243,7 +243,7 @@ def test_crash_before_settle_recovery(tmp_path):
     store1 = MMStateStore(db_path)
     loop1 = PaperTradingLoop(
         store=store1, expiry_key=OLD_EXPIRY, markets=[OLD_MARKET], engine_fn=_engine(),
-        config=MMConfig(gamma=0.5), clock=SimClock(START), vol_gate_fn=_vol_gate(),
+        config=MMConfig(gamma=0.5, k_arrival=1.0), clock=SimClock(START), vol_gate_fn=_vol_gate(),  # k pinned: wide-quote geometry keeps Kelly size above the tiny depth so DEPTH binds
     )
     loop1.tick({OLD_MARKET[0]: _snapshot_msg(0.5)})
     for _ in range(3):
@@ -337,7 +337,7 @@ def test_mid_log_written_every_tick_and_markout_report_over_store(store):
     market_id, _strike = MARKETS[0]
     loop = PaperTradingLoop(
         store=store, expiry_key=EXPIRY, markets=MARKETS, engine_fn=_engine(),
-        config=MMConfig(gamma=0.5), clock=SimClock(START), vol_gate_fn=_vol_gate(),
+        config=MMConfig(gamma=0.5, k_arrival=1.0), clock=SimClock(START), vol_gate_fn=_vol_gate(),  # k pinned: wide-quote geometry keeps Kelly size above the tiny depth so DEPTH binds
     )
 
     # Tick 1: plain snapshot -> rests bid/ask quotes for both markets.
@@ -386,7 +386,7 @@ def test_held_position_accrues_age_and_r3_across_fill_free_ticks(store):
     market_id, _strike = MARKETS[0]
     loop = PaperTradingLoop(
         store=store, expiry_key=EXPIRY, markets=MARKETS, engine_fn=_engine(),
-        config=MMConfig(gamma=0.5), clock=SimClock(START), vol_gate_fn=_vol_gate(),
+        config=MMConfig(gamma=0.5, k_arrival=1.0), clock=SimClock(START), vol_gate_fn=_vol_gate(),  # k pinned: wide-quote geometry keeps Kelly size above the tiny depth so DEPTH binds
     )
 
     # Tick 1: rest quotes.
@@ -436,7 +436,7 @@ def test_last_liquidity_reaches_size_ladder_and_forces_depth_cap(store):
     market_id, _strike = MARKETS[0]
     loop = PaperTradingLoop(
         store=store, expiry_key=EXPIRY, markets=MARKETS, engine_fn=_engine(),
-        config=MMConfig(gamma=0.5), clock=SimClock(START), vol_gate_fn=_vol_gate(),
+        config=MMConfig(gamma=0.5, k_arrival=1.0), clock=SimClock(START), vol_gate_fn=_vol_gate(),  # k pinned: wide-quote geometry keeps Kelly size above the tiny depth so DEPTH binds
     )
 
     # Several ticks of a tiny resting book so the depth_window rolling mean
@@ -481,7 +481,7 @@ def test_one_dead_book_tick_freezes_consensus_and_skips_x_hist(store):
     market_id, _strike = MARKETS[0]
     loop = PaperTradingLoop(
         store=store, expiry_key=EXPIRY, markets=MARKETS, engine_fn=_engine(),
-        config=MMConfig(gamma=0.5), clock=SimClock(START), vol_gate_fn=_vol_gate(),
+        config=MMConfig(gamma=0.5, k_arrival=1.0), clock=SimClock(START), vol_gate_fn=_vol_gate(),  # k pinned: wide-quote geometry keeps Kelly size above the tiny depth so DEPTH binds
     )
 
     loop.tick(_moving_books(MARKETS, 0.0))
@@ -633,7 +633,7 @@ def test_plan_6_2_hedge_recs_land_as_offsets_and_inflate_neighbor_next_tick(stor
     market_id, other_market = MARKETS[0][0], MARKETS[1][0]
     loop = PaperTradingLoop(
         store=store, expiry_key=EXPIRY, markets=MARKETS, engine_fn=_engine(),
-        config=MMConfig(gamma=0.5), clock=SimClock(START), vol_gate_fn=_vol_gate(),
+        config=MMConfig(gamma=0.5, k_arrival=1.0), clock=SimClock(START), vol_gate_fn=_vol_gate(),  # k pinned: wide-quote geometry keeps Kelly size above the tiny depth so DEPTH binds
     )
     # Low threshold so a modest fill is unambiguously "over cap" without
     # needing to hand-tune fill sizes against q_max_scale internals.
@@ -693,7 +693,7 @@ def test_w2_2b_buy_no_price_rule_numeric_case(store):
 
     loop = PaperTradingLoop(
         store=store, expiry_key=EXPIRY, markets=MARKETS, engine_fn=_engine(),
-        config=MMConfig(gamma=0.5), clock=SimClock(START), vol_gate_fn=_vol_gate(),
+        config=MMConfig(gamma=0.5, k_arrival=1.0), clock=SimClock(START), vol_gate_fn=_vol_gate(),  # k pinned: wide-quote geometry keeps Kelly size above the tiny depth so DEPTH binds
     )
     now = loop.clock.now()
     market_id, other_market = MARKETS[0][0], MARKETS[1][0]
@@ -733,7 +733,7 @@ def test_w2_2_suppressed_side_never_resurrected(store):
 
     loop = PaperTradingLoop(
         store=store, expiry_key=EXPIRY, markets=MARKETS, engine_fn=_engine(),
-        config=MMConfig(gamma=0.5), clock=SimClock(START), vol_gate_fn=_vol_gate(),
+        config=MMConfig(gamma=0.5, k_arrival=1.0), clock=SimClock(START), vol_gate_fn=_vol_gate(),  # k pinned: wide-quote geometry keeps Kelly size above the tiny depth so DEPTH binds
     )
     now = loop.clock.now()
     market_id, other_market = MARKETS[0][0], MARKETS[1][0]
@@ -764,7 +764,7 @@ def test_w2_2_suppressed_side_zeroed_size_never_resurrected(store):
 
     loop = PaperTradingLoop(
         store=store, expiry_key=EXPIRY, markets=MARKETS, engine_fn=_engine(),
-        config=MMConfig(gamma=0.5), clock=SimClock(START), vol_gate_fn=_vol_gate(),
+        config=MMConfig(gamma=0.5, k_arrival=1.0), clock=SimClock(START), vol_gate_fn=_vol_gate(),  # k pinned: wide-quote geometry keeps Kelly size above the tiny depth so DEPTH binds
     )
     now = loop.clock.now()
     market_id, other_market = MARKETS[0][0], MARKETS[1][0]
@@ -801,7 +801,7 @@ def test_breach_interplay_hedge_fires_below_one_sided_threshold(store):
     market_id, other_market = MARKETS[0][0], MARKETS[1][0]
     loop = PaperTradingLoop(
         store=store, expiry_key=EXPIRY, markets=MARKETS, engine_fn=_engine(),
-        config=MMConfig(gamma=0.5), clock=SimClock(START), vol_gate_fn=_vol_gate(),
+        config=MMConfig(gamma=0.5, k_arrival=1.0), clock=SimClock(START), vol_gate_fn=_vol_gate(),  # k pinned: wide-quote geometry keeps Kelly size above the tiny depth so DEPTH binds
     )
     loop.tick(_moving_books(MARKETS, 0.0))
     now = loop.clock.now()
@@ -865,7 +865,7 @@ def test_beta_hedge_flag_off_is_inert(store, monkeypatch):
     gated inside beta_hedges. Monkeypatched to raise if ever called."""
     loop = PaperTradingLoop(
         store=store, expiry_key=EXPIRY, markets=MARKETS, engine_fn=_engine(),
-        config=MMConfig(gamma=0.5), clock=SimClock(START), vol_gate_fn=_vol_gate(),
+        config=MMConfig(gamma=0.5, k_arrival=1.0), clock=SimClock(START), vol_gate_fn=_vol_gate(),  # k pinned: wide-quote geometry keeps Kelly size above the tiny depth so DEPTH binds
     )
     assert loop.hedger.enable_beta_hedge is False
 
@@ -885,7 +885,7 @@ def test_beta_hedge_flag_on_calls_beta_hedges_with_placeholder_sigma_b(store, mo
     documented sigma_b_floor placeholder (reviewer note 13)."""
     loop = PaperTradingLoop(
         store=store, expiry_key=EXPIRY, markets=MARKETS, engine_fn=_engine(),
-        config=MMConfig(gamma=0.5), clock=SimClock(START), vol_gate_fn=_vol_gate(),
+        config=MMConfig(gamma=0.5, k_arrival=1.0), clock=SimClock(START), vol_gate_fn=_vol_gate(),  # k pinned: wide-quote geometry keeps Kelly size above the tiny depth so DEPTH binds
     )
     loop.hedger.enable_beta_hedge = True
 

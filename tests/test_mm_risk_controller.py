@@ -91,9 +91,17 @@ def test_a_vol_high_widens_not_pull():
 
 
 def test_b_near_resolution_pulls():
-    d = _eval(_rc(), tte=0.5)
+    # tte=0.2d = 4.8h, inside the 6h default window (24h -> 6h, 2026-07-11).
+    d = _eval(_rc(), tte=0.2)
     assert d.mode == QuoteMode.PULLED
     assert RiskTrigger.NEAR_RESOLUTION in d.triggers
+
+
+def test_b_near_resolution_no_pull_outside_window():
+    # tte=0.5d = 12h was PULLED under the old 24h default; must quote now.
+    d = _eval(_rc(), tte=0.5)
+    assert d.mode == QuoteMode.TWO_SIDED
+    assert RiskTrigger.NEAR_RESOLUTION not in d.triggers
 
 
 def test_b_gap_through_strike_pulls():

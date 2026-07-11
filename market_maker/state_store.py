@@ -118,6 +118,14 @@ class MidLogRow:
 
 
 @dataclass
+class TradePrintRow:
+    ts: datetime
+    market_id: str
+    price: float
+    size: float
+
+
+@dataclass
 class PnlSnapshot:
     ts: datetime
     market_id: Optional[str]
@@ -417,6 +425,24 @@ class MMStateStore:
             # unusable there (market_id leads), so give the DELETE its own index.
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_mid_log_ts ON mid_log(ts)"
+            )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS trade_prints (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts TEXT NOT NULL,
+                    market_id TEXT NOT NULL,
+                    price REAL NOT NULL,
+                    size REAL NOT NULL
+                )
+                """
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_trade_prints_market_ts ON trade_prints(market_id, ts)"
+            )
+            # prune_trade_prints filters on ts alone (mirrors idx_mid_log_ts).
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_trade_prints_ts ON trade_prints(ts)"
             )
 
     # ------------------------------------------------------------------
@@ -1186,5 +1212,61 @@ class MMStateStore:
         with self._conn:
             cur = self._conn.execute(
                 "DELETE FROM mid_log WHERE ts < ?", (_dt_to_iso(older_than),)
+            )
+        return cur.rowcount
+
+    # ------------------------------------------------------------------
+    # trade_prints (raw WS aggressor prints, 2026-07-11: recorded so
+    # scripts/mm_calibrate_k.py can fit the Dalen arrival decay k from
+    # print distance-to-mid -- the zero-fill launch defaults left no fill
+    # data to calibrate from, but the print stream needs none of our fills)
+    # ------------------------------------------------------------------
+
+    def append_trade_prints(
+        self, prints_by_market: Dict[str, List[Tuple[datetime, float, float]]]
+    ) -> int:
+        """Durably log this tick's drained `MarketState.last_prints`, one
+        INSERT executemany across all markets. Each print is the feed's
+        (ts, price, size) tuple, price on the venue's YES scale. Returns the
+        number of rows written; no-op on an empty/all-empty dict."""
+        rows = [
+            (_dt_to_iso(ts), market_id, float(price), float(size))
+            for market_id, prints in prints_by_market.items()
+            for (ts, price, size) in prints
+        ]
+        if not rows:
+            return 0
+        with self._conn:
+            self._conn.executemany(
+                "INSERT INTO trade_prints (ts, market_id, price, size) VALUES (?, ?, ?, ?)",
+                rows,
+            )
+        return len(rows)
+
+    def get_trade_prints(self, market_id: Optional[str] = None) -> List[TradePrintRow]:
+        if market_id is None:
+            rows = self._conn.execute(
+                "SELECT * FROM trade_prints ORDER BY id ASC"
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM trade_prints WHERE market_id = ? ORDER BY id ASC",
+                (market_id,),
+            ).fetchall()
+        return [
+            TradePrintRow(
+                ts=_iso_to_dt(row["ts"]), market_id=row["market_id"],
+                price=row["price"], size=row["size"],
+            )
+            for row in rows
+        ]
+
+    def prune_trade_prints(self, older_than: datetime) -> int:
+        """Delete `trade_prints` rows strictly older than `older_than`
+        (mirrors `prune_mid_log`; retention is the caller's choice --
+        paper_runner uses `MMConfig.quotes_retention_s`)."""
+        with self._conn:
+            cur = self._conn.execute(
+                "DELETE FROM trade_prints WHERE ts < ?", (_dt_to_iso(older_than),)
             )
         return cur.rowcount

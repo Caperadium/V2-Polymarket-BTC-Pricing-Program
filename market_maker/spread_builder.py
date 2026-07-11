@@ -58,8 +58,13 @@ from market_maker.logodds import floor_half_spread, half_spread_p_exact, sigmoid
 # Module defaults for terms 4/5 (plan 2.5: "add module defaults if MMConfig
 # lacks fields; keep configurable" -- overridable per call to build_quote_set).
 DEFAULT_ROBUST_SCALE: float = 1.0
-DEFAULT_CREDIBILITY_WIDEN_SCALE: float = 0.02  # prob units at credibility=0
-DEFAULT_WING_BASE_P: float = 0.01  # prob units, before confidence-tier scaling
+# 2026-07-11 zero-fill recal: credibility widening was contributing
+# ~1.4c/side at credibility~0.3 (the dominant robust-term component; MC-SE
+# sqrt(sigma2) is sub-cent in the belly), and the wing base another 1c/side
+# -- against a 0.2-1c market half-touch. Halved both; further cuts should
+# come from measured fill markouts, not guesses.
+DEFAULT_CREDIBILITY_WIDEN_SCALE: float = 0.01  # prob units at credibility=0 (0.02 -> 0.01, 2026-07-11)
+DEFAULT_WING_BASE_P: float = 0.005  # prob units, before confidence-tier scaling (0.01 -> 0.005, 2026-07-11)
 
 
 def make_stub_directive(market_id: str, ts: datetime) -> RiskDirective:

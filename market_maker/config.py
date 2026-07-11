@@ -27,7 +27,13 @@ class MMConfig:
     # All launch defaults (pending Stage A/B calibration): no fill history exists
     # to estimate arrival decay or risk aversion (plan 8.10, 10.3).
     gamma: float = 0.10  # risk aversion (launch default, pending calibration)
-    k_arrival: float = 1.0  # kappa, arrival decay (launch default, pending calibration)
+    # k_arrival: 1.0 -> 10.0 (2026-07-11 zero-fill recal). The k=1 launch
+    # placeholder made the Dalen arrival term (1/k)ln(1+gamma/k) ~ 0.095
+    # x-units ~ 2.2c/side at ATM -- the single largest term in a 5.7c/side
+    # half-spread vs a 0.5c market half-touch (VPS run 20260711_184948 quote
+    # journal). k=10 prices the arrival term ~ 0.02c/side; interim judgment
+    # value until scripts/mm_calibrate_k.py fits k from recorded trade prints.
+    k_arrival: float = 10.0  # kappa, arrival decay (interim; pending trade-print calibration)
     arrival_scale_A: float = 1.0  # arrival scale A (launch default, pending calibration)
     sigma_b_floor: float = 0.05  # belief log-odds vol floor (launch default)
     sigma_b_cap: float = 5.0  # belief log-odds vol cap (launch default)
@@ -97,7 +103,12 @@ class MMConfig:
     posterior_refresh_s: float = 3600.0  # posterior recompute cadence (slow channel)
 
     # --- near-resolution / settlement ---
-    near_resolution_pull_hours: float = 24.0  # plan 2.10 / 10.8 default
+    # near_resolution_pull_hours: 24.0 -> 6.0 (2026-07-11). The 24h plan
+    # default pulled quotes for the entire final day of a daily event --
+    # combined with ~2d auto-mode lead the bot never quoted 0-1 DTE, the
+    # highest-volume regime and the model's 1-2d sweet spot. 6h still clears
+    # the settlement-adjacent gap risk window.
+    near_resolution_pull_hours: float = 6.0
     settlement_retry_window_hours: float = 6.0  # unsettleable retry window (plan 2.13; 24h -> 6h 2026-07-11, escalation is journal-only)
 
     # --- confidence-tier day boundaries (plan 2.1; tightened per

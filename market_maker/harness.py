@@ -521,6 +521,17 @@ class PaperTradingLoop:
         if mids_by_market:
             self.store.append_mids(now, mids_by_market)
 
+        # 2026-07-11: durably record this tick's drained trade prints so
+        # scripts/mm_calibrate_k.py can fit the arrival decay k from print
+        # distance-to-mid (no fill data needed). last_prints was already
+        # drained into the MarketState by the feed snapshot; the fill sim
+        # below reads the same list, this only copies it to the store.
+        prints_by_market = {
+            m: ms.last_prints for m, ms in market_states.items() if ms.last_prints
+        }
+        if prints_by_market:
+            self.store.append_trade_prints(prints_by_market)
+
         # 2. pricer snapshot (reuse previous on engine failure)
         hours = self._hours_to_expiry(now)
         try:
