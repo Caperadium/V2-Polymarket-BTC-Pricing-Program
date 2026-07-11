@@ -190,6 +190,14 @@ class CachedEngine:
     it has lived at least this long, so the MLE fit from tick 1 does not
     silently price the whole run -- S0 already reloads every reprice
     (s0_override=None), only the fit itself was frozen.
+
+    Jump params (2026-07-10 fix): bipower-calibrated via load_calibrated_jumps,
+    refreshed on the same cadence as the GARCH refit. Previously no jump_params
+    were passed, so simulate_paths fell back to the hardcoded module defaults,
+    which sit ~+1.2-1.5c above the calibrated ladder near ATM at 1-7 DTE (see
+    temp/VR.md section 8). Falls back to engine defaults (None) if calibration
+    is unavailable or unconverged -- quoting must not die on a calibration
+    failure.
     """
 
     def __init__(self, reprice_s: float, seed: int = 42, garch_refit_s: float = 21_600.0) -> None:
@@ -200,7 +208,38 @@ class CachedEngine:
         self._cached_at: float = 0.0
         self._garch_cache: Dict[Any, Any] = {}
         self._garch_fitted_at: Optional[float] = None
+        self._jump_params: Optional[Dict[str, Any]] = None
         self.latencies: List[float] = []
+
+    def _load_jump_params(self) -> Optional[Dict[str, Any]]:
+        """Load bipower-calibrated Kou jump params for calculate_probabilities.
+
+        Mirrors run_full_pipeline's key mapping: load_calibrated_jumps returns
+        'lam'/'p_crash' keys, simulate_paths expects 'lambda'/'crash_prob' --
+        passing the raw dict through would silently drop the calibrated
+        lambda/crash back to module defaults.
+        """
+        try:
+            from core.pricing.btc_pricing_engine import load_calibrated_jumps
+
+            cal = load_calibrated_jumps()
+            if not cal.get("fit_converged"):
+                logger.warning(
+                    "jump calibration not converged; using engine default jumps"
+                )
+                return None
+            return {
+                "lambda": cal["lam"], "crash_prob": cal["p_crash"],
+                "eta_up": cal["eta_up"], "eta_down": cal["eta_down"],
+                "mu_v": cal["mu_v"], "rho_J": cal["rho_J"],
+                "rho_j_slope": cal.get("rho_j_slope", 0.0),
+            }
+        except Exception:
+            logger.warning(
+                "jump calibration load failed; using engine default jumps",
+                exc_info=True,
+            )
+            return None
 
     def __call__(self, strikes, hours_to_expiry, **kwargs):
         now = time.time()
@@ -215,6 +254,10 @@ class CachedEngine:
             logger.info("GARCH cache age >= %.0fs; cleared for refit", self.garch_refit_s)
 
         cache_was_empty = not self._garch_cache
+        if cache_was_empty:
+            # Same cadence as the GARCH refit; load_calibrated_jumps has its
+            # own 30d CSV cache so this is cheap between recalibrations.
+            self._jump_params = self._load_jump_params()
         t0 = time.time()
         res = calculate_probabilities(
             list(strikes),
@@ -224,6 +267,7 @@ class CachedEngine:
             use_svcj=True,
             use_skewed_t=True,
             use_figarch=True,
+            jump_params=self._jump_params,
             garch_cache=self._garch_cache,
         )
         self.latencies.append(time.time() - t0)

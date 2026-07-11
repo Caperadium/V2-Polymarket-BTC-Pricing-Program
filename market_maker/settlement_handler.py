@@ -110,12 +110,71 @@ class BTCDataProvider:
         self._daily = daily
         self._intraday_path = intraday_path
         self._daily_path = daily_path
+        # Whether each source is path-backed (constructor arg was None) --
+        # only path-backed sources are eligible for refresh()/mtime tracking.
+        # Injected frames are static for the provider's lifetime.
+        self._intraday_is_path_backed = intraday is None
+        self._daily_is_path_backed = daily is None
+        self._intraday_mtime: Optional[float] = None
+        self._daily_mtime: Optional[float] = None
 
     def _ensure_loaded(self) -> None:
         if self._intraday is None:
             self._intraday = _load_close_csv(self._intraday_path)
         if self._daily is None:
             self._daily = _load_close_csv(self._daily_path)
+
+    def refresh(self) -> None:
+        """Reload path-backed sources whose file mtime has changed since the
+        last load. Injected frames (constructor arg not None) are never
+        stat'd or reloaded here.
+
+        This exists as a SEPARATE step from `_ensure_loaded` (which keeps its
+        load-if-None-only semantics) because settlement retries must see
+        freshly fetched CSVs -- the 24h UNSETTLEABLE retry window is useless
+        if the provider's cache never invalidates -- while a single settlement
+        resolution (`_resolve_settlement_spot`'s sequence of intraday_range /
+        nearest_intraday_close / prior_daily_close calls) must see one
+        consistent pair of frames throughout. Callers invalidate once per
+        settle attempt (here) and then read via the pinned `_ensure_loaded`
+        accessors for the rest of that attempt.
+        """
+        if self._intraday_is_path_backed:
+            self._intraday = self._refresh_one(
+                self._intraday_path, self._intraday, self._intraday_mtime, "_intraday_mtime"
+            )
+        if self._daily_is_path_backed:
+            self._daily = self._refresh_one(
+                self._daily_path, self._daily, self._daily_mtime, "_daily_mtime"
+            )
+
+    def _refresh_one(
+        self, path: Path, cached: Optional[pd.DataFrame], last_mtime: Optional[float], mtime_attr: str
+    ) -> Optional[pd.DataFrame]:
+        # Independent try block per source: a stat failure here must not
+        # abort the sibling source's refresh (caller invokes this per-source).
+        try:
+            mtime: Optional[float] = path.stat().st_mtime
+        except OSError:
+            mtime = None
+
+        if cached is not None and mtime == last_mtime:
+            return cached  # already loaded and unchanged
+
+        reloaded = _load_close_csv(path)
+
+        # Torn-read guard: an empty reload over a non-empty cache is a
+        # transient read failure (mid-write truncation or an unreadable
+        # file) -- keep serving the good cache and do NOT advance the
+        # stored mtime, so the next refresh() retries the reload. An empty
+        # reload over a None-or-empty cache (missing file, or a file that
+        # is genuinely empty so far) IS accepted, mtime advances -- otherwise
+        # a genuinely-empty-then-populated file would wedge forever.
+        if reloaded.empty and cached is not None and not cached.empty:
+            return cached
+
+        setattr(self, mtime_attr, mtime)
+        return reloaded
 
     def intraday_range(self) -> Tuple[Optional[pd.Timestamp], Optional[pd.Timestamp]]:
         self._ensure_loaded()
@@ -168,6 +227,8 @@ def _resolve_settlement_spot(
     _spot_as_of-style prior-daily-close fallback for the rare case where the
     range check passes but no print lands within tolerance.
     """
+    data.refresh()  # pick up fresh CSVs once per settle attempt (see refresh() docstring)
+
     settle_dt = settlement_instant_utc(expiry_key)
     settle_ts = pd.Timestamp(settle_dt)
 

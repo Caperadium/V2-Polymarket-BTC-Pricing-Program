@@ -68,9 +68,18 @@ Jumps follow a compound Poisson process with asymmetric exponential magnitudes:
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `LAMBDA` | 25.0 | Annual jump intensity |
-| `CRASH_PROB` | 0.6 | Probability a jump is downward |
-| `ETA_UP` | 50.0 | 1/mean upward jump size |
-| `ETA_DOWN` | 25.0 | 1/mean downward jump size |
+| `CRASH_PROB` | 0.54 | Probability a jump is downward |
+| `ETA_UP` | 35.0 | 1/mean upward jump size |
+| `ETA_DOWN` | 32.0 | 1/mean downward jump size |
+
+Defaults re-anchored 2026-07-10 to the full-history bipower calibration (the
+conjugate posterior agrees within its 90% CI on every parameter). The previous
+values (0.6 / 50 / 25, implied jump drift -40%/yr vs -10%/yr calibrated)
+inflated ATM P(S_T >= K) by ~1.2-1.5 cents at 1-7 DTE for any caller not
+passing calibrated `jump_params`; calibrated callers were unaffected. These
+constants are a fallback only -- every production path (backrunner, batch
+pipelines, and the market-maker `CachedEngine` as of the same fix) passes
+bipower-calibrated `jump_params` explicitly.
 
 **Multi-jump aggregation per hour**: Jump intensity is scaled `lam_hourly = LAMBDA / (365 × 24)`. Multiple jumps per hour are aggregated using Gamma-distributed magnitudes with explicit masking.
 

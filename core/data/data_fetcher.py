@@ -29,6 +29,27 @@ BINANCE_URL = "https://api.binance.com/api/v3/klines"
 USER_AGENT = "btc_data_fetcher/1.1"
 
 
+def _write_csv_atomic(path, header, rows):
+    """Write a CSV to `path` atomically via write-tmp-then-`os.replace`.
+
+    The ~105MB intraday file takes seconds to write, and live readers
+    (market-maker runner, pricing engine, settlement handler) stat/read the
+    same path concurrently. Writing in place with `open("w")` lets a reader
+    observe a partially-written (truncated) file mid-write. Writing to a
+    same-directory `.tmp` sibling and calling `os.replace` (atomic on both
+    POSIX and Windows since it's the same filesystem) guarantees every
+    reader sees either the old-complete or the new-complete file, never a
+    torn one. Assumes a single writer (one datafetch timer), so a fixed
+    tmp filename is fine.
+    """
+    tmp_path = path.with_name(path.name + ".tmp")
+    with tmp_path.open("w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(header)
+        writer.writerows(rows)
+    os.replace(tmp_path, path)
+
+
 def _read_json(url, retries=5, backoff=1.0):
     """Fetch JSON with retries/backoff; raise RuntimeError on failure."""
     last_err = None
@@ -86,10 +107,7 @@ def fetch_daily(days=1825, symbol="BTCUSDT", interval="1d", throttle=0.5):
     if not rows:
         raise RuntimeError("Binance daily fetch returned no data")
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    with DAILY_PATH.open("w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["date", "close"])
-        writer.writerows(rows)
+    _write_csv_atomic(DAILY_PATH, ["date", "close"], rows)
     print(f"Saved {len(rows)} daily rows to {DAILY_PATH} (Binance, {fetches} calls)")
 
 
@@ -131,10 +149,7 @@ def fetch_hourly(days=1825, symbol="BTCUSDT", interval="1h", throttle=0.5):
     if not rows:
         raise RuntimeError("Binance hourly fetch returned no data")
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    with HOURLY_PATH.open("w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["date", "close"])
-        writer.writerows(rows)
+    _write_csv_atomic(HOURLY_PATH, ["date", "close"], rows)
     print(f"Saved {len(rows)} hourly rows to {HOURLY_PATH} (Binance, {fetches} calls)")
 
 
@@ -316,11 +331,10 @@ def fetch_intraday(days=730, symbol="BTCUSDT", interval="1m", throttle=0.5):
         raise RuntimeError("Binance returned no intraday data")
     
     # Write combined data
-    with INTRADAY_PATH.open("w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["Timestamp", "Open", "High", "Low", "Close", "Volume"])
-        writer.writerows(all_rows)
-    
+    _write_csv_atomic(
+        INTRADAY_PATH, ["Timestamp", "Open", "High", "Low", "Close", "Volume"], all_rows
+    )
+
     if is_incremental:
         print(f"Appended {len(new_rows)} new rows ({fetches} API calls). Total: {len(all_rows)} rows")
     else:

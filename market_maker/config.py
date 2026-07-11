@@ -98,7 +98,7 @@ class MMConfig:
 
     # --- near-resolution / settlement ---
     near_resolution_pull_hours: float = 24.0  # plan 2.10 / 10.8 default
-    settlement_retry_window_hours: float = 24.0  # unsettleable retry window (plan 2.13)
+    settlement_retry_window_hours: float = 6.0  # unsettleable retry window (plan 2.13; 24h -> 6h 2026-07-11, escalation is journal-only)
 
     # --- confidence-tier day boundaries (plan 2.1; tightened per
     # temp/suitability.md -- no backtest coverage past 7 DTE, 28d tail defect) ---

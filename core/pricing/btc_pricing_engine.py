@@ -55,11 +55,17 @@ _FIGARCH_FALLBACK_WARNED = False
 # ==============================================================================
 # JUMP PARAMETERS (Kou's Double Exponential Jump Diffusion)
 # These are kept constant for easy tuning. Override via jump_params dict.
+# 2026-07-10: defaults re-anchored to the full-history bipower calibration
+# (43,792 hourly returns, 124 jumps; conjugate posterior agrees within 90% CI
+# on every parameter -- see temp/VR.md section 8). The previous values
+# (CRASH_PROB=0.6, ETA_UP=50, ETA_DOWN=25, implied jump drift -40%/yr vs -10%/yr
+# calibrated) inflated ATM P(S_T >= K) by ~1.2-1.5c at 1-7 DTE for any caller
+# that did not pass calibrated jump_params. Calibrated callers are unaffected.
 # ==============================================================================
 LAMBDA = 25.0       # Jump intensity (expected number of jumps per year)
-CRASH_PROB = 0.6    # Probability that a jump is a crash (downward)
-ETA_UP = 50.0       # Decay parameter for upward jumps (1/mean jump size)
-ETA_DOWN = 25.0     # Decay parameter for downward jumps (1/mean jump size)
+CRASH_PROB = 0.54   # Probability that a jump is a crash (downward)
+ETA_UP = 35.0       # Decay parameter for upward jumps (1/mean jump size)
+ETA_DOWN = 32.0     # Decay parameter for downward jumps (1/mean jump size)
 
 # ==============================================================================
 # SVCJ VOLATILITY JUMP PARAMETERS

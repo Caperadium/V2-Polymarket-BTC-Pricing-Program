@@ -5,6 +5,7 @@ tmp-path MMStateStore.
 """
 from __future__ import annotations
 
+import os
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
@@ -199,7 +200,7 @@ def test_unsettleable_no_fill_position_stays_open(store):
     assert result.escalated_market_ids == []
 
 
-def test_unsettleable_retry_settles_when_data_arrives(store):
+def test_retry_settles_when_provider_replaced(store):
     intraday_empty = _intraday_df([("2026-01-01 00:00:00", 50000.0)])
     data = BTCDataProvider(intraday=intraday_empty, daily=pd.DataFrame())
     handler = SettlementHandler(store, MMConfig(), data)
@@ -219,6 +220,133 @@ def test_unsettleable_retry_settles_when_data_arrives(store):
 
     got = store.get_settlement("mkt-retry", EXPIRY)
     assert got.outcome is SettlementOutcome.YES
+
+
+# ---------------------------------------------------------------------------
+# path-backed cache invalidation (refresh() -- plan Task 1)
+# ---------------------------------------------------------------------------
+
+
+def _write_intraday_csv(path, rows):
+    """Write a timestamp,close CSV in the format `_load_close_csv` reads."""
+    lines = ["timestamp,close"] + [f"{ts},{close}" for ts, close in rows]
+    path.write_text("\n".join(lines) + "\n")
+
+
+def test_path_backed_retry_settles_when_csv_rewritten(store, tmp_path):
+    # 1. CSV whose range does NOT cover the settlement instant.
+    intraday_path = tmp_path / "intraday.csv"
+    daily_path = tmp_path / "daily.csv"
+    _write_intraday_csv(intraday_path, [("2026-01-01 00:00:00", 50000.0)])
+    daily_path.write_text("timestamp,close\n")  # empty (header-only)
+
+    data = BTCDataProvider(intraday_path=intraday_path, daily_path=daily_path)
+    handler = SettlementHandler(store, MMConfig(), data)
+
+    m = MarketPosition(market_id="mkt-path-retry", strike=100000.0, q=20.0, avg_cost=0.5)
+
+    # 2. First settle attempt -> UNSETTLEABLE (range gate fails).
+    r1 = handler.settle_expiry(EXPIRY, [m], now=SETTLE_DT + timedelta(minutes=1))
+    assert r1.events[0].outcome is SettlementOutcome.UNSETTLEABLE
+
+    # 3. Rewrite the CSV with a print covering the instant; force a later
+    # mtime (coarse filesystem mtime resolution would otherwise make this
+    # flaky in a fast test).
+    stat0 = intraday_path.stat()
+    _write_intraday_csv(intraday_path, [("2026-07-06 16:00:00", 100500.0)])
+    os.utime(intraday_path, (stat0.st_mtime + 10, stat0.st_mtime + 10))
+
+    # 4. Same handler instance (the regression this test covers: settle_expiry
+    # picks up the rewritten file without swapping handler.data).
+    r2 = handler.settle_expiry(EXPIRY, [m], now=SETTLE_DT + timedelta(hours=2))
+    assert r2.events[0].outcome is SettlementOutcome.YES
+    assert r2.events[0].spot_used == 100500.0
+
+
+def test_torn_read_guard_keeps_serving_good_cache(store, tmp_path):
+    intraday_path = tmp_path / "intraday.csv"
+    daily_path = tmp_path / "daily.csv"
+    _write_intraday_csv(intraday_path, [("2026-07-06 16:00:00", 100500.0)])
+    daily_path.write_text("timestamp,close\n")
+
+    data = BTCDataProvider(intraday_path=intraday_path, daily_path=daily_path)
+    handler = SettlementHandler(store, MMConfig(), data)
+    m = MarketPosition(market_id="mkt-torn", strike=100000.0, q=1.0, avg_cost=0.5)
+
+    # Good CSV loaded via a settle (refresh() runs at the top of
+    # _resolve_settlement_spot).
+    r1 = handler.settle_expiry(EXPIRY, [m], now=SETTLE_DT + timedelta(minutes=1))
+    assert r1.events[0].outcome is SettlementOutcome.YES
+
+    good_mtime = intraday_path.stat().st_mtime
+
+    # Overwrite with garbage/empty content, bump mtime -> reload must be
+    # rejected (torn-read guard) so the provider still serves the previous
+    # good frame.
+    intraday_path.write_text("")
+    os.utime(intraday_path, (good_mtime + 10, good_mtime + 10))
+    data.refresh()
+
+    m2 = MarketPosition(market_id="mkt-torn-2", strike=100000.0, q=1.0, avg_cost=0.5)
+    r2 = handler.settle_expiry(EXPIRY, [m2], now=SETTLE_DT + timedelta(minutes=2))
+    assert r2.events[0].outcome is SettlementOutcome.YES  # still the good cached frame
+    assert r2.events[0].spot_used == 100500.0
+
+    # A subsequent good rewrite + later mtime IS picked up -- proves the
+    # rejected reload above did not advance the stored mtime.
+    _write_intraday_csv(intraday_path, [("2026-07-06 16:00:00", 99000.0)])
+    os.utime(intraday_path, (good_mtime + 20, good_mtime + 20))
+
+    m3 = MarketPosition(market_id="mkt-torn-3", strike=100000.0, q=1.0, avg_cost=0.5)
+    r3 = handler.settle_expiry(EXPIRY, [m3], now=SETTLE_DT + timedelta(minutes=3))
+    assert r3.events[0].outcome is SettlementOutcome.NO  # 99000 < strike 100000
+    assert r3.events[0].spot_used == 99000.0
+
+
+def test_empty_then_populated_file_is_picked_up(store, tmp_path):
+    # File missing at first use.
+    intraday_path = tmp_path / "intraday.csv"
+    daily_path = tmp_path / "daily.csv"
+    daily_path.write_text("timestamp,close\n")
+
+    data = BTCDataProvider(intraday_path=intraday_path, daily_path=daily_path)
+    handler = SettlementHandler(store, MMConfig(), data)
+    m = MarketPosition(market_id="mkt-empty-first", strike=100000.0, q=1.0, avg_cost=0.5)
+
+    r1 = handler.settle_expiry(EXPIRY, [m], now=SETTLE_DT + timedelta(minutes=1))
+    assert r1.events[0].outcome is SettlementOutcome.UNSETTLEABLE
+
+    # Now populate the file + bump mtime -> next refresh loads it.
+    _write_intraday_csv(intraday_path, [("2026-07-06 16:00:00", 100500.0)])
+    os.utime(intraday_path, (intraday_path.stat().st_mtime + 10, intraday_path.stat().st_mtime + 10))
+
+    r2 = handler.settle_expiry(EXPIRY, [m], now=SETTLE_DT + timedelta(minutes=2))
+    assert r2.events[0].outcome is SettlementOutcome.YES
+    assert r2.events[0].spot_used == 100500.0
+
+
+def test_injected_frames_never_stat_or_reload(store, tmp_path):
+    # Nonexistent paths -- if refresh() ever stat'd/reloaded these, it would
+    # either raise or silently drop the injected frames to empty.
+    nonexistent_intraday = tmp_path / "does_not_exist_intraday.csv"
+    nonexistent_daily = tmp_path / "does_not_exist_daily.csv"
+    assert not nonexistent_intraday.exists()
+    assert not nonexistent_daily.exists()
+
+    intraday = _intraday_df([("2026-07-06 16:00:00", 100500.0)])
+    data = BTCDataProvider(
+        intraday=intraday, daily=pd.DataFrame(),
+        intraday_path=nonexistent_intraday, daily_path=nonexistent_daily,
+    )
+    handler = SettlementHandler(store, MMConfig(), data)
+    m = MarketPosition(market_id="mkt-injected-static", strike=100000.0, q=1.0, avg_cost=0.5)
+
+    # Settlement behavior is driven purely by the injected frame -- YES,
+    # not UNSETTLEABLE -- proving refresh() didn't try (and fail) to load
+    # from the nonexistent paths.
+    result = handler.settle_expiry(EXPIRY, [m], now=SETTLE_DT + timedelta(minutes=1))
+    assert result.events[0].outcome is SettlementOutcome.YES
+    assert result.events[0].spot_used == 100500.0
 
 
 def test_unsettleable_escalates_after_retry_window(store):

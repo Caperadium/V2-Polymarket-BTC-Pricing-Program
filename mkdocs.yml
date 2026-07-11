@@ -2,11 +2,29 @@ site_name: BTC Polymarket Pricing
 theme:
   name: material
   palette:
-    primary: indigo
+    # Dark (default)
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: black
+      accent: orange
+      toggle:
+        icon: material/weather-night
+        name: Switch to light mode
+    # Light (toggle)
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: black
+      accent: orange
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to dark mode
   features:
     - navigation.tabs
     - navigation.sections
+    - navigation.top
+    - navigation.footer
     - search.highlight
+    - search.suggest
     - content.code.copy
 plugins:
   - search
@@ -41,6 +59,7 @@ nav:
     - Kelly Sizing: concepts/kelly-sizing.md
     - Vol Gate: concepts/vol-gate.md
     - Risk Controls: concepts/risk-controls.md
+    - Market Making: concepts/market-making.md
     - Backtesting Methodology: concepts/backtesting-methodology.md
     - Signal Diagnostics: concepts/signal-diagnostics.md
     - Execution Layer: concepts/execution-layer.md
