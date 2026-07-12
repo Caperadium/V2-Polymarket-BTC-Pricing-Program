@@ -1,5 +1,3 @@
 # Changes
 
 <!-- Append one entry per logical task. Cleared after each push. -->
-
-- Add Telegram slash-command metrics bot for the market maker: `scripts/mm_telegram_bot.py` (stdlib-only, read-only long-polling daemon answering /status, /bankroll, /pnl, /fills, /inventory, /quotes, /markout, /help with live engine metrics from run_control/heartbeat, run_meta.json, the state db opened mode=ro, and markout_report.json). Credentials reuse the existing MM_ALERT_WEBHOOK Telegram URL (token + chat_id parsed out; MM_TELEGRAM_TOKEN/MM_TELEGRAM_CHAT_ID override); chat_id is a hard allowlist; getUpdates offset persists to <control-dir>/telegram_bot_state.json. New systemd unit template `deploy/mm-telegram.service` (Restart=always, shares the mm-alert webhook drop-in). Tests in `tests/test_mm_telegram_bot.py` (22 tests: creds parsing, dispatch, every handler against a real MMStateStore tmp db). Docs: deploy/README.md new optional-service section, DOCS/guides/market-maker-deployment.md command table, CLAUDE.md commands/structure/deploy-kit notes.
