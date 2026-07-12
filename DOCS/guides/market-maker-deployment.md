@@ -17,6 +17,7 @@ Paper Runner" section of the repo's `CLAUDE.md`.
 | `mm-paper.service` | The paper-trading engine unit. `Restart=on-failure` + `RestartForceExitStatus=42` (rollover), `RestartSec=60`, `TimeoutStopSec=900`, `KillMode=mixed`. |
 | `mm-datafetch.service` / `.timer` | Runs `core/data/data_fetcher.py` every 30 minutes (`Persistent=true`). Nothing else refreshes BTC data on the VPS. |
 | `mm-alert.service` / `.timer` | Runs `scripts/mm_alert_check.py` every 5 minutes. Fault alerts (CRASHED/STALLED, feed unhealthy >15min, stale BTC data, low disk, `settlement_timeout`) are de-duped 6h per condition; additionally one daily heartbeat message ("still alive" one-liner with state/tick/fills/disk) is sent at the first check at/after 08:00 UTC (`$MM_HEARTBEAT_HOUR_UTC` to change, `$MM_HEARTBEAT_DISABLE=1` to turn off), so webhook silence always means the alert pipeline itself is broken. |
+| `mm-telegram.service` | Optional. Runs `scripts/mm_telegram_bot.py`, a stdlib-only read-only Telegram bot (long-polling `getUpdates`, no inbound endpoint) that answers operator slash commands with current engine metrics. Reuses the mm-alert webhook URL for credentials. |
 | `README.md` | Full install steps + the 72h acceptance test (reproduced below). |
 
 All unit files are templates: every `<EDIT>` placeholder (repo path, venv
@@ -116,6 +117,31 @@ ssh -L 8502:127.0.0.1:8502 <vps-host>   # keep open, browse http://localhost:850
 The loopback bind is the security boundary -- no firewall rule needed.
 Pick a port that is free on the box (8501 is Streamlit's default and may
 be taken). Full unit file in `deploy/README.md` section 2.
+
+### Telegram metrics bot (optional)
+
+`deploy/mm-telegram.service` runs `scripts/mm_telegram_bot.py`: message the
+alert bot on Telegram and it answers with current metrics instead of you
+waiting for the daily heartbeat. Commands:
+
+| Command | Answer |
+|---------|--------|
+| `/status` | Engine state (`engine_status()`), tick, feed health, per-expiry lines |
+| `/bankroll` | Initial bankroll (run_meta.json) + current equity from the latest pnl TOTAL row |
+| `/pnl` | Realized / unrealized (mid + consensus) / settlement breakdown |
+| `/fills` | Fill counts by liquidity (maker/taker/settlement), last-24h count, last fill |
+| `/inventory` | Open positions (q != 0) with expiry/strike |
+| `/quotes` | Latest resting quote per market (bid/ask/spread/sizes, age) |
+| `/markout` | `markout_report.json` by-region rollup |
+| `/help` | Command list |
+
+Credentials come from the same `MM_ALERT_WEBHOOK` Telegram URL mm-alert uses
+(token + chat_id parsed from it; `MM_TELEGRAM_TOKEN`/`MM_TELEGRAM_CHAT_ID`
+override). The chat_id is a hard allowlist -- the bot never answers any
+other chat. It is read-only by construction (state db opened `mode=ro`) and
+persists its getUpdates offset to `<control-dir>/telegram_bot_state.json` so
+a restart does not replay old commands. Run only one instance per bot token
+(Telegram rejects a second concurrent `getUpdates` consumer with a 409).
 
 ## Stopping / starting cleanly
 

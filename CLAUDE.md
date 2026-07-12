@@ -73,6 +73,9 @@ python -c "from market_maker import run_control; print(run_control.stop_engine()
 # Market-maker VPS deploy-kit alert check (stdlib only, cron/timer-safe, always exits 0)
 python scripts/mm_alert_check.py --control-dir temp/paper_run/control
 
+# Market-maker Telegram metrics bot (stdlib only, read-only; answers /status /bankroll /pnl /fills /inventory /quotes /markout)
+python scripts/mm_telegram_bot.py --control-dir temp/paper_run/control
+
 # Fit the Dalen arrival decay k from recorded trade prints (no fills needed; needs a state-db with trade_prints + mid_log rows)
 python scripts/mm_calibrate_k.py --state-db market_maker/mm_paper_state.db --days 7
 
@@ -153,6 +156,7 @@ mkdocs serve
 |   |-- mm-paper.service          #   Engine unit template
 |   |-- mm-datafetch.service/.timer #  BTC data refresh every 30 min
 |   |-- mm-alert.service/.timer   #   Fault-check + webhook alert every 5 min
+|   |-- mm-telegram.service       #   Telegram slash-command metrics bot (optional)
 |   `-- README.md                 #   Install/runbook/72h acceptance test
 ├── scripts/                      # Executable scripts & pipelines
 │   ├── backtesting/
@@ -170,6 +174,7 @@ mkdocs serve
 │   ├── migrate_db.py
 |   |-- migrate_contract_store_midnight.py # One-shot: floor store dates to midnight + re-dedup
 |   |-- mm_alert_check.py         # Stdlib-only market-maker fault/alert check (deploy/mm-alert.timer)
+|   |-- mm_telegram_bot.py        # Stdlib-only Telegram slash-command metrics bot (deploy/mm-telegram.service)
 |   `-- mm_calibrate_k.py         # Fit Dalen arrival decay k from recorded trade prints (state-db trade_prints + mid_log)
 ├── polymarket/                   # CLOB execution layer
 │   ├── accounting.py             #   Collateral and fill tracking
@@ -368,7 +373,7 @@ Binary BTC market-making against Polymarket `bitcoin-above` ladders -- paper-tra
 
 **Staleness guard**: every tick, `paper_runner.py` freshly stats `DATA/btc_intraday_1m.csv`; if its age exceeds `--btc-stale-max-s` (default 7200s) or the file is missing, the tick runs with `manual_override=True`, which pulls all quotes and cancels resting orders until fresh data lands. `DATA/btc_intraday_1m.csv` is refreshed by a separate cron/timer (`deploy/mm-datafetch.timer`), never by the runner itself.
 
-**The `deploy/` kit** (systemd unit templates + `scripts/mm_alert_check.py`): `mm-paper.service` runs the engine (`RestartForceExitStatus=42` for retry-on-no-events / fixed-mode rollover, `TimeoutStopSec=900` since SIGTERM is only observed between ticks); `mm-datafetch.service`+`.timer` refresh BTC data every 30 min; `mm-alert.service`+`.timer` run `scripts/mm_alert_check.py` every 5 min -- a stdlib-only, always-exits-0 script that pages a generic JSON webhook (`$MM_ALERT_WEBHOOK`) on engine CRASHED/STALLED, a feed-unhealthy streak >15min, stale BTC data (>2x `--btc-stale-max-s`), low disk, a `settlement_timeout` exit while stopped, resume position discrepancies (`resume_discrepancies` > 0 in heartbeat), a frozen Beuoy bankroll (`bankroll_frozen` -- OR over ladders under multi-expiry), an in-process ladder settlement timeout (`ladder_settlement_timeouts` > 0 -- covers what the STOPPED-based check can no longer see in auto mode), or a sustained `n_expiries_active == 0` while running (>15min; acquisition keeps finding nothing) -- the multi-expiry checks no-op on old heartbeats missing their fields -- de-duped 6h per alert key via `temp/paper_run/control/alert_state.json`. It also sends one daily heartbeat message (state/tick/fills/disk one-liner) at the first check at/after 08:00 UTC (`$MM_HEARTBEAT_HOUR_UTC` overrides the hour, `$MM_HEARTBEAT_DISABLE=1` turns it off; tracked as `heartbeat_last_date` in the state file, not subject to the 6h de-dupe), so webhook silence is distinguishable from a dead alert pipeline. An optional `mm-monitor.service` (documented in `deploy/README.md` section 2, no template file) serves `app/pages/mm_monitor.py` bound to loopback for viewing through an SSH tunnel (`ssh -L 8502:127.0.0.1:8502 <vps>`). See `deploy/README.md` for the install walkthrough and the 72h VPS acceptance test procedure.
+**The `deploy/` kit** (systemd unit templates + `scripts/mm_alert_check.py`): `mm-paper.service` runs the engine (`RestartForceExitStatus=42` for retry-on-no-events / fixed-mode rollover, `TimeoutStopSec=900` since SIGTERM is only observed between ticks); `mm-datafetch.service`+`.timer` refresh BTC data every 30 min; `mm-alert.service`+`.timer` run `scripts/mm_alert_check.py` every 5 min -- a stdlib-only, always-exits-0 script that pages a generic JSON webhook (`$MM_ALERT_WEBHOOK`) on engine CRASHED/STALLED, a feed-unhealthy streak >15min, stale BTC data (>2x `--btc-stale-max-s`), low disk, a `settlement_timeout` exit while stopped, resume position discrepancies (`resume_discrepancies` > 0 in heartbeat), a frozen Beuoy bankroll (`bankroll_frozen` -- OR over ladders under multi-expiry), an in-process ladder settlement timeout (`ladder_settlement_timeouts` > 0 -- covers what the STOPPED-based check can no longer see in auto mode), or a sustained `n_expiries_active == 0` while running (>15min; acquisition keeps finding nothing) -- the multi-expiry checks no-op on old heartbeats missing their fields -- de-duped 6h per alert key via `temp/paper_run/control/alert_state.json`. It also sends one daily heartbeat message (state/tick/fills/disk one-liner) at the first check at/after 08:00 UTC (`$MM_HEARTBEAT_HOUR_UTC` overrides the hour, `$MM_HEARTBEAT_DISABLE=1` turns it off; tracked as `heartbeat_last_date` in the state file, not subject to the 6h de-dupe), so webhook silence is distinguishable from a dead alert pipeline. An optional `mm-monitor.service` (documented in `deploy/README.md` section 2, no template file) serves `app/pages/mm_monitor.py` bound to loopback for viewing through an SSH tunnel (`ssh -L 8502:127.0.0.1:8502 <vps>`). An optional `mm-telegram.service` runs `scripts/mm_telegram_bot.py` -- a stdlib-only, read-only Telegram long-polling bot (getUpdates; no inbound endpoint) answering operator slash commands: `/status` (engine_status + heartbeat), `/bankroll` (initial bankroll from run_meta.json + equity from the latest pnl TOTAL row), `/pnl`, `/fills`, `/inventory`, `/quotes`, `/markout`, `/help`. It reuses `$MM_ALERT_WEBHOOK` for credentials (bot token + chat_id parsed from the Telegram sendMessage URL; `$MM_TELEGRAM_TOKEN`/`$MM_TELEGRAM_CHAT_ID` override), hard-allowlists the chat_id (other chats are silently ignored), opens the state db `mode=ro`, and persists its getUpdates offset to `<control-dir>/telegram_bot_state.json` so restarts do not replay commands. Only one instance may poll a given bot token (Telegram 409s a second getUpdates consumer). See `deploy/README.md` for the install walkthrough and the 72h VPS acceptance test procedure.
 
 ### Position Tracking (`core/data/positions.py`)
 

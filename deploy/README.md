@@ -192,6 +192,37 @@ ssh -L 8502:127.0.0.1:8502 <vps-host>
 `--server.address 127.0.0.1` is the security boundary: the dashboard is
 reachable only through the tunnel, no firewall rule needed.
 
+### Optional: Telegram metrics bot (slash commands)
+
+`scripts/mm_telegram_bot.py` (unit template: `deploy/mm-telegram.service`) is
+the query-side counterpart to the alert check: instead of waiting for the
+daily heartbeat, message the alert bot directly and it answers with current
+metrics. Commands: `/status` (engine state, tick, feed, per-expiry),
+`/bankroll` (initial + current equity from the latest pnl TOTAL row), `/pnl`
+(realized/unrealized/settlement breakdown), `/fills` (counts by liquidity,
+last 24h, last fill), `/inventory` (open positions), `/quotes` (latest
+resting quote per market), `/markout` (by-region fill markout), `/help`.
+
+Stdlib-only, read-only (never writes engine state; the state db is opened
+`mode=ro`), long-polling (`getUpdates` -- no inbound endpoint, works behind
+NAT). It reuses the same `MM_ALERT_WEBHOOK` Telegram URL as mm-alert (bot
+token + chat_id are parsed out of it); the chat_id is a hard allowlist --
+messages from any other chat are ignored, never answered.
+
+```bash
+sudo cp deploy/mm-telegram.service /etc/systemd/system/
+sudo mkdir -p /etc/systemd/system/mm-telegram.service.d
+sudo cp /etc/systemd/system/mm-alert.service.d/webhook.conf \
+        /etc/systemd/system/mm-telegram.service.d/webhook.conf
+sudo systemctl daemon-reload
+sudo systemctl enable --now mm-telegram.service
+journalctl -u mm-telegram -f   # the bot logs each poll error / denied chat
+```
+
+Note: only ONE consumer may long-poll a bot's `getUpdates` at a time
+(Telegram returns 409 to the second) -- run a single instance. The push-side
+`sendMessage` webhook used by mm-alert is unaffected and coexists fine.
+
 ## 3. Stopping / starting cleanly
 
 ```bash

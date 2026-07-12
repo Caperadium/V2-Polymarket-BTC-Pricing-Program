@@ -1,0 +1,44 @@
+# mm-telegram.service -- Telegram slash-command metrics bot for mm-paper
+#
+# Long-running daemon (Telegram getUpdates long polling -- no inbound HTTP
+# endpoint, works behind NAT). Runs scripts/mm_telegram_bot.py, which answers
+# operator commands (/status /bankroll /pnl /fills /inventory /quotes
+# /markout) with read-only views of the engine's control-dir files and the
+# MMStateStore sqlite db. It NEVER writes engine state. Template unit; EDIT
+# the placeholders below.
+#
+#   sudo cp deploy/mm-telegram.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now mm-telegram.service
+#
+# Credentials: reuses the same MM_ALERT_WEBHOOK URL as mm-alert.service (bot
+# token and chat_id are parsed out of it), or set MM_TELEGRAM_TOKEN +
+# MM_TELEGRAM_CHAT_ID explicitly. Prefer a drop-in override
+# (/etc/systemd/system/mm-telegram.service.d/webhook.conf) over editing this
+# file in place -- see deploy/README.md.
+#
+# The chat_id is a hard allowlist: the bot silently ignores messages from any
+# other Telegram chat.
+
+[Unit]
+Description=Telegram metrics bot for mm-paper.service (read-only)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+# <EDIT> path to the repo clone on this VPS -- must match mm-paper.service.
+WorkingDirectory=/opt/mm/V2-BTC-Contract-Pricing
+# <EDIT> path to the venv's python.
+ExecStart=/opt/mm/venv/bin/python scripts/mm_telegram_bot.py --control-dir temp/paper_run/control
+# <EDIT> your webhook URL (same value as mm-alert.service).
+Environment=MM_ALERT_WEBHOOK=https://example.invalid/CHANGE-ME
+
+# The bot's own loop already backs off and retries on transport errors;
+# Restart=always covers a crash of the interpreter itself.
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
