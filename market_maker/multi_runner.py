@@ -317,6 +317,7 @@ class MultiExpiryOrchestrator:
         tick_s: float = 15.0,
         vol_gate_fn: Optional[Callable[[], object]] = None,
         data_provider: Optional[BTCDataProvider] = None,
+        markout_provider: Optional[Callable[[], Optional[dict]]] = None,
         adapter_factory: Callable[[Dict[str, str]], Any] = None,
         resolver: Optional[Callable[..., List[Tuple[str, str, list]]]] = None,
         auto_mode: bool = False,
@@ -343,6 +344,13 @@ class MultiExpiryOrchestrator:
         # per-loop providers would hold N copies. refresh() is mtime-gated,
         # so sharing costs nothing.
         self.data_provider = data_provider if data_provider is not None else BTCDataProvider()
+        # wave 2 W7: ONE shared markout-report provider threaded into every
+        # slot's PaperTradingLoop (via _build_slot, the single construction
+        # point) -- markout is a venue/regime property, not per-ladder, so
+        # sharing one callable across slots is correct (matches data_provider
+        # sharing above). None (default) keeps every loop's sizing on the
+        # m_prior path, same as an unwired single-expiry loop.
+        self.markout_provider = markout_provider
         self.adapter_factory = adapter_factory
         self.resolver = resolver
         self.auto_mode = auto_mode
@@ -395,6 +403,7 @@ class MultiExpiryOrchestrator:
             clock=clock,
             vol_gate_fn=self.vol_gate_fn,
             data_provider=self.data_provider,
+            markout_provider=self.markout_provider,
             bankroll=self.bankroll_share,
             tick_dt_s=self.tick_s,
             feed_capability=FeedCapability.FULL_L2,

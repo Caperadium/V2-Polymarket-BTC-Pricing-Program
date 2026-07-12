@@ -471,13 +471,14 @@ def test_last_liquidity_reaches_size_ladder_and_forces_depth_cap(store):
 
 
 # ---------------------------------------------------------------------------
-# mm_sizing_fix_plan.md C1/C2 harness wiring -- size_ladder receives the
-# tick's real inventory snapshot and per-market mkt_mid/strike, not just
-# liquidity (which the test above already covers).
+# mm_sizing_fix_plan.md C1/C2 + mm_sizing_wave2_plan.md W7 harness wiring:
+# size_ladder receives the tick's real inventory snapshot and per-market
+# POSTED prices/strike/markout fields (wave 2 -- mkt_mid no longer exists),
+# and those same posted prices land unchanged on the tick's QuoteSet.
 # ---------------------------------------------------------------------------
 
 
-def test_harness_wires_inventory_and_mkt_mid_and_strike_into_size_ladder(store, monkeypatch):
+def test_harness_wires_inventory_and_posted_prices_and_strike_into_size_ladder(store, monkeypatch):
     import market_maker.harness as harness_mod
     from market_maker.contracts import InventoryState
 
@@ -496,8 +497,6 @@ def test_harness_wires_inventory_and_mkt_mid_and_strike_into_size_ladder(store, 
 
     monkeypatch.setattr(harness_mod, "size_ladder", spy)
 
-    # Two-sided book on every market -> mkt_mid should be computed and threaded
-    # into every ContractSizingInput this tick.
     loop.tick({m: _snapshot_msg(0.5) for m, _k in MARKETS})
 
     assert captured, "size_ladder was not called this tick"
@@ -506,7 +505,88 @@ def test_harness_wires_inventory_and_mkt_mid_and_strike_into_size_ladder(store, 
     assert contracts, "expected at least one ContractSizingInput"
     for c in contracts:
         assert c.strike is not None
-    assert any(c.mkt_mid is not None for c in contracts)
+        # markout fields default-present (cold provider -- no markout_provider
+        # wired on this loop) rather than absent/erroring.
+        assert c.mk_n == 0
+        assert c.mk_n_attempted == 0
+        assert c.mk_avg is None
+        assert c.mk_var is None
+
+    # The posted prices fed to sizing are exactly the QuoteSet's prices for
+    # the same market/tick -- the wave 2 W1/W7 single-computation guarantee.
+    by_market = {c.market_id: c for c in contracts}
+    for m, _k in loop.markets:
+        qs = loop.last_quote_sets[m]
+        c = by_market[m]
+        assert c.bid_price == pytest.approx(qs.bid_price)
+        assert c.ask_price == pytest.approx(qs.ask_price)
+
+
+def test_markout_provider_called_once_per_tick(store):
+    calls = {"n": 0}
+
+    def counting_provider():
+        calls["n"] += 1
+        return None
+
+    loop = PaperTradingLoop(
+        store=store, expiry_key=EXPIRY, markets=MARKETS, engine_fn=_engine(),
+        config=MMConfig(gamma=0.5, k_arrival=1.0), clock=SimClock(START), vol_gate_fn=_vol_gate(),
+        markout_provider=counting_provider,
+    )
+    loop.tick({m: _snapshot_msg(0.5) for m, _k in MARKETS})
+    assert calls["n"] == 1  # NOT once per market (len(MARKETS) == 2)
+
+    loop.tick({m: _snapshot_msg(0.5) for m, _k in MARKETS})
+    assert calls["n"] == 2
+
+
+def test_markout_provider_report_resolves_into_sizing_fields(store):
+    """A wired provider returning a real markout_report()-shaped dict resolves
+    into non-default ContractSizingInput markout fields for a market whose
+    (region, tte_bucket, horizon_s) cell is populated and >= markout_min_n."""
+    import market_maker.harness as harness_mod
+    from market_maker.pnl_report import tte_bucket_label
+
+    cfg = MMConfig(gamma=0.5, k_arrival=1.0)
+    report_holder: dict = {"report": None}
+    loop = PaperTradingLoop(
+        store=store, expiry_key=EXPIRY, markets=MARKETS, engine_fn=_engine(),
+        config=cfg, clock=SimClock(START), vol_gate_fn=_vol_gate(),
+        markout_provider=lambda: report_holder["report"],
+    )
+
+    # Tick once (cold, provider returns None) to learn this tick's actual
+    # tte_bucket/region so the fake report's cell keys line up with what the
+    # harness will look up on the NEXT tick.
+    loop.tick({m: _snapshot_msg(0.5) for m, _k in MARKETS})
+    tte_bucket = tte_bucket_label(max(loop.last_snapshot.tte_days, 0.0))
+    # Both markets are ATM-ish under the sigmoid engine (belly_band default
+    # 0.2-0.8 covers consensus_p here).
+    region = "belly"
+    report_holder["report"] = {
+        "cells": [
+            {"region": region, "tte_bucket": tte_bucket, "horizon_s": cfg.markout_horizon_s,
+             "n": cfg.markout_min_n, "n_attempted": cfg.markout_min_n,
+             "mk_avg": 0.02, "mk_var": 0.0009, "mk_total": 0.02 * cfg.markout_min_n},
+        ],
+        "by_region": {},
+        "by_expiry": {},
+    }
+
+    captured = {}
+    orig_size_ladder = harness_mod.size_ladder
+
+    def spy(*args, **kwargs):
+        captured["args"] = args
+        return orig_size_ladder(*args, **kwargs)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(harness_mod, "size_ladder", spy)
+        loop.tick({m: _snapshot_msg(0.5) for m, _k in MARKETS})
+
+    contracts = captured["args"][0]
+    assert any(c.mk_n == cfg.markout_min_n and c.mk_avg == pytest.approx(0.02) for c in contracts)
 
 
 # ---------------------------------------------------------------------------

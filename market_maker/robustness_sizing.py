@@ -1,5 +1,6 @@
-"""Robustness / sizing layer (plan Section 2.8, task Z1; rewritten per
-temp/mm_sizing_fix_plan.md C1-C5, 2026-07-12).
+"""Robustness / sizing layer (plan Section 2.8, task Z1; wave 1 per
+temp/mm_sizing_fix_plan.md C1-C5; rewritten again per
+temp/mm_sizing_wave2_plan.md W2-W5, 2026-07-12).
 
 Converts edge into stake, never full-Kelly, through a staged pipeline whose every
 stage is recorded in a per-decision audit. The pipeline runs in two spaces:
@@ -9,18 +10,36 @@ naturally share- or notional-denominated).
 
 FRACTION SPACE:
 
-  1. Per-contract Kelly f* (buying YES at edge price P with belief p_hat:
-     b=(1-P)/P, f* = (b*p_hat-(1-p_hat))/b; buying NO is the same form with
-     belief 1-p_hat at NO price 1-P). Negative f* -> 0. The edge price P is the
-     MARKET mid (ContractSizingInput.mkt_mid) when available, falling back to
-     our own quote side (bid_price / 1-ask_price) when it is not (plan C1) --
-     this decouples conviction sizing from our own spread calibration, which
-     the old "edge vs our own quote" form did not.
-  2. Baker-McHale shrink k = f*^2/(f*^2 + ((b+1)/b)^2 * sigma2), using
-     snapshot.sigma2[strike] when the leg's contract carries a strike present
-     in the snapshot's per-strike map, else falling back to sigma2_ladder
-     (plan C4). phi (below) keeps sigma2_ladder -- it is a ladder-level
-     quantity by plan design, not a per-leg one.
+  1. Per-contract Kelly f* -- POSTED-QUOTE edge net of measured markout (wave
+     2 W2, explicit reversal of wave 1's mkt_mid edge choice). Per leg, in the
+     leg's own price scale:
+
+       YES leg: price_leg = bid_price (our posted bid);  belief_leg = p_hat
+       NO  leg: price_leg = 1 - ask_price (our posted ask); belief_leg = 1-p_hat
+
+       structural_edge = belief_leg - price_leg
+       m_prior = structural_edge - config.eps_base   # AS prior charge
+       m = mk_avg if (mk_avg is not None and mk_n >= config.markout_min_n)
+           else m_prior                                # measured net edge
+       m = max(m, 0.0)              # Glosten-Milgrom: negative net edge -> no size
+       f_star, b = kelly_buy(price_leg + m, price_leg)  # belief_eff = price_leg + m
+
+     bid_price/ask_price are now the POSTED quote prices (the caller passes
+     post-spread-builder prices, not our raw proposal) -- this is the
+     Chen-Pennock utility-maker frame: Kelly at our OWN posted quote, belief
+     haircut by measured adverse selection (realized-spread decomposition),
+     not the market mid. The shifted-belief form of kelly_buy makes the
+     resulting Kelly edge algebraically equal to exactly m at odds
+     b=(1-price_leg)/price_leg -- no separate "edge" helper is needed.
+  2. Baker-McHale shrink k = f*^2/(f*^2 + ((b+1)/b)^2 * sigma2_edge), where
+     sigma2_edge is the markout-measurement variance of the SAME leg's net
+     edge (wave 2 W2): sigma2_edge = mk_var/mk_n when measured (mk_n >=
+     markout_min_n), else config.markout_prior_var (an uninformed prior).
+     The per-strike/per-ladder MC-SE snapshot.sigma2 is DROPPED from leg
+     shrinkage as of wave 2 (it double-charged the spread bet against a
+     model-parameter uncertainty that is a different quantity from
+     fill-level adverse selection); snapshot sigma2_ladder is kept for phi
+     (below) and for audit only.
   3. Bankroll utilization cap: total fraction across all legs <= bankroll_util_cap
      of paper bankroll. Records BANKROLL when binding.
   4. Fractional-Kelly ceiling c<=0.5 -- the LAST fraction-space ceiling, records
@@ -30,20 +49,59 @@ SHARE SPACE (fractions convert to shares via shares = f*bankroll/price_per_share
 where price_per_share is OUR quote side: P for a YES bet at our bid, 1-P for a
 NO bet at our ask -- the capital actually at risk per share if filled):
 
-  5. Presence floor (plan C3): leg_shares = max(kelly_shares, presence_shares),
-     where presence_shares = presence_frac * bankroll / price_per_share, tapered
-     toward zero as inventory on that side approaches q_max. A pure floor -- it
-     only ever raises a leg's size, never lowers one respected by a firmer cap
-     below. Records an audit "presence_floor" stage; does NOT add a SizingCap
-     member (the floor is not a cap).
+  5. Presence floor (wave 1 C3, GATED as of wave 2 W4): leg_shares =
+     max(kelly_shares, presence_shares), where presence_shares =
+     presence_frac * bankroll / price_per_share, tapered toward zero as
+     inventory on that side approaches q_max. Gated on measured net edge:
+
+       m_gate = mk_avg when (mk_avg is not None and mk_n >= markout_min_n)
+                else m_prior                       # NOT clamped at 0 here
+       gate = (m_gate >= 0.0) or (mk_n_attempted < config.markout_min_n)
+       floor applies only when gate is True
+
+     The exploration carve-out (mk_n_attempted < markout_min_n -> gate stays
+     True regardless of m_gate's sign) is the anti-starvation clause: an
+     unmeasured cell keeps the floor so fills can accumulate -- fills are the
+     only source of markout/k/credibility calibration. A cold-start leg (no
+     markout fields at all, mk_n_attempted=0) is always in the exploration
+     carve-out, so it behaves exactly as wave 1 (unconditional floor). Once
+     measured (mk_n_attempted >= min_n) with a negative net edge, the floor
+     turns off on that side. A pure floor otherwise -- it only ever raises a
+     leg's size, never lowers one respected by a firmer cap below. Records an
+     audit "presence_floor" stage; does NOT add a SizingCap member (the floor
+     is not a cap).
+  5b. Reduce-side exemption (wave 2 W3): the f*>=0 floor above (and the Kelly
+     edge itself) can zero the inventory-UNLOAD side exactly when skew
+     exceeds the effective spread -- cash-EV Kelly cannot see the
+     risk-relief utility of shedding inventory. Fix, UNGATED, applied at the
+     same pipeline position as the presence floor (before headroom/depth/
+     bucket caps -- caps still dominate):
+
+       if q > 0: the ask/NO leg is this market's reduce side
+       if q < 0: the bid/YES leg is the reduce side
+       reduce_floor = min(abs(q), s_presence)   # s_presence: UNtapered wave-1
+                                                 # floor unit for that leg
+       leg_shares = max(leg_shares, reduce_floor)   # unconditional
+
+     MAGNITUDE LIMITATION (explicit): min(|q|, s_presence) restores PRESENCE
+     on the unload side (a floor-sized clip), not shedding capacity
+     proportional to the excess -- a large position unwinds over multiple
+     fills, not one; proportional unload sizing belongs to the Kelly path
+     once measured markout data exists on that side. Directive suppression
+     still wins downstream (build_quote_set mode zeroing) -- this exemption
+     cannot resurrect a PULLED/one-sided market's suppressed side.
   6. Inventory headroom cap (plan C2): bid_shares <= q_max - q, ask_shares <=
      q_max + q, from InventoryState when provided. Records INVENTORY when
      binding.
-  7. Depth cap: quote size also bounded by LiquidityState realized depth per
-     side when provided (inert when absent). Records DEPTH when binding. Runs
-     AFTER the presence floor and inventory cap so it remains a hard minimum
-     over both (a floored-then-inventory-capped size that still exceeds
-     realized depth is clipped to depth, exactly as before the floor existed).
+  7. Depth cap, FLOORED (wave 2 W5): quote size bounded by
+     max(realized_depth_side, config.depth_cap_floor_shares) rather than raw
+     realized_depth_side -- a dead book (realized_depth=0) no longer
+     permanently zeroes our size; the depth cap's purpose is impact control,
+     not presence control. Records DEPTH when binding. Runs AFTER the
+     presence floor, reduce-side exemption, and inventory cap so it remains a
+     hard minimum over all three (a floored-then-inventory-capped size that
+     still exceeds the floored depth bound is clipped to it, exactly as
+     before the floor existed).
   8. Bucket worst-case recheck (plan C5): the ladder's strikes partition
      terminal spot into buckets; within a bucket, every leg that loses (YES at
      K loses iff spot <= K; NO at K loses iff spot > K) contributes its
@@ -68,7 +126,9 @@ always). caps_applied display order (_CAP_ORDER) keeps FRACTIONAL_C last
 for readability; that ordering is cosmetic and does not describe execution
 order.
 
-Depends only on market_maker.contracts, market_maker.config and stdlib.
+Depends only on market_maker.contracts, market_maker.config and stdlib
+(deliberately NOT market_maker.pnl_report -- all markout lookups resolve in
+the harness and arrive as plain fields on ContractSizingInput).
 """
 from __future__ import annotations
 
@@ -106,28 +166,43 @@ _CAP_ORDER = [
 class ContractSizingInput:
     """One ladder contract to size.
 
-    bid_price/ask_price are OUR OWN quote sides (we buy YES at bid_price, we
-    sell YES / buy NO at 1-ask_price): they feed price_per_share, the capital
-    at risk per share if filled. They are NOT the edge price used for Kelly.
+    bid_price/ask_price are now the POSTED quote prices (wave 2 W1/W2): the
+    harness computes these via spread_builder.compute_posted_prices and
+    passes them here BEFORE sizing runs, then feeds the same tuple into
+    build_quote_set(posted=...) so the two never disagree. They serve two
+    roles: (a) price_per_share, the capital at risk per share if filled
+    (bid_price for a YES buy, 1-ask_price for a NO buy); (b) as of wave 2,
+    they are also the edge price itself -- Kelly compares belief against our
+    OWN posted quote (Chen-Pennock utility-maker frame), not the market mid
+    (mkt_mid, wave 1's edge choice, is REMOVED as of wave 2 -- see W2 in the
+    module docstring).
 
-    mkt_mid is the market's own mid (YES-scale), and IS the edge price when
-    present: Kelly compares belief p_hat against mkt_mid (YES leg) / 1-mkt_mid
-    (NO leg). When mkt_mid is None, the edge price falls back to our own quote
-    side (bid_price / 1-ask_price) -- the pre-C1 behavior.
+    mk_avg/mk_var/mk_n/mk_n_attempted are the resolved markout-measurement
+    cell for this market at the sizing horizon (wave 2 W2/W6, via
+    pnl_report.markout_stats, resolved by the harness -- this module never
+    imports pnl_report). Sign convention matches pnl_report.markout_report:
+    mk = sign*(mid_h - fill_price), so mk_avg > 0 means we kept value on
+    average. All default to "unmeasured" (None/0) so a caller that never
+    wires markout data gets the m_prior fallback path everywhere.
 
     strike is optional; when provided and present in the PricerSnapshot's
-    per-strike sigma2 map, it selects that leg's Baker-McHale sigma2 (plan C4)
-    and participates in the bucket worst-case recheck (plan C5). Missing
-    strikes fall back to sigma2_ladder for shrinkage and to a conservative
-    sum-cap fallback for the bucket recheck (see size_ladder).
+    per-strike sigma2 map, it participates in the bucket worst-case recheck
+    (plan C5). Missing strikes fall back to a conservative sum-cap fallback
+    for the bucket recheck (see size_ladder). NOTE: as of wave 2 W2 the
+    per-strike snapshot.sigma2 map is no longer used for leg shrinkage
+    (sigma2_edge instead); strike's only remaining sizing role is the bucket
+    recheck.
     """
 
     market_id: str
     p_hat: float
     bid_price: float
     ask_price: float
-    mkt_mid: Optional[float] = None
     strike: Optional[float] = None
+    mk_avg: Optional[float] = None
+    mk_var: Optional[float] = None
+    mk_n: int = 0
+    mk_n_attempted: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -162,6 +237,39 @@ def baker_mchale(f_star: float, b: float, sigma2: float) -> float:
     return max(0.0, min(1.0, k))
 
 
+def _leg_edge(
+    price_leg: float,
+    belief_leg: float,
+    mk_avg: Optional[float],
+    mk_var: Optional[float],
+    mk_n: int,
+    config: MMConfig,
+) -> Tuple[float, float, float]:
+    """Wave 2 W2 per-leg edge/variance resolution, shared by the YES and NO
+    legs (both are computed in the leg's own price scale, so this one
+    function serves both -- see the module docstring's explicit per-side
+    frame). Returns (m_gate, m_clamped, sigma2_edge):
+
+      structural_edge = belief_leg - price_leg
+      m_prior = structural_edge - config.eps_base
+      measured = mk_avg is not None and mk_n >= config.markout_min_n
+      m_gate = mk_avg if measured else m_prior      # UNclamped, for the W4 floor gate
+      m_clamped = max(m_gate, 0.0)                   # Glosten-Milgrom floor at 0
+      sigma2_edge = (mk_var / mk_n) if (measured and mk_var is not None)
+                    else config.markout_prior_var
+    """
+    structural_edge = belief_leg - price_leg
+    m_prior = structural_edge - config.eps_base
+    measured = mk_avg is not None and mk_n >= config.markout_min_n
+    m_gate = mk_avg if measured else m_prior
+    m_clamped = max(m_gate, 0.0)
+    if measured and mk_var is not None and mk_n > 0:
+        sigma2_edge = mk_var / mk_n
+    else:
+        sigma2_edge = config.markout_prior_var
+    return m_gate, m_clamped, sigma2_edge
+
+
 # ---------------------------------------------------------------------------
 # Internal per-leg record
 # ---------------------------------------------------------------------------
@@ -177,6 +285,8 @@ class _Leg:
     b: float
     k_shrink: float
     f: float  # working fraction through the fraction-space stages
+    m_gate: float = 0.0  # wave 2 W4: measured net edge (unclamped) used for the floor gate
+    sigma2_edge: float = 0.0  # wave 2 W2: markout-measurement variance used for Baker-McHale
     shares: float = 0.0  # working shares through the share-space stages
 
 
@@ -203,32 +313,40 @@ def size_ladder(
     sigma2_ladder = float(snapshot.sigma2_ladder)  # common-mode ladder variance
     audit: Dict[str, Any] = {"stages": [], "sigma2_ladder": sigma2_ladder}
 
-    # Stage 1 + 2: build legs (YES via bid, NO via ask). Edge price is
-    # mkt_mid when available (plan C1); price_per_share stays our own quote
-    # side regardless. Baker-McHale sigma2 is per-strike when available
-    # (plan C4), else falls back to the ladder common mode.
+    # Stage 1 + 2 (wave 2 W2): build legs (YES via bid, NO via ask). Edge is
+    # now the POSTED-quote edge net of measured markout (see _leg_edge and the
+    # module docstring) -- mkt_mid is gone. Baker-McHale sigma2 is the
+    # markout-measurement variance of the SAME leg's net edge (sigma2_edge),
+    # not the pricer's per-strike/ladder MC-SE.
     legs: List[_Leg] = []
     for c in contracts:
-        leg_sigma2 = sigma2_ladder
-        if c.strike is not None and c.strike in snapshot.sigma2:
-            leg_sigma2 = float(snapshot.sigma2[c.strike])
-
-        yes_edge_price = c.mkt_mid if c.mkt_mid is not None else c.bid_price
-        f_yes, b_yes = kelly_buy(c.p_hat, yes_edge_price)
-        k_yes = baker_mchale(f_yes, b_yes, leg_sigma2)
+        yes_price = c.bid_price
+        yes_belief = c.p_hat
+        m_gate_yes, m_yes, sigma2_yes = _leg_edge(
+            yes_price, yes_belief, c.mk_avg, c.mk_var, c.mk_n, config
+        )
+        f_yes, b_yes = kelly_buy(yes_price + m_yes, yes_price)
+        k_yes = baker_mchale(f_yes, b_yes, sigma2_yes)
         legs.append(
-            _Leg(c.market_id, True, c.strike, c.bid_price, f_yes, b_yes, k_yes, f_yes * k_yes)
+            _Leg(c.market_id, True, c.strike, yes_price, f_yes, b_yes, k_yes, f_yes * k_yes,
+                 m_gate=m_gate_yes, sigma2_edge=sigma2_yes)
         )
 
-        no_price_per_share = 1.0 - c.ask_price
-        no_edge_price = (1.0 - c.mkt_mid) if c.mkt_mid is not None else no_price_per_share
-        f_no, b_no = kelly_buy(1.0 - c.p_hat, no_edge_price)
-        k_no = baker_mchale(f_no, b_no, leg_sigma2)
+        no_price = 1.0 - c.ask_price
+        no_belief = 1.0 - c.p_hat
+        m_gate_no, m_no, sigma2_no = _leg_edge(
+            no_price, no_belief, c.mk_avg, c.mk_var, c.mk_n, config
+        )
+        f_no, b_no = kelly_buy(no_price + m_no, no_price)
+        k_no = baker_mchale(f_no, b_no, sigma2_no)
         legs.append(
-            _Leg(c.market_id, False, c.strike, no_price_per_share, f_no, b_no, k_no, f_no * k_no)
+            _Leg(c.market_id, False, c.strike, no_price, f_no, b_no, k_no, f_no * k_no,
+                 m_gate=m_gate_no, sigma2_edge=sigma2_no)
         )
     audit["stages"].append(
-        {"stage": "kelly+baker_mchale", "f": [(lg.market_id, lg.is_yes, lg.f) for lg in legs]}
+        {"stage": "kelly+baker_mchale",
+         "f": [(lg.market_id, lg.is_yes, lg.f) for lg in legs],
+         "sigma2_edge": [(lg.market_id, lg.is_yes, lg.sigma2_edge) for lg in legs]}
     )
 
     triggered = set()
@@ -261,15 +379,38 @@ def size_ladder(
         if lg.f > 0.0 and lg.price_per_share > 0.0:
             lg.shares = lg.f * bankroll / lg.price_per_share
 
-    # Stage 5: presence floor (plan C3). A pure floor: only ever raises a
-    # leg's shares. presence_frac<=0 disables (floor contributes 0).
+    # Stage 5: presence floor (plan C3), GATED on measured net edge as of
+    # wave 2 W4. A pure floor when gated on: only ever raises a leg's
+    # shares. presence_frac<=0 disables (floor contributes 0) independent of
+    # the gate.
+    #
+    # gate = (m_gate >= 0.0) or (mk_n_attempted < markout_min_n)   -- W4
+    # m_gate is the leg's UNclamped measured/prior net edge (set in Stage 1);
+    # the exploration carve-out (n_attempted below the trust threshold) keeps
+    # the floor ON regardless of m_gate's sign so a never-measured cell can
+    # accumulate fills. mk_n_attempted is per-CONTRACT (ContractSizingInput),
+    # shared by both legs of that market (one measurement cell), so we look
+    # it up by market_id via the original contracts, not per-leg.
+    mk_n_attempted_by_market: Dict[str, int] = {c.market_id: c.mk_n_attempted for c in contracts}
     inv_by_market: Dict[str, Any] = dict(inventory.per_contract) if inventory is not None else {}
     presence_info: List[Dict[str, Any]] = []
+    # s_presence_by_leg: the UNtapered wave-1 floor unit per leg, needed by
+    # both the (tapered, gated) presence floor below and the (untapered,
+    # ungated) reduce-side exemption (Stage 5b) -- computed once here.
+    s_presence_by_leg: Dict[Tuple[str, bool], float] = {}
+    for lg in legs:
+        if lg.price_per_share > 0.0:
+            s_presence_by_leg[(lg.market_id, lg.is_yes)] = (
+                config.presence_frac * bankroll / lg.price_per_share
+            )
+
     if config.presence_frac > 0.0:
         for lg in legs:
-            if lg.price_per_share <= 0.0:
+            s_presence = s_presence_by_leg.get((lg.market_id, lg.is_yes))
+            if s_presence is None:
                 continue
-            s_presence = config.presence_frac * bankroll / lg.price_per_share
+            n_attempted = mk_n_attempted_by_market.get(lg.market_id, 0)
+            gate = (lg.m_gate >= 0.0) or (n_attempted < config.markout_min_n)
             taper = 1.0
             cinv = inv_by_market.get(lg.market_id)
             if cinv is not None:
@@ -278,14 +419,42 @@ def size_ladder(
                 else:
                     q_toward_side = cinv.q if lg.is_yes else -cinv.q
                     taper = max(0.0, min(1.0, 1.0 - q_toward_side / cinv.q_max))
-            presence_shares = s_presence * taper
+            presence_shares = (s_presence * taper) if gate else 0.0
             if presence_shares > lg.shares:
                 lg.shares = presence_shares
             presence_info.append(
                 {"market_id": lg.market_id, "is_yes": lg.is_yes,
-                 "presence_shares": presence_shares, "taper": taper}
+                 "presence_shares": presence_shares, "taper": taper, "gate": gate}
             )
     audit["stages"].append({"stage": "presence_floor", "legs": presence_info})
+
+    # Stage 5b: reduce-side exemption (wave 2 W3), UNGATED -- shedding
+    # inventory is utility-positive via a risk-relief term cash-EV Kelly
+    # ignores, so this floor applies regardless of the W4 gate above. Applied
+    # in share space at the same pipeline position as the presence floor
+    # (before headroom/depth/bucket caps -- caps still dominate).
+    reduce_info: List[Dict[str, Any]] = []
+    if inventory is not None:
+        for lg in legs:
+            cinv = inv_by_market.get(lg.market_id)
+            if cinv is None or cinv.q == 0.0:
+                continue
+            # q > 0 (net long YES): the ask/NO leg is the reduce side.
+            # q < 0 (net long NO / short YES): the bid/YES leg is the reduce side.
+            is_reduce_side = (not lg.is_yes) if cinv.q > 0.0 else lg.is_yes
+            if not is_reduce_side:
+                continue
+            s_presence = s_presence_by_leg.get((lg.market_id, lg.is_yes))
+            if s_presence is None:
+                continue
+            reduce_floor = min(abs(cinv.q), s_presence)
+            if reduce_floor > lg.shares:
+                lg.shares = reduce_floor
+                reduce_info.append(
+                    {"market_id": lg.market_id, "is_yes": lg.is_yes,
+                     "reduce_floor": reduce_floor, "q": cinv.q}
+                )
+    audit["stages"].append({"stage": "reduce_side_exemption", "legs": reduce_info})
 
     # Stage 6: inventory headroom cap (plan C2) -- hard min.
     max_add_yes: Dict[str, float] = {}
@@ -313,19 +482,24 @@ def size_ladder(
 
     # Stage 7: depth cap -- hard min, AFTER the floor and inventory cap
     # (CRITICAL: must stay a hard min here so a pre-existing depth-binding
-    # size is unaffected by the floor's max()).
+    # size is unaffected by the floor's max()). FLOORED as of wave 2 W5: the
+    # bound is max(realized_depth_side, config.depth_cap_floor_shares), not
+    # raw realized_depth_side -- a dead book (realized_depth=0) no longer
+    # permanently zeroes size; depth control is for impact, not presence.
     if liquidity is not None:
         for lg in legs:
             liq = liquidity.get(lg.market_id)
             if liq is None:
                 continue
             if lg.is_yes:
-                if lg.shares > liq.realized_depth_bid + 1e-12:
-                    lg.shares = liq.realized_depth_bid
+                depth_bound = max(liq.realized_depth_bid, config.depth_cap_floor_shares)
+                if lg.shares > depth_bound + 1e-12:
+                    lg.shares = depth_bound
                     triggered.add(SizingCap.DEPTH)
             else:
-                if lg.shares > liq.realized_depth_ask + 1e-12:
-                    lg.shares = liq.realized_depth_ask
+                depth_bound = max(liq.realized_depth_ask, config.depth_cap_floor_shares)
+                if lg.shares > depth_bound + 1e-12:
+                    lg.shares = depth_bound
                     triggered.add(SizingCap.DEPTH)
 
     # Stage 8: bucket worst-case recheck (plan C5) -- final share-space

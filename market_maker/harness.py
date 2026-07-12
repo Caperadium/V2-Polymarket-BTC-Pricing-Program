@@ -56,7 +56,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
-from market_maker.config import MMConfig
+from market_maker.config import MMConfig, in_belly_band
 from market_maker.contracts import (
     AnchorMethod,
     BankrollState,
@@ -82,6 +82,7 @@ from market_maker.liquidity_monitor import LiquidityMonitor
 from market_maker.market_data_client import BookMirror, FeedCapability
 from market_maker.order_lifecycle import OrderLifecycleManager, PaperVenueAdapter, SimClock
 from market_maker.paper_fill_sim import PaperFillSimulator
+from market_maker.pnl_report import markout_stats, tte_bucket_label
 from market_maker.pricer_adapter import build_snapshot
 from market_maker.quote_engine import estimate_sigma_b, make_quote_from_config
 from market_maker.risk_controller import InvBreach, RiskController
@@ -92,7 +93,7 @@ from market_maker.settlement_handler import (
     SettlementHandler,
     settlement_instant_utc,
 )
-from market_maker.spread_builder import build_quote_set
+from market_maker.spread_builder import build_quote_set, compute_posted_prices
 from market_maker.state_store import MMStateStore
 
 logger = logging.getLogger("mm.harness")
@@ -172,6 +173,7 @@ class PaperTradingLoop:
         clock: Optional[SimClock] = None,
         vol_gate_fn: Optional[Callable[[], object]] = None,
         data_provider: Optional[BTCDataProvider] = None,
+        markout_provider: Optional[Callable[[], Optional[dict]]] = None,
         bankroll: float = 1000.0,
         tick_dt_s: float = 60.0,
         quote_variant: str = "dalen",
@@ -187,6 +189,10 @@ class PaperTradingLoop:
         self.config = config or MMConfig()
         self.clock = clock or SimClock(datetime(2026, 7, 1, 12, 0, tzinfo=timezone.utc))
         self.engine_fn = engine_fn
+        # wave 2 W7: optional callable returning the latest markout_report()
+        # dict (or None -- cold start / never wired). Called ONCE per tick by
+        # _compose_quote_sets, never per-market.
+        self.markout_provider = markout_provider
         self.bankroll = bankroll
         self.tick_dt_s = tick_dt_s
         self.quote_variant = quote_variant
@@ -325,8 +331,9 @@ class PaperTradingLoop:
         liquidity: Optional[Dict[str, LiquidityState]] = None,
         market_states: Optional[Dict[str, Any]] = None,
     ) -> List[Tuple[float, str, QuoteSet]]:
-        """Quote engine -> sizing -> spread builder for the whole ladder. A
-        seam the forced-no-arb test monkeypatches to inject a crossing ladder.
+        """Quote engine -> posted prices -> sizing -> QuoteSet for the whole
+        ladder. A seam the forced-no-arb test monkeypatches to inject a
+        crossing ladder.
 
         `liquidity` (W1.1): dict market_id -> LiquidityState, forwarded to
         `size_ladder(liquidity=...)` so the DEPTH cap actually binds; the
@@ -335,17 +342,30 @@ class PaperTradingLoop:
         the DEPTH cap inert, matching prior behavior.
 
         `market_states` (plan C1): dict market_id -> MarketState, the same
-        dict `tick()` builds in step 1. Used ONLY to compute the SIZING mid
-        (ContractSizingInput.mkt_mid) under a both-sides-present-and-uncrossed
-        guard; deliberately NOT `_market_mid()`, whose one-sided fallback
-        would violate the mkt_mid=None fallback contract in
-        robustness_sizing (a one-sided book must fall back to old
-        edge-vs-our-own-quote behavior, not a fake mid)."""
+        dict `tick()` builds in step 1. No longer used to compute a sizing
+        mid (wave 2 W2 removed ContractSizingInput.mkt_mid -- sizing now
+        edges off our OWN posted quote, not the market mid); kept as a
+        parameter for signature stability in case a future caller needs it.
+
+        Wave 2 W1/W7 ordering: for each market, build the proposal, then
+        `compute_posted_prices` (the six-term spread builder, computed ONCE),
+        then feed the posted bid/ask into `ContractSizingInput` (both as the
+        capital-at-risk price basis and as the Kelly edge price) plus this
+        tick's resolved markout stats (W6, via `markout_stats`), THEN size
+        the ladder, THEN `build_quote_set(..., posted=...)` so the QuoteSet's
+        prices are exactly the ones sizing used -- never recomputed."""
         cfg = self.config
         now = self.clock.now()
         tte = max(snap.tte_days, 0.0)
 
+        # W7: pull the latest markout report ONCE per tick (not per market).
+        # A cold/unwired provider (None) or an empty report (None return)
+        # both degrade every market to the m_prior path in robustness_sizing.
+        report = self.markout_provider() if self.markout_provider is not None else None
+        tte_bucket = tte_bucket_label(tte)
+
         proposals = {}
+        posted_by_market: Dict[str, Tuple[float, float, Dict[str, float]]] = {}
         contracts: List[ContractSizingInput] = []
         # sigma_b sampling stride: estimate on consensus-x subsampled to
         # >= cfg.sigma_b_sample_s so tick-frequency microstructure noise
@@ -377,16 +397,28 @@ class PaperTradingLoop:
             )
             proposals[m] = prop
 
-            ms = (market_states or {}).get(m)
-            mkt_mid = None
-            if (ms is not None and ms.best_bid is not None and ms.best_ask is not None
-                    and ms.best_bid < ms.best_ask):
-                mkt_mid = 0.5 * (float(ms.best_bid) + float(ms.best_ask))
+            consensus_p_k = float(fv.consensus_p[k])
+            posted = compute_posted_prices(
+                prop, directives[m], self.venue_descriptor, cfg,
+                sigma2=float(snap.sigma2[k]), confidence_tier=snap.confidence_tier,
+                credibility=fv.credibility, consensus_p=consensus_p_k, tte_days=tte,
+            )
+            posted_by_market[m] = posted
+            posted_bid, posted_ask, _terms = posted
+
+            region = "belly" if in_belly_band(consensus_p_k, cfg.belly_band) else "wing"
+            if report is not None:
+                mk_avg, mk_var, mk_n, mk_n_attempted = markout_stats(
+                    report, region, tte_bucket, cfg.markout_horizon_s, cfg.markout_min_n
+                )
+            else:
+                mk_avg, mk_var, mk_n, mk_n_attempted = None, None, 0, 0
 
             contracts.append(
                 ContractSizingInput(market_id=m, p_hat=float(fv.consensus_p[k]),
-                                    bid_price=prop.p_bid_raw, ask_price=prop.p_ask_raw,
-                                    mkt_mid=mkt_mid, strike=float(k))
+                                    bid_price=posted_bid, ask_price=posted_ask,
+                                    strike=float(k), mk_avg=mk_avg, mk_var=mk_var,
+                                    mk_n=mk_n, mk_n_attempted=mk_n_attempted)
             )
         self.last_proposals = proposals
 
@@ -408,6 +440,7 @@ class PaperTradingLoop:
                 sigma2=float(snap.sigma2[k]), confidence_tier=snap.confidence_tier,
                 credibility=fv.credibility, consensus_p=float(fv.consensus_p[k]),
                 source_seq=self._tick, ts=now, tte_days=tte,
+                posted=posted_by_market[m],
             )
             out.append((k, m, qs))
         return out

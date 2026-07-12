@@ -504,6 +504,25 @@ def run(argv: Optional[List[str]] = None) -> int:
         db_existed = state_db_path.exists()
         store = MMStateStore(str(state_db_path))
 
+        # wave 2 W7: seed the shared markout-report holder from the
+        # persistent store's own fills BEFORE the orchestrator/loops are
+        # built, so a restart does not lose a week of measurement (the
+        # holder stays {"report": None} on a fresh/empty store -- guarded,
+        # never fatal). The SAME holder is updated at the periodic
+        # markout_report() write further below so every slot's loop (via
+        # markout_provider=holder.get lambda) always sees the latest report.
+        _markout_holder: Dict[str, Optional[dict]] = {"report": None}
+        try:
+            _seed_fills = store.get_fills()
+            if _seed_fills:
+                _markout_holder["report"] = markout_report(
+                    _seed_fills, store.mid_at_or_after,
+                    store.get_market_registry(), MMConfig().belly_band,
+                    now=datetime.now(timezone.utc),
+                )
+        except Exception:
+            logger.warning("markout report seed failed; starting on the m_prior sizing path", exc_info=True)
+
         from core.strategy.vol_gate import compute_vol_gate
 
         btc_df = _read_btc_intraday(_BTC_INTRADAY_PATH)
@@ -522,6 +541,11 @@ def run(argv: Optional[List[str]] = None) -> int:
             tick_s=args.tick_s,
             vol_gate_fn=live_vol_gate,
             data_provider=_DATA_PROVIDER,
+            # wave 2 W7: one shared provider over the holder seeded above; the
+            # periodic markout_report() write further below (existing C4
+            # cadence) updates the SAME holder in place, so every slot's loop
+            # picks up the latest report without any additional wiring.
+            markout_provider=lambda: _markout_holder["report"],
             # Late-binding lambdas so the existing monkeypatch seams
             # (paper_runner.PolymarketFeedAdapter / .resolve_events_multi)
             # keep working -- the names resolve against THIS module's globals
@@ -859,6 +883,10 @@ def run(argv: Optional[List[str]] = None) -> int:
                                 now=now,
                             )
                             _write_json_atomic(out_dir / "markout_report.json", report_json)
+                            # wave 2 W7: keep the shared sizing-provider holder
+                            # current -- every slot's loop reads this same
+                            # dict via markout_provider=lambda: holder["report"].
+                            _markout_holder["report"] = report_json
                             store.prune_mid_log(now - timedelta(seconds=MARKOUT_LOOKBACK_S))
                     except Exception:
                         logger.warning("markout report failed at tick %d", tick_n, exc_info=True)

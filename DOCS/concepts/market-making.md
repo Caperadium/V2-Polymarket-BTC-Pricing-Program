@@ -447,7 +447,7 @@ limits that are naturally share- or notional-denominated). The design maxim:
 **never full-Kelly, and record every cap that binds** (each decision carries a
 `caps_applied` audit list).
 
-### 8.1 Kelly, then shrink it
+### 8.1 Kelly at our own posted quote, haircut by measured markout
 
 For a binary bought at price P with believed win probability p, define net
 odds b = (1 - P)/P. The **Kelly fraction** -- the bankroll fraction maximizing
@@ -457,41 +457,91 @@ long-run log wealth if your belief is exactly right --
 f* = ( b*p - (1 - p) ) / b
 ```
 
-is computed per contract for both legs: a YES leg (belief p_hat) and a NO leg
-(belief 1 - p_hat). **P is the market's own mid** (the current best-bid/ask
-midpoint on the venue, when both sides are present and uncrossed), not our own
-quote -- Kelly's edge is our belief against the market's belief, and pricing
-that edge off our own quote would make sizing move backwards whenever spread
-calibration changes (a real regression fixed 2026-07-12: a spread-arrival
-recalibration mechanically collapsed flat-inventory sizes ~10x, because the
-"edge" was self-referential against our own tightened quote). When no
-reliable market mid is available (one-sided or crossed book), sizing falls
-back to the pre-fix form -- edge vs our own quote side (bid_price /
-1 - ask_price). Negative f* means no edge on that side: size zero. Separately,
-`price_per_share` (used for the fraction-to-shares conversion below) is
-*always* our own quote side -- the edge price and the capital-at-risk price
-are different quantities that happen to coincide only in the fallback case.
+is computed per contract for both legs: a YES leg (belief p_hat, price = our
+own posted bid) and a NO leg (belief 1 - p_hat, price = 1 - our own posted
+ask). **P is our own posted quote** (the price the spread builder actually
+puts on the book, after all six spread terms), not the market mid -- this is
+the literature-correct maker frame (Chen-Pennock utility-maker; AS/GLFT
+depth-as-edge): as a maker, the bet you are actually making is "I get filled
+at P and the true value is p" -- the edge lives at the quote you post, not at
+whatever the rest of the book happens to show. `bid_price`/`ask_price` on
+`ContractSizingInput` are computed once by `spread_builder.compute_posted_prices`
+and fed both into sizing and into the final `QuoteSet`, so the two can never
+disagree.
 
-Kelly's catch is the *if your belief is exactly right*. It is notoriously
-aggressive under estimation error -- overbetting is punished far more than
-underbetting. The **Baker-McHale shrinkage** discounts f* by how uncertain
-p_hat is, using the leg's own strike's sigma2 when available (falling back to
-the ladder-common sigma2 otherwise):
+Believing our own posted edge outright would double-count: the spread already
+has an adverse-selection buffer baked in, and unmodeled adverse selection
+beyond that buffer needs to be haircut out of the edge before Kelly sees it.
+That haircut is **measured markout** where evidence exists, and a **prior AS
+charge** otherwise:
 
 ```
-k_shrink = f*^2 / ( f*^2  +  ((b+1)/b)^2 * sigma2 )        f <- f* * k_shrink
+structural_edge = belief - price                 # e.g. p_hat - our_posted_bid
+m_prior         = structural_edge - eps_base      # AS prior charge
+m = mk_avg   if (measured: mk_n >= markout_min_n)
+    m_prior  otherwise
+m = max(m, 0)                                     # Glosten-Milgrom: no edge -> no size
+f*, b = kelly_buy(price + m, price)               # belief_eff = price + m
 ```
 
-When sigma2 = 0 (perfect estimate) k = 1 and full Kelly stands; as uncertainty
-grows relative to the edge, k -> 0. Note this is exactly where the wing
-posterior substitution earns its keep: without it, the near-zero MC error at
-the wings would tell Baker-McHale the tails are precisely estimated -- the
-opposite of the truth. Pricing per-strike (rather than one ladder-wide
-sigma2 applied to every leg) means a wing leg's larger parameter uncertainty
-shrinks that leg specifically, instead of over-shrinking the whole ladder to
-the wing's level or under-shrinking the wings to the ATM level.
+`mk_avg` is the per-fill realized markout for this market's (region,
+tte_bucket, horizon) cell from `pnl_report.markout_report` -- the actual
+value captured net of adverse price movement after each fill, the
+Conrad-Wahal "realized spread" -- resolved once per tick by the harness via
+`pnl_report.markout_stats` and passed in on `ContractSizingInput.mk_avg` /
+`mk_var` / `mk_n` / `mk_n_attempted`. Below `markout_min_n` fills in that
+cell the measurement is not trusted yet, and sizing falls back to the prior:
+structural edge minus the adverse-selection buffer already charged in the
+spread. A cold-start ladder (no fills yet anywhere) runs entirely on the
+prior path everywhere -- this is what restores the size-to-spread coupling a
+2026-07-12 defect had severed (sizing on the raw pre-widen proposal, with no
+adverse-selection haircut at all, left size unconditionally coupled to
+`p_hat` alone regardless of how thin the posted spread actually was).
 
-### 8.2 The ladder bets one event
+Kelly's other catch is the *if your belief is exactly right*. It is
+notoriously aggressive under estimation error -- overbetting is punished far
+more than underbetting. The **Baker-McHale shrinkage** discounts f* by how
+uncertain the *edge* m is (not by how uncertain the terminal-price model
+p_hat is -- see the note at the end of this section):
+
+```
+k_shrink = f*^2 / ( f*^2  +  ((b+1)/b)^2 * sigma2_edge )        f <- f* * k_shrink
+
+sigma2_edge = mk_var / mk_n         when measured (mk_n >= markout_min_n)
+              config.markout_prior_var   otherwise (uninformed prior, ~two
+                                          AS-buffers wide)
+```
+
+When sigma2_edge = 0 (perfect measurement) k = 1 and full Kelly stands; as
+markout uncertainty grows relative to the edge, k -> 0. A cell with a little
+measured data and low variance shrinks less than a cold-start leg sitting on
+the uninformed prior -- size grows with evidence, exactly the intended
+"exploration builds conviction" dynamic.
+
+**Note on the per-strike/per-ladder MC-SE (parameter-posterior) sigma2.** An
+earlier design fed the pricer's own per-strike Monte-Carlo standard error
+into this same Baker-McHale shrinkage, on the theory that a wing strike's
+larger parameter uncertainty should shrink that leg more. In practice this
+double-charged the spread bet: MC-SE measures uncertainty in the *terminal
+probability estimate*, a different quantity from *markout* uncertainty (how
+much realized adverse selection varies around its mean), and at realistic MC
+sample sizes the MC-SE contribution was small enough (sub-cent) that it
+mostly just diluted the correctly-scaled markout variance without adding
+real information. **As of the posted-spread/markout Kelly rewrite, this
+channel is dropped from leg shrinkage entirely** -- `sigma2_edge` above is
+the only variance Baker-McHale sees. The parameter-posterior sigma2 the
+pricer still computes per strike continues to do real work elsewhere: it
+widens the *robust* spread term (Section 5, term 4) and feeds `phi` for
+audit -- it no longer shrinks leg sizes. The consequence, accepted rather
+than fixed: in the cold-start regime (before enough fills exist to measure
+markout per cell) every leg shrinks by the same uninformed prior variance
+regardless of strike, so a wing leg's extra parameter uncertainty is not
+separately punished at the sizing stage. Wing exposure stays bounded by three
+other controls instead -- the q_max shrinking mode, the wing spread-widening
+term, and the bucket worst-case cap below -- so this is a loss of one
+redundant safeguard, not an open risk.
+
+### 8.2 Presence, reduce-side exemption, and the ladder bets one event
 
 The remaining fraction-space stages are portfolio-level and lightweight:
 
@@ -506,27 +556,59 @@ The remaining fraction-space stages are portfolio-level and lightweight:
   ceiling).
 
 Fractions become shares via `size = f * bankroll / risk_per_share`, where the
-risk per share is P for a YES bought at P, and 1 - P for a NO. Three more
-stages then run in share space, in this order:
+risk per share is P for a YES bought at P, and 1 - P for a NO (both P's are
+our own posted quote, as above). Several more stages then run in share space,
+in this order:
 
-- **Presence floor.** A quote-side minimum, `presence_frac * bankroll /
-  risk_per_share`, tapered toward zero as this side's inventory approaches
-  q_max (so the floor never fights the inventory cap below it). Pure `max()`
-  against the Kelly size -- it only ever raises a leg, never lowers one a
-  firmer cap has already set. Below-floor conviction sizing (e.g. a
-  zero-edge leg) still gets a small resting presence instead of vanishing to
-  zero; the launch default is deliberately small (~$5/side at-the-money).
+- **Presence floor, gated on measured net edge.** A quote-side minimum,
+  `presence_frac * bankroll / risk_per_share`, tapered toward zero as this
+  side's inventory approaches q_max (so the floor never fights the inventory
+  cap below it). Pure `max()` against the Kelly size when its gate is open --
+  it only ever raises a leg, never lowers one a firmer cap has already set.
+  The gate: `(m_gate >= 0) or (mk_n_attempted < markout_min_n)`, where
+  `m_gate` is the same measured-or-prior net edge used above (unclamped).
+  A cell that has never been measured (or barely measured) keeps the floor
+  on regardless of the edge's sign -- the **exploration carve-out**: fills
+  are the only source of markout/credibility calibration, so an unmeasured
+  cell must keep a minimum resting presence to ever accumulate the evidence
+  that would let it earn a real edge-driven size. Only once a cell is
+  *trusted* (enough fills) and shows a *measured, negative* net edge does the
+  floor turn off on that side -- the failure mode this closes is a
+  perpetually-resting floor quote bleeding to a genuinely toxic counterparty
+  forever, which the wave-1 unconditional floor could not distinguish from
+  ordinary cold-start presence.
+- **Reduce-side exemption, ungated.** Cash-EV Kelly has a blind spot: when
+  inventory skew exceeds the effective spread, the unload side's Kelly
+  fraction (and therefore its floor, if gated) can go to exactly zero --
+  Kelly only sees the bet's expected cash payoff, not the risk-relief value
+  of shedding a position that is pressing against its cap. Observed live: a
+  62-share position quoting bid 81.7c / ask 0.0 -- the exact side that should
+  be resting most aggressively was silent. Fix: whichever leg is this
+  market's *reduce side* (the ask/NO leg if net long YES, the bid/YES leg if
+  net long NO) gets floored at `min(|q|, s_presence)` -- the ordinary
+  (untapered) presence-floor unit, capped at the position size itself --
+  **unconditionally**, ignoring the W4 gate above. This restores *presence*
+  on the unload side, not proportional unwind capacity: an 80-share position
+  still unwinds over several fills, not one shot. Proportional unload sizing
+  is left to the ordinary Kelly path once that side accumulates its own
+  measured (positive) markout. A directive that has already suppressed a
+  side (PULLED, or the wrong side of BID_ONLY/ASK_ONLY) still wins -- this
+  exemption cannot resurrect a side risk control has deliberately zeroed.
 - **Inventory headroom cap.** Bid size <= q_max - q (buying more YES cannot
   push the position past its cap); ask size <= q_max + q (selling YES / buying
   NO cannot push a short position past its cap). Wires the inventory manager's
   live position into sizing itself, closing a prior gap where sizing was
   inventory-blind and only the risk controller's one-sided/pull rules reacted
   to a breach *after* it happened.
-- **Depth cap.** Each side's size is also bounded by the realized displayed
-  depth the liquidity monitor measured (Section 11.2) -- there is no point
-  resting more size than the book ever shows near the touch, and doing so
-  distorts the paper experiment. Runs after the presence floor and inventory
-  cap so it remains a hard minimum over both.
+- **Depth cap, floored at a minimum restorable size.** Each side's size is
+  also bounded by `max(realized_depth, depth_cap_floor_shares)` -- the
+  liquidity monitor's realized displayed depth (Section 11.2), never allowed
+  to collapse all the way to zero. A completely dead book (realized depth 0)
+  used to permanently zero our size on that side; the depth cap's job is
+  impact control (don't rest more than the book ever shows near the touch),
+  not presence control, so it now floors at a venue-minimum restorable size
+  (default 1 share) instead. Runs after the presence floor, reduce-side
+  exemption, and inventory cap, so it remains a hard minimum over all three.
 
 Finally, the **bucket worst-case cap** is the joint-ladder control: all
 strikes in one expiry settle off the *same* terminal BTC spot, so a YES leg
@@ -886,11 +968,13 @@ exactly these points:
 2. **`p_grid`** (densified curve) -> the monotone reference for PAV no-arb
    repair (Section 9.1).
 3. **`n_sims`** -> the exact Bernoulli standard error `p(1-p)/n_sims`
-   (Section 3.2), which drives Baker-McHale size shrinkage (Section 8.1) and
-   the robust spread term (Section 7, term 4).
+   (Section 3.2), which feeds the robust spread term (Section 7, term 4) and
+   `phi` (audit). It no longer drives Baker-McHale size shrinkage directly
+   (Section 8.1) -- that channel now shrinks on measured/prior *markout*
+   variance instead; see Section 8.1's note on the parameter-posterior sigma2.
 4. **Bayesian posterior bands** (companion module) -> wing-strike parameter
    uncertainty, replacing the misleadingly small MC error in the tails
-   (Section 3.2).
+   (Section 3.2); widens the robust spread term, no longer shrinks leg sizes.
 5. **Known model weaknesses from backtests** -> hard-coded structure: the
    belly-widening term's base/slope (Section 7, term 6) and the confidence-
    tier day boundaries gating wing widening (Section 3.3).

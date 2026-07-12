@@ -151,6 +151,7 @@ def _mk_orch(
     max_settlement_wait_h: float = 26.0,
     reprice_s: float = 0.0,
     jump_loader=None,
+    markout_provider=None,
 ) -> Tuple[MultiExpiryOrchestrator, SharedPricingEngine, _ScriptedCompute]:
     compute = compute or _ScriptedCompute()
     engine = SharedPricingEngine(reprice_s=reprice_s, compute_fn=compute, jump_loader=jump_loader)
@@ -163,6 +164,7 @@ def _mk_orch(
         tick_s=TICK_S,
         vol_gate_fn=_vol_gate,
         data_provider=data_provider or _empty_provider(),
+        markout_provider=markout_provider,
         adapter_factory=lambda tokens: _FakeAdapter(tokens),
         resolver=resolver,
         auto_mode=auto_mode,
@@ -325,6 +327,29 @@ def test_startup_stagger_one_first_price_per_tick(store):
         assert slot.state == "active"
 
 
+def test_markout_provider_threaded_into_every_slot_loop(store):
+    # wave 2 W7: ONE shared markout_provider reaches every slot's
+    # PaperTradingLoop via _build_slot, the single construction point -- both
+    # startup slots and (separately asserted below) a mid-run acquisition.
+    stub_provider = lambda: {"stub": True}
+    orch, engine, compute = _mk_orch(store, markout_provider=stub_provider)
+    orch.startup(NOW0, [("ev-a", EXPIRY_A, LADDER_A), ("ev-b", EXPIRY_B, LADDER_B)],
+                 db_existed=False)
+    assert len(orch.slots) == 2
+    for slot in orch.slots.values():
+        assert slot.loop.markout_provider is stub_provider
+
+
+def test_markout_provider_none_default_keeps_existing_constructors_green(store):
+    # Default (no markout_provider passed) must not break any existing
+    # MultiExpiryOrchestrator caller -- every slot's loop gets None, same as
+    # an unwired single-expiry PaperTradingLoop.
+    orch, engine, compute = _mk_orch(store)
+    orch.startup(NOW0, [("ev-a", EXPIRY_A, LADDER_A)], db_existed=False)
+    for slot in orch.slots.values():
+        assert slot.loop.markout_provider is None
+
+
 def test_reprice_grant_rotates_round_robin(store):
     orch, engine, compute = _mk_orch(store)
     orch.startup(NOW0, [("ev-a", EXPIRY_A, LADDER_A), ("ev-b", EXPIRY_B, LADDER_B)],
@@ -443,6 +468,31 @@ def test_in_process_rollover_settled_ladder_replaced(store):
     # P's live orders were cancelled (scoped)
     for m, _k, _t in LADDER_PAST:
         assert store.get_live_orders(m) == []
+
+
+def test_markout_provider_threaded_into_mid_run_acquired_slot(store):
+    # wave 2 W7 (reviewer Q6 item 5): _build_slot is the SINGLE construction
+    # point covering both startup slots and mid-run acquisitions -- a slot
+    # acquired via in-process rollover must get the same shared provider.
+    _FakeAdapter.instances = []
+    now = settlement_instant_utc(EXPIRY_PAST) + timedelta(hours=1)
+    provider = _provider_covering(EXPIRY_PAST)
+    stub_provider = lambda: {"stub": True}
+
+    def _resolver(now_arg, lead, cap, exclude):
+        return [("ev-c", EXPIRY_C, LADDER_C)]
+
+    orch, engine, compute = _mk_orch(
+        store, auto_mode=True, resolver=_resolver, data_provider=provider,
+        markout_provider=stub_provider,
+    )
+    orch.startup(now, [("ev-p", EXPIRY_PAST, LADDER_PAST), ("ev-b", EXPIRY_B, LADDER_B)],
+                 db_existed=False)
+    orch.tick(now)  # P settles + torn down; C acquired in-process
+
+    assert EXPIRY_C in orch.slots
+    assert orch.slots[EXPIRY_C].loop.markout_provider is stub_provider
+    assert orch.slots[EXPIRY_B].loop.markout_provider is stub_provider
 
 
 def test_settlement_timeout_teardown_and_later_catchup_closes(store):

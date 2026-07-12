@@ -54,7 +54,13 @@ above (never complemented); see the function docstring for the full
 region/tte-bucket/horizon join logic. It reads mids from the durable
 ``mid_log`` table (``market_maker/state_store.py``'s mid-log design) via an
 injected lookup callable -- the runner owns the store read, this module
-stays pure.
+stays pure. Each cell/rollup also carries ``mk_var`` (wave 2 W6, sample
+variance of that cell's markouts) so the sizing layer can shrink toward the
+measured edge with confidence proportional to the evidence (Baker-McHale on
+``mk_var/n``). ``markout_stats`` (wave 2 W6) is the pure resolution helper
+the harness uses to pull one (mk_avg, mk_var, n, n_attempted) tuple out of a
+report for a given (region, tte_bucket, horizon_s) -- see its own docstring
+for the cell -> region-rollup fallback order.
 """
 from __future__ import annotations
 
@@ -100,6 +106,13 @@ def _tte_bucket(tte_days: float) -> str:
         if tte_days < upper:
             return label
     return "4d+"
+
+
+# Public alias (wave 2 W6): the harness needs to classify a market into the
+# same tte buckets the report uses, without reaching for the private name.
+# The private name stays working (kept as the implementation).
+def tte_bucket_label(tte_days: float) -> str:
+    return _tte_bucket(tte_days)
 
 
 def fill_cash(side: Side, price: float, size: float) -> float:
@@ -257,13 +270,23 @@ def _summarize(vals: List[float]) -> Dict[str, object]:
     shared by both the cells loop and the by_region rollup so the n/mk_total/
     mk_avg formula lives in exactly one place). `mk_avg` is 0.0 on an empty
     list (F2: a cell with zero hits is still emitted, never divides by zero).
-    Does NOT include `n_attempted` -- callers own that count (it is tracked
-    per attempted lookup, not per successful value, so it cannot be derived
-    from `vals` alone) and merge it into the returned dict themselves.
+    `mk_var` (wave 2 W6) is the population variance of `vals` (denominator n,
+    not n-1 -- these are the full observed sample, not an estimate of a
+    larger population), 0.0 when n < 2 (undefined/degenerate otherwise).
+    Additive key: existing consumers (mm_monitor read-only rendering) ignore
+    unknown keys. Does NOT include `n_attempted` -- callers own that count
+    (it is tracked per attempted lookup, not per successful value, so it
+    cannot be derived from `vals` alone) and merge it into the returned dict
+    themselves.
     """
     n = len(vals)
     total = sum(vals)
-    return {"n": n, "mk_avg": (total / n) if n else 0.0, "mk_total": total}
+    mk_avg = (total / n) if n else 0.0
+    if n >= 2:
+        mk_var = sum((v - mk_avg) ** 2 for v in vals) / n
+    else:
+        mk_var = 0.0
+    return {"n": n, "mk_avg": mk_avg, "mk_var": mk_var, "mk_total": total}
 
 
 def markout_report(
@@ -448,3 +471,90 @@ def markout_report(
         "lookback_s": MARKOUT_LOOKBACK_S,
         "generated_ts": datetime.now(timezone.utc).isoformat(),
     }
+
+
+# ---------------------------------------------------------------------------
+# Markout lookup helper for sizing (wave 2 W6)
+# ---------------------------------------------------------------------------
+
+
+def markout_stats(
+    report: Optional[dict],
+    region: str,
+    tte_bucket: str,
+    horizon_s: float,
+    min_n: int,
+) -> Tuple[Optional[float], Optional[float], int, int]:
+    """Resolve (mk_avg, mk_var, n, n_attempted) for one (region, tte_bucket,
+    horizon_s) sizing lookup out of a `markout_report()` dict (wave 2 W6 --
+    the robustness_sizing markout haircut reads this via the harness, never
+    directly, so robustness_sizing itself stays free of any pnl_report
+    import).
+
+    Resolution order:
+      1. Exact cell from `report["cells"]` (region + tte_bucket + horizon_s,
+         matched as float) -- the finest-grained measurement.
+      2. If that cell is missing, or its `n < min_n`, fall back to the
+         region-only rollup `report["by_region"][region][str(horizon_s)]`
+         (NOTE: by_region horizons are keyed by `str(h)`, e.g. "600.0" --
+         markout_report builds this with `str(h)`, so a float-keyed lookup
+         here would silently miss every time; must match that exactly).
+      3. If that is also missing or still `n < min_n`, return
+         `(None, None, 0, best_n_attempted)` where `best_n_attempted` is the
+         largest `n_attempted` seen across whichever of the two lookups
+         above actually resolved (0 if neither did) -- callers (the wave 2
+         W4 exploration gate) use it to distinguish "never attempted" from
+         "attempted, still thin".
+
+    Never raises: a malformed, empty, or None `report`, or a report missing
+    expected keys/shapes, degrades to the null tuple `(None, None, 0, 0)`
+    rather than propagating a KeyError/TypeError into the sizing pipeline.
+    """
+    try:
+        if not report:
+            return None, None, 0, 0
+
+        best_n_attempted = 0
+
+        cells = report.get("cells") if isinstance(report, dict) else None
+        if isinstance(cells, list):
+            for cell in cells:
+                if not isinstance(cell, dict):
+                    continue
+                if (
+                    cell.get("region") == region
+                    and cell.get("tte_bucket") == tte_bucket
+                    and float(cell.get("horizon_s", float("nan"))) == float(horizon_s)
+                ):
+                    n = int(cell.get("n", 0) or 0)
+                    n_attempted = int(cell.get("n_attempted", 0) or 0)
+                    best_n_attempted = max(best_n_attempted, n_attempted)
+                    if n >= min_n:
+                        return (
+                            float(cell.get("mk_avg", 0.0)),
+                            float(cell.get("mk_var", 0.0)),
+                            n,
+                            n_attempted,
+                        )
+                    break  # exact cell found but thin; fall through to region rollup
+
+        by_region = report.get("by_region") if isinstance(report, dict) else None
+        if isinstance(by_region, dict):
+            region_entry = by_region.get(region)
+            if isinstance(region_entry, dict):
+                horizon_entry = region_entry.get(str(horizon_s))
+                if isinstance(horizon_entry, dict):
+                    n = int(horizon_entry.get("n", 0) or 0)
+                    n_attempted = int(horizon_entry.get("n_attempted", 0) or 0)
+                    best_n_attempted = max(best_n_attempted, n_attempted)
+                    if n >= min_n:
+                        return (
+                            float(horizon_entry.get("mk_avg", 0.0)),
+                            float(horizon_entry.get("mk_var", 0.0)),
+                            n,
+                            n_attempted,
+                        )
+
+        return None, None, 0, best_n_attempted
+    except Exception:
+        return None, None, 0, 0

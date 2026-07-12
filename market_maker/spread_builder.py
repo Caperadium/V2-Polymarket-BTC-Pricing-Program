@@ -39,7 +39,7 @@ from __future__ import annotations
 
 import math
 from datetime import datetime
-from typing import Optional
+from typing import Dict, Optional, Tuple
 
 from market_maker.config import MMConfig, in_belly_band
 from market_maker.contracts import (
@@ -111,26 +111,28 @@ def _quantize(bid_price: float, ask_price: float, tick: float, lo: float, hi: fl
     return bid_price, ask_price
 
 
-def build_quote_set(
+def compute_posted_prices(
     proposal: QuoteProposal,
     directive: RiskDirective,
-    sizing: SizingDecision,
     venue: VenueDescriptor,
     config: MMConfig,
     sigma2: float,
     confidence_tier: ConfidenceTier,
     credibility: float,
     consensus_p: float,
-    source_seq: int,
-    liquidity: Optional[LiquidityState] = None,  # reserved; sizes come from `sizing`
     robust_scale: float = DEFAULT_ROBUST_SCALE,
     credibility_widen_scale: float = DEFAULT_CREDIBILITY_WIDEN_SCALE,
     wing_base_p: float = DEFAULT_WING_BASE_P,
-    ts: Optional[datetime] = None,
     tte_days: Optional[float] = None,
-) -> QuoteSet:
+) -> Tuple[float, float, Dict[str, float]]:
+    """Price-building half of build_quote_set (wave 2 W1 split): the six
+    additive spread terms plus floor/clamp/quantize/no-cross composition.
+    Pure function of (proposal, directive, venue, config, sigma2,
+    confidence_tier, credibility, consensus_p) -- no sizing, no QuoteSet.
+    Returns (bid_price, ask_price, terms); `terms` is the same audit dict
+    build_quote_set has always returned on its QuoteSet.
+    """
     p_lo, p_hi = config.p_clamp
-    ts_final = ts if ts is not None else proposal.ts
 
     # term 1: base arrival markup — AUDIT-ONLY, like the skew term. The quote
     # engine's delta_x already carries the arrival component ((2/k)ln(1+g/k),
@@ -192,16 +194,6 @@ def build_quote_set(
     band_lo, band_hi = venue.price_band
     bid_price, ask_price = _quantize(bid_price, ask_price, venue.tick_size, band_lo, band_hi)
 
-    bid_size = sizing.bid_size
-    ask_size = sizing.ask_size
-    if directive.mode == QuoteMode.BID_ONLY:
-        ask_size = 0.0
-    elif directive.mode == QuoteMode.ASK_ONLY:
-        bid_size = 0.0
-    elif directive.mode == QuoteMode.PULLED:
-        bid_size = 0.0
-        ask_size = 0.0
-
     terms = {
         "markup": markup_p,
         "eps": eps_p,
@@ -211,6 +203,54 @@ def build_quote_set(
         "belly": belly_p,
         "floor_applied": floor_applied,
     }
+
+    return bid_price, ask_price, terms
+
+
+def build_quote_set(
+    proposal: QuoteProposal,
+    directive: RiskDirective,
+    sizing: SizingDecision,
+    venue: VenueDescriptor,
+    config: MMConfig,
+    sigma2: float,
+    confidence_tier: ConfidenceTier,
+    credibility: float,
+    consensus_p: float,
+    source_seq: int,
+    liquidity: Optional[LiquidityState] = None,  # reserved; sizes come from `sizing`
+    robust_scale: float = DEFAULT_ROBUST_SCALE,
+    credibility_widen_scale: float = DEFAULT_CREDIBILITY_WIDEN_SCALE,
+    wing_base_p: float = DEFAULT_WING_BASE_P,
+    ts: Optional[datetime] = None,
+    tte_days: Optional[float] = None,
+    posted: Optional[Tuple[float, float, Dict[str, float]]] = None,
+) -> QuoteSet:
+    ts_final = ts if ts is not None else proposal.ts
+
+    # wave 2 W1: posted prices are computed by compute_posted_prices, either
+    # here (posted=None, bit-identical to pre-wave-2 behavior) or upstream by
+    # the caller (harness sizes on the posted prices, then passes them back
+    # in via `posted` so they are not recomputed).
+    if posted is None:
+        bid_price, ask_price, terms = compute_posted_prices(
+            proposal, directive, venue, config, sigma2, confidence_tier,
+            credibility, consensus_p, robust_scale=robust_scale,
+            credibility_widen_scale=credibility_widen_scale,
+            wing_base_p=wing_base_p, tte_days=tte_days,
+        )
+    else:
+        bid_price, ask_price, terms = posted
+
+    bid_size = sizing.bid_size
+    ask_size = sizing.ask_size
+    if directive.mode == QuoteMode.BID_ONLY:
+        ask_size = 0.0
+    elif directive.mode == QuoteMode.ASK_ONLY:
+        bid_size = 0.0
+    elif directive.mode == QuoteMode.PULLED:
+        bid_size = 0.0
+        ask_size = 0.0
 
     return QuoteSet(
         ts=ts_final,

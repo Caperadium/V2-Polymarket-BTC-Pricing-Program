@@ -28,6 +28,8 @@ from market_maker.pnl_report import (
     compute_pnl_rows,
     fill_cash,
     markout_report,
+    markout_stats,
+    tte_bucket_label,
 )
 from market_maker.settlement_handler import settlement_instant_utc
 from market_maker.state_store import MMStateStore
@@ -811,3 +813,138 @@ def test_markout_report_by_expiry_unknown_bucket_for_unregistered():
     assert set(report["by_expiry"].keys()) == {"unknown"}
     cell = report["by_expiry"]["unknown"]["60.0"]
     assert cell["n"] == 0 and cell["n_attempted"] == 1
+
+
+# ---------------------------------------------------------------------------
+# wave 2 W6: mk_var correctness + markout_stats resolution helper
+# ---------------------------------------------------------------------------
+
+
+def test_mk_var_hand_computed_population_variance():
+    # Three fills in the SAME cell with markouts +0.10 / -0.10 / 0.00 (mean 0,
+    # population variance = (0.01+0.01+0.0)/3 = 0.02/3). Staggered ts (each 10
+    # minutes apart) so each fill's [ts+60, ts+60+window) lookup window only
+    # ever matches its OWN mid row (the test double picks the first candidate
+    # ts in-window, and identical fill.ts would make every fill match the
+    # same row).
+    fill_a = _paper_fill("m1", Side.BUY_YES, 0.50, 1.0, mid_at_fill=0.50, order_id="a", ts=NOW)
+    fill_b = _paper_fill(
+        "m1", Side.BUY_YES, 0.50, 1.0, mid_at_fill=0.50, order_id="b",
+        ts=NOW + timedelta(minutes=10),
+    )
+    fill_c = _paper_fill(
+        "m1", Side.BUY_YES, 0.50, 1.0, mid_at_fill=0.50, order_id="c",
+        ts=NOW + timedelta(minutes=20),
+    )
+    registry = {"m1": (FAR_EXPIRY, 100000.0)}
+    mid_rows = {"m1": [
+        (fill_a.ts + timedelta(seconds=60), 0.60),  # mk = +0.10
+        (fill_b.ts + timedelta(seconds=60), 0.40),  # mk = -0.10
+        (fill_c.ts + timedelta(seconds=60), 0.50),  # mk = 0.00
+    ]}
+    report = markout_report(
+        [fill_a, fill_b, fill_c], _mid_lookup_from_rows(mid_rows), registry, BELLY_BAND,
+        horizons=(60.0,),
+    )
+    cell = report["cells"][0]
+    assert cell["n"] == 3
+    assert cell["mk_avg"] == pytest.approx(0.0, abs=1e-12)
+    assert cell["mk_var"] == pytest.approx(0.02 / 3.0)
+
+    rollup = report["by_region"][cell["region"]]["60.0"]
+    assert rollup["mk_var"] == pytest.approx(0.02 / 3.0)
+
+
+def test_mk_var_zero_below_two_samples():
+    fill = _paper_fill("m1", Side.BUY_YES, 0.50, 1.0, mid_at_fill=0.50)
+    registry = {"m1": (FAR_EXPIRY, 100000.0)}
+    mid_rows = {"m1": [(fill.ts + timedelta(seconds=60), 0.60)]}
+    report = markout_report(
+        [fill], _mid_lookup_from_rows(mid_rows), registry, BELLY_BAND, horizons=(60.0,),
+    )
+    cell = report["cells"][0]
+    assert cell["n"] == 1
+    assert cell["mk_var"] == 0.0
+
+
+def test_markout_stats_exact_cell_resolution():
+    report = {
+        "cells": [
+            {"region": "belly", "tte_bucket": "0-1d", "horizon_s": 600.0,
+             "n": 25, "n_attempted": 30, "mk_avg": 0.02, "mk_var": 0.0004},
+        ],
+        "by_region": {
+            "belly": {"600.0": {"n": 100, "n_attempted": 120, "mk_avg": 0.05, "mk_var": 0.001}},
+        },
+    }
+    mk_avg, mk_var, n, n_attempted = markout_stats(report, "belly", "0-1d", 600.0, min_n=20)
+    # exact cell wins over the (also-eligible) region rollup
+    assert (mk_avg, mk_var, n, n_attempted) == (0.02, 0.0004, 25, 30)
+
+
+def test_markout_stats_falls_back_to_region_rollup_when_cell_thin():
+    report = {
+        "cells": [
+            {"region": "belly", "tte_bucket": "0-1d", "horizon_s": 600.0,
+             "n": 5, "n_attempted": 8, "mk_avg": 0.02, "mk_var": 0.0004},
+        ],
+        "by_region": {
+            "belly": {"600.0": {"n": 100, "n_attempted": 120, "mk_avg": 0.05, "mk_var": 0.001}},
+        },
+    }
+    mk_avg, mk_var, n, n_attempted = markout_stats(report, "belly", "0-1d", 600.0, min_n=20)
+    assert (mk_avg, mk_var, n, n_attempted) == (0.05, 0.001, 100, 120)
+
+
+def test_markout_stats_null_tuple_reports_best_n_attempted():
+    # Neither the cell nor the region rollup reaches min_n -> null tuple, but
+    # n_attempted reports the LARGEST attempted count seen across both lookups
+    # (the W4 exploration gate's anti-starvation signal).
+    report = {
+        "cells": [
+            {"region": "belly", "tte_bucket": "0-1d", "horizon_s": 600.0,
+             "n": 3, "n_attempted": 5, "mk_avg": 0.02, "mk_var": 0.0004},
+        ],
+        "by_region": {
+            "belly": {"600.0": {"n": 8, "n_attempted": 12, "mk_avg": 0.03, "mk_var": 0.0006}},
+        },
+    }
+    mk_avg, mk_var, n, n_attempted = markout_stats(report, "belly", "0-1d", 600.0, min_n=20)
+    assert mk_avg is None and mk_var is None and n == 0
+    assert n_attempted == 12
+
+
+def test_markout_stats_never_attempted_returns_zero():
+    report = {"cells": [], "by_region": {}}
+    assert markout_stats(report, "belly", "0-1d", 600.0, min_n=20) == (None, None, 0, 0)
+
+
+def test_markout_stats_region_horizon_key_is_str_not_float():
+    # W6 required-change: by_region is keyed by str(horizon_s) ("600.0"), not
+    # a float -- a report missing the exact cell must still resolve via the
+    # str-keyed region rollup, not silently miss.
+    report = {
+        "cells": [],
+        "by_region": {"wing": {"600.0": {"n": 50, "n_attempted": 60, "mk_avg": -0.01, "mk_var": 0.0002}}},
+    }
+    mk_avg, mk_var, n, n_attempted = markout_stats(report, "wing", "1-2d", 600.0, min_n=20)
+    assert (mk_avg, mk_var, n, n_attempted) == (-0.01, 0.0002, 50, 60)
+
+
+def test_markout_stats_malformed_report_never_raises():
+    assert markout_stats(None, "belly", "0-1d", 600.0, min_n=20) == (None, None, 0, 0)
+    assert markout_stats({}, "belly", "0-1d", 600.0, min_n=20) == (None, None, 0, 0)
+    assert markout_stats({"cells": "not-a-list"}, "belly", "0-1d", 600.0, min_n=20) == (None, None, 0, 0)
+    assert markout_stats({"cells": [{"region": "belly"}]}, "belly", "0-1d", 600.0, min_n=20) == (None, None, 0, 0)
+    assert markout_stats(
+        {"cells": [], "by_region": {"belly": "not-a-dict"}}, "belly", "0-1d", 600.0, min_n=20
+    ) == (None, None, 0, 0)
+    assert markout_stats(
+        {"cells": [], "by_region": {"belly": {"600.0": "not-a-dict"}}}, "belly", "0-1d", 600.0, min_n=20
+    ) == (None, None, 0, 0)
+
+
+def test_tte_bucket_label_matches_private_alias():
+    from market_maker.pnl_report import _tte_bucket
+    for tte in (0.0, 0.5, 1.0, 1.5, 2.0, 3.9, 4.0, 10.0):
+        assert tte_bucket_label(tte) == _tte_bucket(tte)

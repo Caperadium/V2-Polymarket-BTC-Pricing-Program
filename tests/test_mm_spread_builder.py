@@ -19,6 +19,7 @@ from market_maker.spread_builder import (
     DEFAULT_WING_BASE_P,
     _quantize,
     build_quote_set,
+    compute_posted_prices,
     make_stub_directive,
     make_stub_sizing,
 )
@@ -309,3 +310,72 @@ def test_stub_directive_and_sizing_shape():
     assert d.eps_add == pytest.approx(0.0)
     s = make_stub_sizing("m1", TS)
     assert s.bid_size > 0.0 and s.ask_size > 0.0
+
+
+# ---------------------------------------------------------------------------
+# wave 2 W1: compute_posted_prices split -- bit-identity with build_quote_set
+# (posted=None path), and posted= short-circuit (verbatim tuple respected).
+# ---------------------------------------------------------------------------
+
+
+def _directive_variants():
+    base = make_stub_directive("m1", TS)
+    import dataclasses
+    return [
+        base,
+        dataclasses.replace(base, eps_add=0.05),
+        dataclasses.replace(base, mode=QuoteMode.BID_ONLY),
+    ]
+
+
+def _proposal_variants():
+    return [
+        _proposal(r_x=0.0, delta_x=0.3),
+        _proposal(r_x=logit(0.7), delta_x=0.1, skew_x=0.02),
+        _proposal(r_x=logit(0.9995), delta_x=0.05),
+    ]
+
+
+def test_compute_posted_prices_matches_build_quote_set_over_grid():
+    config = MMConfig()
+    sizing = make_stub_sizing("m1", TS)
+    for proposal in _proposal_variants():
+        for directive in _directive_variants():
+            for consensus_p in (0.1, 0.5, 0.9):
+                for tte_days in (0.5, 5.0, None):
+                    bid_p, ask_p, terms_p = compute_posted_prices(
+                        proposal, directive, VENUE, config,
+                        sigma2=0.0002, confidence_tier=ConfidenceTier.FULL,
+                        credibility=0.7, consensus_p=consensus_p, tte_days=tte_days,
+                    )
+                    qs = build_quote_set(
+                        proposal, directive, sizing, VENUE, config,
+                        sigma2=0.0002, confidence_tier=ConfidenceTier.FULL,
+                        credibility=0.7, consensus_p=consensus_p, source_seq=1,
+                        tte_days=tte_days,
+                    )
+                    assert qs.bid_price == pytest.approx(bid_p, abs=1e-12)
+                    assert qs.ask_price == pytest.approx(ask_p, abs=1e-12)
+                    assert qs.terms == terms_p
+
+
+def test_build_quote_set_posted_short_circuit_respected_verbatim():
+    # A posted= tuple with prices that DISAGREE with what compute_posted_prices
+    # would have computed must be respected exactly (no recomputation) --
+    # proves the harness's "compute once, pass in" ordering (wave 2 W1/W7)
+    # actually short-circuits rather than silently recomputing.
+    config = MMConfig()
+    proposal = _proposal(r_x=0.0, delta_x=0.3)
+    directive = make_stub_directive("m1", TS)
+    sizing = make_stub_sizing("m1", TS)
+    fake_posted = (0.111, 0.222, {"markup": 0.0, "eps": 0.0, "skew": 0.0,
+                                   "robust": 0.0, "wing": 0.0, "belly": 0.0,
+                                   "floor_applied": 0.0})
+    qs = build_quote_set(
+        proposal, directive, sizing, VENUE, config,
+        sigma2=0.0002, confidence_tier=ConfidenceTier.FULL, credibility=0.7,
+        consensus_p=0.5, source_seq=1, posted=fake_posted,
+    )
+    assert qs.bid_price == pytest.approx(0.111)
+    assert qs.ask_price == pytest.approx(0.222)
+    assert qs.terms == fake_posted[2]

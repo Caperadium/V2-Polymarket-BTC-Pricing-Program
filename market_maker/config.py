@@ -145,6 +145,12 @@ class MMConfig:
     bankroll_floor: float = 0.02
     risk_latch_seconds: float = 60.0
 
+    # --- markout-based sizing (wave 2 W8) ---
+    markout_min_n: int = 20  # min fills in a resolved cell to trust measured markout over the prior
+    markout_horizon_s: float = 600.0  # sizing lookup horizon (middle of the 60/600/3600 report horizons)
+    markout_prior_var: float = (2 * 0.0085) ** 2  # uninformed sigma2_edge prior, ~2 AS-buffers wide
+    depth_cap_floor_shares: float = 1.0  # depth cap never zeroes size below this (venue min order size)
+
 
 def in_belly_band(p: float, belly_band: Tuple[float, float]) -> bool:
     """Inclusive belly-band membership: belly_lo <= p <= belly_hi.
