@@ -88,9 +88,10 @@ class HedgeReason(Enum):
 
 
 class SizingCap(Enum):
-    LADDER_JOINT = "LADDER_JOINT"
+    LADDER_JOINT = "LADDER_JOINT"  # retained for old-journal compat; no longer emitted (plan C5)
     RUIN = "RUIN"
     BANKROLL = "BANKROLL"
+    INVENTORY = "INVENTORY"  # per-side headroom cap (plan C2)
     DEPTH = "DEPTH"
     FRACTIONAL_C = "FRACTIONAL_C"
 
@@ -342,6 +343,9 @@ class SizingDecision:
     caps_applied: List[SizingCap]
     sigma2_used: float
     phi_directive: float
+    # = headroom when inventory provided at sizing time, else 0.0 (not computed)
+    max_add_yes: float = 0.0
+    max_add_no: float = 0.0
 
     def __post_init__(self) -> None:
         _require_nonneg("bid_size", self.bid_size)

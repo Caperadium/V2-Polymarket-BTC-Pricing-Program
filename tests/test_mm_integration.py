@@ -274,8 +274,10 @@ def test_pricer_failure_reuses_snapshot_then_widens_then_pulls(store):
 def _crossing_patch(loop):
     orig = loop._compose_quote_sets
 
-    def patched(snap, fv, directives, liquidity=None):
-        composed = orig(snap, fv, directives, liquidity=liquidity)  # keeps last_proposals populated
+    def patched(snap, fv, directives, liquidity=None, market_states=None):
+        composed = orig(
+            snap, fv, directives, liquidity=liquidity, market_states=market_states
+        )  # keeps last_proposals populated
         composed.sort(key=lambda t: t[0])
         out = []
         for i, (k, m, qs) in enumerate(composed):
@@ -319,23 +321,44 @@ def test_forced_noarb_reject_blocks_orders(store):
 def test_inventory_cap_goes_one_sided_then_pulls(store):
     # Small q_max so a few fills breach it. Large bankroll -> large resting bid;
     # SMALL prints (3 shares/tick) PARTIALLY fill it so the same bid stays live
-    # every tick. The ratio then steps through the (1,1.5] one-sided band and,
-    # via a cancel-window fill, into the >1.5 pull band.
+    # every tick. The ratio steps through the (1,1.5] one-sided band and holds
+    # there -- sizing is now inventory-aware (mm_sizing_fix_plan.md C2: the
+    # bid side's headroom cap, q_max - q, hard-stops further bid-side
+    # accumulation once headroom is exhausted), so the OLD mechanism for this
+    # test (fills alone running q past 1.5x q_max) is exactly the sizing bug
+    # the plan fixes and can no longer overshoot via resting-bid fills.
+    # A genuine >1.5x extreme breach still arises the way it would live: q_max
+    # itself shrinks (S'(x) falls as consensus_x moves away from ATM) under an
+    # ALREADY-large position, without requiring any further fill. Drive that
+    # by moving the underlying spot away from the strike after the position is
+    # built up to the one-sided band.
     cfg = MMConfig(q_max_scale=20.0, k_arrival=1.0)  # q_max(ATM) = 20 * 0.25 = 5; k pinned to launch value, scenario is tuned to the wide-quote geometry
     loop = _make_loop(store, config=cfg, bankroll=5000.0)
 
     modes = []
     fill_counts = []
-    for _ in range(12):
+    for _ in range(6):
         loop.tick(_static_books(prints_by_market={"m-100k": [(0.02, 3.0)]}))
         modes.append(loop.last_directives["m-100k"].mode)
         fill_counts.append(len(store.get_fills("m-100k")))
         assert loop.fold_matches_inventory()
 
     assert QuoteMode.ASK_ONLY in modes  # long breach -> quote asks only
+    one_sided_idx = modes.index(QuoteMode.ASK_ONLY)
+
+    # Shift spot away from the strike so q_max (proportional to S'(x)) shrinks
+    # under the already-built position, without any new fills required.
+    for i in range(6):
+        s0_shift = S0 + 3000.0 * (i + 1)
+        shifted = {m: _snapshot_msg(_p_of(k, s0=s0_shift)) for m, k in MARKETS}
+        loop.tick(shifted)
+        modes.append(loop.last_directives["m-100k"].mode)
+        fill_counts.append(len(store.get_fills("m-100k")))
+        assert loop.fold_matches_inventory()
+
     first_pull = next((i for i, m in enumerate(modes) if m == QuoteMode.PULLED), None)
     assert first_pull is not None
-    assert modes.index(QuoteMode.ASK_ONLY) < first_pull  # one-sided BEFORE pull
+    assert one_sided_idx < first_pull  # one-sided BEFORE pull
 
     # After the pull fires, no further fills occur (orders cancelled).
     assert fill_counts[-1] == fill_counts[first_pull]

@@ -471,6 +471,45 @@ def test_last_liquidity_reaches_size_ladder_and_forces_depth_cap(store):
 
 
 # ---------------------------------------------------------------------------
+# mm_sizing_fix_plan.md C1/C2 harness wiring -- size_ladder receives the
+# tick's real inventory snapshot and per-market mkt_mid/strike, not just
+# liquidity (which the test above already covers).
+# ---------------------------------------------------------------------------
+
+
+def test_harness_wires_inventory_and_mkt_mid_and_strike_into_size_ladder(store, monkeypatch):
+    import market_maker.harness as harness_mod
+    from market_maker.contracts import InventoryState
+
+    loop = PaperTradingLoop(
+        store=store, expiry_key=EXPIRY, markets=MARKETS, engine_fn=_engine(),
+        config=MMConfig(gamma=0.5, k_arrival=1.0), clock=SimClock(START), vol_gate_fn=_vol_gate(),
+    )
+
+    captured = {}
+    orig_size_ladder = harness_mod.size_ladder
+
+    def spy(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return orig_size_ladder(*args, **kwargs)
+
+    monkeypatch.setattr(harness_mod, "size_ladder", spy)
+
+    # Two-sided book on every market -> mkt_mid should be computed and threaded
+    # into every ContractSizingInput this tick.
+    loop.tick({m: _snapshot_msg(0.5) for m, _k in MARKETS})
+
+    assert captured, "size_ladder was not called this tick"
+    assert isinstance(captured["kwargs"].get("inventory"), InventoryState)
+    contracts = captured["args"][0]
+    assert contracts, "expected at least one ContractSizingInput"
+    for c in contracts:
+        assert c.strike is not None
+    assert any(c.mkt_mid is not None for c in contracts)
+
+
+# ---------------------------------------------------------------------------
 # W1.2 -- one-dead-book tick: consensus frozen, _x_hist append skipped,
 # fair_value_age_s grows (verified end-to-end via the risk journal's
 # FAIR_VALUE_STALE trigger once age exceeds fv_max_age_s).

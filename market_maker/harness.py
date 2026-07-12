@@ -323,6 +323,7 @@ class PaperTradingLoop:
     def _compose_quote_sets(
         self, snap, fv, directives,
         liquidity: Optional[Dict[str, LiquidityState]] = None,
+        market_states: Optional[Dict[str, Any]] = None,
     ) -> List[Tuple[float, str, QuoteSet]]:
         """Quote engine -> sizing -> spread builder for the whole ladder. A
         seam the forced-no-arb test monkeypatches to inject a crossing ladder.
@@ -331,7 +332,15 @@ class PaperTradingLoop:
         `size_ladder(liquidity=...)` so the DEPTH cap actually binds; the
         tick passes `self.last_liquidity` (populated earlier in the same
         tick's risk-directive loop, so it is fresh). None (default) keeps
-        the DEPTH cap inert, matching prior behavior."""
+        the DEPTH cap inert, matching prior behavior.
+
+        `market_states` (plan C1): dict market_id -> MarketState, the same
+        dict `tick()` builds in step 1. Used ONLY to compute the SIZING mid
+        (ContractSizingInput.mkt_mid) under a both-sides-present-and-uncrossed
+        guard; deliberately NOT `_market_mid()`, whose one-sided fallback
+        would violate the mkt_mid=None fallback contract in
+        robustness_sizing (a one-sided book must fall back to old
+        edge-vs-our-own-quote behavior, not a fake mid)."""
         cfg = self.config
         now = self.clock.now()
         tte = max(snap.tte_days, 0.0)
@@ -346,6 +355,7 @@ class PaperTradingLoop:
         stride = max(1, int(round(sample_s / self.tick_dt_s))) if sample_s > 0 else 1
         sample_dt_days = (self.tick_dt_s * stride) / 86400.0
 
+        inventory = self.inv.snapshot(now)
         for m, k in self.markets:
             # W1.2: only feed the sigma_b estimator on ticks where consensus
             # was actually recomputed -- a frozen anchor (incomplete-mids
@@ -361,18 +371,28 @@ class PaperTradingLoop:
             sigma_b = estimate_sigma_b(
                 hist, sample_dt_days, cfg.sigma_b_floor, cfg.sigma_b_cap
             )
-            q = self.inv.snapshot(now).per_contract[m].q
+            q = inventory.per_contract[m].q
             prop = make_quote_from_config(
                 cfg, m, float(fv.consensus_x[k]), q, tte, sigma_b, variant=self.quote_variant, ts=now
             )
             proposals[m] = prop
+
+            ms = (market_states or {}).get(m)
+            mkt_mid = None
+            if (ms is not None and ms.best_bid is not None and ms.best_ask is not None
+                    and ms.best_bid < ms.best_ask):
+                mkt_mid = 0.5 * (float(ms.best_bid) + float(ms.best_ask))
+
             contracts.append(
                 ContractSizingInput(market_id=m, p_hat=float(fv.consensus_p[k]),
-                                    bid_price=prop.p_bid_raw, ask_price=prop.p_ask_raw)
+                                    bid_price=prop.p_bid_raw, ask_price=prop.p_ask_raw,
+                                    mkt_mid=mkt_mid, strike=float(k))
             )
         self.last_proposals = proposals
 
-        decisions, _audit = size_ladder(contracts, snap, self.bankroll, now, cfg, liquidity=liquidity)
+        decisions, _audit = size_ladder(
+            contracts, snap, self.bankroll, now, cfg, liquidity=liquidity, inventory=inventory
+        )
 
         # W2.1: phi_directive is the same joint-ladder value on every
         # SizingDecision this tick (plan: "any decision carries it") -- cache
@@ -621,7 +641,9 @@ class PaperTradingLoop:
         # W1.1: self.last_liquidity is populated fresh THIS tick by the
         # risk-directive loop above (step 4 runs before this), so no re-emit
         # is needed here.
-        composed = self._compose_quote_sets(snap, fv, directives, liquidity=self.last_liquidity)
+        composed = self._compose_quote_sets(
+            snap, fv, directives, liquidity=self.last_liquidity, market_states=market_states
+        )
         composed.sort(key=lambda t: t[0])
         strikes_sorted = [k for k, _, _ in composed]
         qs_list = [qs for _, _, qs in composed]

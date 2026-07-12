@@ -48,6 +48,10 @@ class MMConfig:
 
     # --- sizing / robustness ---
     fractional_kelly_c: float = 0.5  # HARD ceiling, never full-Kelly (plan 2.8)
+    # fraction of ladder bankroll notional per quote side, presence floor (plan C3);
+    # 0 disables. Caps (depth/inventory/bucket) dominate the floor -- see
+    # robustness_sizing.py module docstring for the full pipeline order.
+    presence_frac: float = 0.005
     q_max_scale: float = 100.0  # scale on the q_max rule below (launch default)
     # q_max rule (verification decision D1, 2026-07-07): "shrinking" (default,
     # conservative: q_max = q_max_scale * max(S'(x), s_prime_floor), cap

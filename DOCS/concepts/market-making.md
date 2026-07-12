@@ -440,9 +440,12 @@ ask, ASK_ONLY the bid, PULLED both.
 ## 8. Sizing: from edge to shares
 
 Prices decided, the remaining question is size, answered by
-`robustness_sizing.size_ladder` through a five-stage pipeline. The design
-maxim: **never full-Kelly, and record every cap that binds** (each decision
-carries a `caps_applied` audit list).
+`robustness_sizing.size_ladder` through a staged pipeline that runs in two
+spaces -- fraction space (per-bankroll fractions, comparable across legs),
+then share space (actual order sizes, comparable against depth/inventory/ruin
+limits that are naturally share- or notional-denominated). The design maxim:
+**never full-Kelly, and record every cap that binds** (each decision carries a
+`caps_applied` audit list).
 
 ### 8.1 Kelly, then shrink it
 
@@ -454,14 +457,26 @@ long-run log wealth if your belief is exactly right --
 f* = ( b*p - (1 - p) ) / b
 ```
 
-is computed per contract for both legs: buying YES at our bid (belief p_hat),
-and buying NO at 1 - ask (belief 1 - p_hat). Negative f* means no edge on that
-side: size zero.
+is computed per contract for both legs: a YES leg (belief p_hat) and a NO leg
+(belief 1 - p_hat). **P is the market's own mid** (the current best-bid/ask
+midpoint on the venue, when both sides are present and uncrossed), not our own
+quote -- Kelly's edge is our belief against the market's belief, and pricing
+that edge off our own quote would make sizing move backwards whenever spread
+calibration changes (a real regression fixed 2026-07-12: a spread-arrival
+recalibration mechanically collapsed flat-inventory sizes ~10x, because the
+"edge" was self-referential against our own tightened quote). When no
+reliable market mid is available (one-sided or crossed book), sizing falls
+back to the pre-fix form -- edge vs our own quote side (bid_price /
+1 - ask_price). Negative f* means no edge on that side: size zero. Separately,
+`price_per_share` (used for the fraction-to-shares conversion below) is
+*always* our own quote side -- the edge price and the capital-at-risk price
+are different quantities that happen to coincide only in the fallback case.
 
 Kelly's catch is the *if your belief is exactly right*. It is notoriously
 aggressive under estimation error -- overbetting is punished far more than
 underbetting. The **Baker-McHale shrinkage** discounts f* by how uncertain
-p_hat is, using the sigma2 from Section 3.2:
+p_hat is, using the leg's own strike's sigma2 when available (falling back to
+the ladder-common sigma2 otherwise):
 
 ```
 k_shrink = f*^2 / ( f*^2  +  ((b+1)/b)^2 * sigma2 )        f <- f* * k_shrink
@@ -471,30 +486,63 @@ When sigma2 = 0 (perfect estimate) k = 1 and full Kelly stands; as uncertainty
 grows relative to the edge, k -> 0. Note this is exactly where the wing
 posterior substitution earns its keep: without it, the near-zero MC error at
 the wings would tell Baker-McHale the tails are precisely estimated -- the
-opposite of the truth.
+opposite of the truth. Pricing per-strike (rather than one ladder-wide
+sigma2 applied to every leg) means a wing leg's larger parameter uncertainty
+shrinks that leg specifically, instead of over-shrinking the whole ladder to
+the wing's level or under-shrinking the wings to the ATM level.
 
 ### 8.2 The ladder bets one event
 
-Stages 3-5 are portfolio-level:
+The remaining fraction-space stages are portfolio-level and lightweight:
 
-- **Joint-ladder cap.** All strikes in one expiry settle off the *same* BTC
-  path -- they are one bet in different clothing, not n independent bets.
-  Summing per-strike Kelly fractions would massively overbet the event. The
-  conservative stand-in for full joint optimization: scale all fractions so
-  their *sum* does not exceed the largest single unscaled fraction.
-- **Ruin caps.** Hard per-expiry at-risk cap (10% of bankroll) and total
-  utilization cap (50%).
-- **Fractional Kelly, always last.** Everything surviving is multiplied by
-  c <= 0.5. Half-Kelly costs only a quarter of the growth rate but halves the
-  drawdowns and is far more robust to misestimated edge; this ceiling is
-  non-negotiable in the config.
+- **Bankroll utilization cap.** Total fraction across the whole ladder <=
+  50% of paper bankroll.
+- **Fractional Kelly -- the last FRACTION-SPACE ceiling.** Everything
+  surviving is multiplied by c <= 0.5. Half-Kelly costs only a quarter of the
+  growth rate but halves the drawdowns and is far more robust to misestimated
+  edge; this ceiling is non-negotiable in the config. It is *not* the last
+  step overall -- see the bucket/ruin cap below, which is a final
+  share-space override that runs after it (a ruin control outranks every
+  ceiling).
 
 Fractions become shares via `size = f * bankroll / risk_per_share`, where the
-risk per share is P for a YES bought at P, and 1 - P for a NO. Finally a
-**depth cap** bounds each side's size by the realized displayed depth the
-liquidity monitor measured (Section 11.2) -- there is no point resting more
-size than the book ever shows near the touch, and doing so distorts the paper
-experiment.
+risk per share is P for a YES bought at P, and 1 - P for a NO. Three more
+stages then run in share space, in this order:
+
+- **Presence floor.** A quote-side minimum, `presence_frac * bankroll /
+  risk_per_share`, tapered toward zero as this side's inventory approaches
+  q_max (so the floor never fights the inventory cap below it). Pure `max()`
+  against the Kelly size -- it only ever raises a leg, never lowers one a
+  firmer cap has already set. Below-floor conviction sizing (e.g. a
+  zero-edge leg) still gets a small resting presence instead of vanishing to
+  zero; the launch default is deliberately small (~$5/side at-the-money).
+- **Inventory headroom cap.** Bid size <= q_max - q (buying more YES cannot
+  push the position past its cap); ask size <= q_max + q (selling YES / buying
+  NO cannot push a short position past its cap). Wires the inventory manager's
+  live position into sizing itself, closing a prior gap where sizing was
+  inventory-blind and only the risk controller's one-sided/pull rules reacted
+  to a breach *after* it happened.
+- **Depth cap.** Each side's size is also bounded by the realized displayed
+  depth the liquidity monitor measured (Section 11.2) -- there is no point
+  resting more size than the book ever shows near the touch, and doing so
+  distorts the paper experiment. Runs after the presence floor and inventory
+  cap so it remains a hard minimum over both.
+
+Finally, the **bucket worst-case cap** is the joint-ladder control: all
+strikes in one expiry settle off the *same* terminal BTC spot, so a YES leg
+at strike K and a NO leg at strike K' > K can never both lose (spot cannot be
+both <= K and > K'). The strikes partition terminal spot into buckets: for
+each bucket, every leg that loses if spot lands there contributes its
+share-space risk fraction, and the true worst-case loss is the largest
+bucket total. If that exceeds the per-expiry cap (10% of bankroll), every
+leg's shares are scaled down by the same factor in one pass. This replaces an
+earlier stand-in (scaling the *sum* of all fractions to the single largest
+one) that ignored hedged cross-strike structure -- an internally-hedged
+YES/NO book is no longer punished as if every leg could lose simultaneously,
+while a genuinely concentrated same-direction book is still capped to the
+true worst case. A leg scaled down here can end up below its own presence
+floor; that is intentional -- caps dominate floors, always, and this is the
+final override in the whole pipeline.
 
 ---
 
@@ -620,9 +668,10 @@ are journaled.
 
 One deliberate non-action: the vol gate's `kelly_mult` is carried on every
 directive but **not applied to sizing** -- it is journaled only. Sizing is
-already defended in depth (Baker-McHale, ladder cap, ruin caps, fractional-c),
-and the vol gate acts on quotes via eps_add and PULL instead. Recording it
-keeps the option to activate later with data.
+already defended in depth (Baker-McHale shrinkage, inventory headroom, depth
+cap, the bucket worst-case/ruin cap, fractional-c), and the vol gate acts on
+quotes via eps_add and PULL instead. Recording it keeps the option to
+activate later with data.
 
 ### 11.2 The liquidity monitor
 
