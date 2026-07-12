@@ -62,13 +62,19 @@ notify() {
 # Read a python expression over the freshest heartbeat; prints result or "ERR".
 hb_query() {
     local expr="$1"
-    "$VENV_PY" - "$CONTROL_DIR" "$expr" <<'PYEOF'
+    "$VENV_PY" - "$CONTROL_DIR" "$REPO_DIR" "$expr" <<'PYEOF'
 import json, sys, pathlib
 control = pathlib.Path(sys.argv[1])
-expr = sys.argv[2]
+repo = pathlib.Path(sys.argv[2])
+expr = sys.argv[3]
 try:
     run = json.loads((control / "current_run.json").read_text())
-    hb = json.loads((pathlib.Path(run["out_dir"]) / "heartbeat.json").read_text())
+    # out_dir is written repo-relative by the runner; resolve against the
+    # repo when not absolute (this script's CWD is arbitrary under systemd).
+    out_dir = pathlib.Path(run["out_dir"])
+    if not out_dir.is_absolute():
+        out_dir = repo / out_dir
+    hb = json.loads((out_dir / "heartbeat.json").read_text())
 except Exception:
     print("ERR")
     sys.exit(0)
