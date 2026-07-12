@@ -139,7 +139,9 @@ def _install_common_stubs(
 ) -> None:
     monkeypatch.setattr(paper_runner, "resolve_event", resolve_event_fn or _default_ladder)
     monkeypatch.setattr(paper_runner, "PolymarketFeedAdapter", adapter_cls)
-    monkeypatch.setattr(paper_runner, "CachedEngine", engine_cls)
+    # Multi-expiry refactor: the engine seam is now a compute callable
+    # injected into the SharedPricingEngine (was: the CachedEngine class).
+    monkeypatch.setattr(paper_runner, "_ENGINE_COMPUTE_FN", engine_cls(reprice_s=0.0))
     monkeypatch.setattr("core.strategy.vol_gate.compute_vol_gate", _fake_compute_vol_gate)
 
     if btc_csv_path is None:

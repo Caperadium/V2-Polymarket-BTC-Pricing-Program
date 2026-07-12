@@ -149,6 +149,7 @@ def compute_pnl_rows(
     consensus: Dict[str, Optional[float]],
     initial_bankroll: float,
     settlements: Optional[Sequence[SettlementEvent]] = None,
+    expiry_by_market: Optional[Dict[str, str]] = None,
 ) -> List[PnlSnapshot]:
     """Build one ``PnlSnapshot`` per market with activity (any market present
     in ``inventory``, i.e. it has at least one fill) plus one aggregate
@@ -170,12 +171,26 @@ def compute_pnl_rows(
     leaves ``settlement_pnl`` at 0.0 for every row; ``realized`` is
     unaffected either way since it is always derived from ``cash`` +
     ``avg_cost`` alone.
+
+    Multi-expiry mode (both knobs default to legacy behavior):
+      - ``expiry_by_market`` (market_id -> expiry_key, typically the store's
+        ``markets`` registry): when given, each PER-MARKET row is stamped
+        with that market's OWN expiry instead of the single ``expiry_key``
+        argument -- which also fixes the pre-existing single-expiry
+        mislabeling where a rolled-over previous event's markets (still in
+        the global inventory) were stamped with the CURRENT run's expiry.
+        The TOTAL row always keeps ``expiry_key`` as passed.
+      - ``expiry_key=None`` means "all expiries" (the multi-expiry
+        orchestrator's global TOTAL mode): the settlements breakdown then
+        includes EVERY expiry's settlement PnL instead of filtering to one.
     """
     cash = cash_by_market(fills)
 
     settlement_pnl_by_market: Dict[str, float] = {}
     for ev in settlements or ():
-        if ev.expiry_key != expiry_key or ev.pnl_realized is None:
+        if ev.pnl_realized is None:
+            continue
+        if expiry_key is not None and ev.expiry_key != expiry_key:
             continue
         settlement_pnl_by_market[ev.market_id] = settlement_pnl_by_market.get(ev.market_id, 0.0) + ev.pnl_realized
 
@@ -198,10 +213,19 @@ def compute_pnl_rows(
 
         settlement_pnl = settlement_pnl_by_market.get(market_id, 0.0)
         at_risk = _capital_at_risk(ci.q, ci.avg_cost)
+        # Multi-expiry note (documented, not fixed): initial_bankroll is the
+        # TOTAL bankroll even when sizing runs on a per-expiry share, so a
+        # per-market utilization understates the per-share utilization by
+        # ~max_expiries x. Display-only; the TOTAL row's utilization (vs the
+        # total bankroll) stays correct.
         utilization = (at_risk / initial_bankroll) if initial_bankroll else 0.0
+        row_expiry = (
+            expiry_by_market.get(market_id, expiry_key)
+            if expiry_by_market is not None else expiry_key
+        )
 
         rows.append(PnlSnapshot(
-            ts=now, market_id=market_id, expiry_key=expiry_key,
+            ts=now, market_id=market_id, expiry_key=row_expiry,
             realized=realized, unrealized_consensus=unrealized_consensus,
             unrealized_mid=unrealized_mid, settlement_pnl=settlement_pnl,
             bankroll_utilization=utilization,
@@ -319,6 +343,11 @@ def markout_report(
          (rolled up across tte_bucket -- the region x horizon summary is the
          headline "is this region's markout biased" view; the finer
          region x tte_bucket x horizon breakdown lives in "cells"),
+         "by_expiry": {expiry_key: {str(horizon_s): {"n", "n_attempted",
+                                                      "mk_avg", "mk_total"}}}
+         (multi-expiry rollup, keyed by the fill's OWN expiry via
+         ``markets_registry``; "unknown" bucket for unregistered markets --
+         additive key, existing consumers ignore it),
          "lookback_s": MARKOUT_LOOKBACK_S,
          "generated_ts": iso}
     """
@@ -334,6 +363,8 @@ def markout_report(
 
     cells: Dict[Tuple[str, str, float], List[float]] = {}
     attempted: Dict[Tuple[str, str, float], int] = {}
+    expiry_cells: Dict[Tuple[str, float], List[float]] = {}
+    expiry_attempted: Dict[Tuple[str, float], int] = {}
 
     for f in eligible:
         if cutoff is not None and f.ts < cutoff:
@@ -350,8 +381,10 @@ def markout_report(
         reg_entry = markets_registry.get(f.market_id)
         if reg_entry is None:
             tte_bucket = "unknown"
+            fill_expiry = "unknown"
         else:
             expiry_key, _strike = reg_entry
+            fill_expiry = expiry_key
             try:
                 tte_days = (settlement_instant_utc(expiry_key) - f.ts).total_seconds() / 86400.0
                 tte_bucket = _tte_bucket(tte_days)
@@ -372,10 +405,16 @@ def markout_report(
             attempted[key] = attempted.get(key, 0) + 1
             vals = cells.setdefault(key, [])
 
+            ekey = (fill_expiry, float(h))
+            expiry_attempted[ekey] = expiry_attempted.get(ekey, 0) + 1
+            evals = expiry_cells.setdefault(ekey, [])
+
             mid_h = mid_lookup(f.market_id, f.ts + timedelta(seconds=h), f.ts + timedelta(seconds=hi_s))
             if mid_h is None:
                 continue
-            vals.append(sign * (mid_h - f.price))
+            mk = sign * (mid_h - f.price)
+            vals.append(mk)
+            evals.append(mk)
 
     cell_list: List[Dict[str, object]] = []
     for key in sorted(cells.keys()):
@@ -396,9 +435,16 @@ def markout_report(
         summary["n_attempted"] = grouped_attempted[(region, h)]
         by_region.setdefault(region, {})[str(h)] = summary
 
+    by_expiry: Dict[str, Dict[str, Dict[str, object]]] = {}
+    for (ek, h), vals in expiry_cells.items():
+        summary = _summarize(vals)
+        summary["n_attempted"] = expiry_attempted[(ek, h)]
+        by_expiry.setdefault(ek, {})[str(h)] = summary
+
     return {
         "cells": cell_list,
         "by_region": by_region,
+        "by_expiry": by_expiry,
         "lookback_s": MARKOUT_LOOKBACK_S,
         "generated_ts": datetime.now(timezone.utc).isoformat(),
     }

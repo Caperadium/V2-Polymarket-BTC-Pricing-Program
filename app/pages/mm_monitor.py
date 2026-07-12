@@ -52,6 +52,7 @@ import streamlit as st
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from market_maker import run_control  # noqa: E402
+from app import mm_monitor_helpers as mmh  # noqa: E402
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 PAPER_RUN_DIR = PROJECT_ROOT / "temp" / "paper_run"
@@ -63,6 +64,11 @@ AUTO_REFRESH_INTERVALS = (5, 10, 30, 60)
 
 PNL_TOTAL_SQL = "SELECT * FROM pnl WHERE market_id IS NULL ORDER BY id ASC"
 INVENTORY_SQL = "SELECT * FROM inventory"
+MARKETS_SQL = "SELECT market_id, expiry_key, strike FROM markets"
+OPEN_ORDERS_SQL = (
+    "SELECT client_order_id, market_id, side, price, size, status, ts_placed "
+    "FROM orders WHERE status IN ('PENDING','LIVE') ORDER BY ts_placed DESC"
+)
 RISK_LATEST_SQL = """
 SELECT r.* FROM risk_journal r
 JOIN (SELECT market_id, MAX(id) AS mid FROM risk_journal GROUP BY market_id) x
@@ -242,15 +248,21 @@ def list_historical_runs(base_dir: Path) -> List[Dict[str, Any]]:
 
 
 def build_positions_table(
-    inv_df: Optional[pd.DataFrame], quotes_df: Optional[pd.DataFrame], expiry_key: Optional[str]
+    inv_df: Optional[pd.DataFrame], quotes_df: Optional[pd.DataFrame],
+    expiry_key: Optional[str], registry_df: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
-    """Join `inventory` rows with the latest quotes.csv row per market to
-    recover strike + a mark price (mid of mkt_bid/mkt_ask). run_meta.json
-    does not carry a market-slug -> strike map (only the strike ladder), so
-    strike is sourced from quotes.csv instead, which already carries it
-    per row -- see report for this deviation from the plan sketch."""
+    """Join `inventory` rows with the state db's `markets` registry (PRIMARY
+    source for strike + expiry -- an old-event market with open inventory but
+    no recent quotes row would otherwise show strike=None) and with the
+    latest quotes.csv row per market (mark-price enrichment only: mid of
+    mkt_bid/mkt_ask, with quotes.csv strike as a fallback for legacy dbs
+    whose registry predates the markets table). `expiry_key` is the legacy
+    single-expiry fallback for markets missing from the registry."""
     if inv_df is None or inv_df.empty:
         return pd.DataFrame()
+
+    expiry_map = mmh.registry_expiry_map(registry_df)
+    strike_map = mmh.registry_strike_map(registry_df)
 
     latest_quotes: Dict[str, pd.Series] = {}
     if quotes_df is not None and not quotes_df.empty and "market" in quotes_df.columns:
@@ -263,11 +275,13 @@ def build_positions_table(
         q = float(r["q"])
         avg_cost = float(r["avg_cost"])
         q_max = float(r["q_max"])
-        strike = None
+        strike = strike_map.get(str(market))
+        expiry = expiry_map.get(str(market), expiry_key)
         mark = None
         qr = latest_quotes.get(market)
         if qr is not None:
-            strike = _num_or_none(qr.get("strike"))
+            if strike is None:
+                strike = _num_or_none(qr.get("strike"))
             bid = _num_or_none(qr.get("mkt_bid"))
             ask = _num_or_none(qr.get("mkt_ask"))
             if bid is not None and ask is not None:
@@ -279,7 +293,8 @@ def build_positions_table(
         util = (abs(q) / q_max) if q_max else 0.0
         unrealized = (q * (mark - avg_cost)) if mark is not None else None
         rows.append({
-            "market": market, "strike": strike, "expiry": expiry_key,
+            "market": market, "strike": strike,
+            "expiry": expiry if expiry is not None else mmh.UNKNOWN_EXPIRY,
             "q": q, "avg_cost": avg_cost, "q_max": q_max, "util": util,
             "mark": mark, "unrealized": unrealized,
         })
@@ -334,6 +349,22 @@ def render_status_row(status: "run_control.EngineStatus") -> None:
     cols[3].metric("Feed healthy", "yes" if feed_healthy else ("no" if feed_healthy is not None else "n/a"))
     cols[4].metric("Fills total", str(hb.get("fills_total", "n/a")))
     cols[5].metric("No-arb violations", str(hb.get("noarb_violations", "n/a")))
+
+    # Multi-expiry: per-expiry badges from the additive heartbeat `expiries`
+    # dict (absent on old single-expiry heartbeats -> nothing rendered).
+    expiries = hb.get("expiries") or {}
+    if expiries:
+        n_active = hb.get("n_expiries_active", len(expiries))
+        parts = []
+        for ek in sorted(expiries):
+            e = expiries[ek]
+            parts.append("%s [%s] feed=%s fills=%s%s" % (
+                ek, e.get("state", "?"),
+                "ok" if e.get("feed_healthy") else "DOWN",
+                e.get("fills", "?"),
+                " FROZEN" if e.get("bankroll_frozen") else "",
+            ))
+        st.caption("Active expiries (%s): %s" % (n_active, "  |  ".join(parts)))
 
 
 def render_controls(status: "run_control.EngineStatus", control_dir: Path) -> None:
@@ -429,14 +460,43 @@ def render_pnl(db_path: Optional[Path], run_meta: Optional[Dict[str, Any]]) -> N
     st.plotly_chart(fig, use_container_width=True)
 
 
-def render_positions(db_path: Optional[Path], out_dir: Optional[Path], run_meta: Optional[Dict[str, Any]]) -> None:
-    if run_meta:
-        strikes = run_meta.get("strikes") or []
-        st.caption(
+def _expiry_tab_caption(container, expiry: str, run_meta: Optional[Dict[str, Any]]) -> None:
+    """Per-tab caption: this expiry's own event slug + strikes (from the
+    multi-expiry run_meta events list when present) -- the old top-level
+    caption read the legacy singular fields, which point at the NEAREST
+    expiry only and would mislead across tabs."""
+    meta = mmh.event_meta_by_expiry(run_meta).get(expiry)
+    if meta:
+        container.caption(
             "%s | expiry %s | strikes: %s"
-            % (run_meta.get("event_slug", "?"), run_meta.get("expiry_key", "?"), strikes)
+            % (meta.get("event_slug", "?"), expiry, meta.get("strikes") or [])
         )
+    else:
+        container.caption("expiry %s (not part of the current run)" % expiry)
 
+
+def _render_expiry_tabs(
+    df: pd.DataFrame, run_meta: Optional[Dict[str, Any]],
+    render_one, empty_msg: str,
+) -> None:
+    """Shared per-expiry st.tabs scaffold: `df` must carry an `expiry`
+    column; `render_one(container, expiry, sub_df)` renders one tab."""
+    if df is None or df.empty:
+        st.info(empty_msg)
+        return
+    data_expiries = df["expiry"].astype(str).tolist() if "expiry" in df.columns else []
+    tabs_order = mmh.expiry_tabs_order(mmh.run_meta_expiries(run_meta), data_expiries)
+    if not tabs_order:
+        st.info(empty_msg)
+        return
+    by_expiry = mmh.split_by_expiry(df)
+    tabs = st.tabs(tabs_order)
+    for label, tab in zip(tabs_order, tabs):
+        with tab:
+            render_one(tab, label, by_expiry.get(label, pd.DataFrame()))
+
+
+def render_positions(db_path: Optional[Path], out_dir: Optional[Path], run_meta: Optional[Dict[str, Any]]) -> None:
     inv_df, err = load_db_table(db_path, INVENTORY_SQL)
     if err:
         st.info(err)
@@ -445,16 +505,45 @@ def render_positions(db_path: Optional[Path], out_dir: Optional[Path], run_meta:
         st.info("no inventory rows yet")
         return
 
+    registry_df, _reg_err = load_db_table(db_path, MARKETS_SQL)
     quotes_df = load_csv(out_dir / "quotes.csv") if out_dir else pd.DataFrame()
     expiry_key = run_meta.get("expiry_key") if run_meta else None
-    table = build_positions_table(inv_df, quotes_df, expiry_key)
+    table = build_positions_table(inv_df, quotes_df, expiry_key, registry_df)
     if table.empty:
         st.info("no positions to show")
-    else:
-        st.dataframe(table, use_container_width=True, hide_index=True)
+        return
+
+    def _one(tab, expiry, sub):
+        _expiry_tab_caption(tab, expiry, run_meta)
+        if sub.empty:
+            tab.info("no positions for this expiry")
+        else:
+            tab.dataframe(sub.drop(columns=["expiry"]), use_container_width=True, hide_index=True)
+
+    _render_expiry_tabs(table, run_meta, _one, "no positions to show")
 
 
-def render_fills(out_dir: Optional[Path]) -> None:
+def render_open_orders(db_path: Optional[Path], run_meta: Optional[Dict[str, Any]]) -> None:
+    orders_df, err = load_db_table(db_path, OPEN_ORDERS_SQL)
+    if err:
+        st.info(err)
+        return
+    if orders_df is None or orders_df.empty:
+        st.info("no open (PENDING/LIVE) orders")
+        return
+    registry_df, _reg_err = load_db_table(db_path, MARKETS_SQL)
+    tagged = mmh.attach_expiry(orders_df, mmh.registry_expiry_map(registry_df), "market_id")
+
+    def _one(tab, expiry, sub):
+        if sub.empty:
+            tab.info("no open orders for this expiry")
+        else:
+            tab.dataframe(sub.drop(columns=["expiry"]), use_container_width=True, hide_index=True)
+
+    _render_expiry_tabs(tagged, run_meta, _one, "no open (PENDING/LIVE) orders")
+
+
+def render_fills(out_dir: Optional[Path], db_path: Optional[Path], run_meta: Optional[Dict[str, Any]]) -> None:
     if out_dir is None:
         st.info("no run directory yet")
         return
@@ -462,7 +551,17 @@ def render_fills(out_dir: Optional[Path]) -> None:
     if fills_df.empty:
         st.info("no fills yet")
         return
-    st.dataframe(fills_df.tail(50).iloc[::-1], use_container_width=True, hide_index=True)
+    registry_df, _reg_err = load_db_table(db_path, MARKETS_SQL)
+    tagged = mmh.attach_expiry(fills_df, mmh.registry_expiry_map(registry_df), "market")
+
+    def _one(tab, expiry, sub):
+        if sub.empty:
+            tab.info("no fills for this expiry")
+        else:
+            tab.dataframe(sub.drop(columns=["expiry"]).tail(50).iloc[::-1],
+                          use_container_width=True, hide_index=True)
+
+    _render_expiry_tabs(tagged, run_meta, _one, "no fills yet")
 
 
 def render_risk_panel(db_path: Optional[Path]) -> None:
@@ -533,6 +632,25 @@ def render_markout(out_dir: Optional[Path]) -> None:
         "sides). coverage = n / n_attempted (share of eligible fills whose "
         "horizon lookup found a mid). Generated %s." % report.get("generated_ts", "?")
     )
+
+    by_expiry = report.get("by_expiry") or {}
+    if by_expiry:
+        st.markdown("**Markout by expiry**")
+        tabs_order = sorted(k for k in by_expiry if k != mmh.UNKNOWN_EXPIRY)
+        if mmh.UNKNOWN_EXPIRY in by_expiry:
+            tabs_order.append(mmh.UNKNOWN_EXPIRY)
+        tabs = st.tabs(tabs_order)
+        for label, tab in zip(tabs_order, tabs):
+            rows = []
+            for horizon, cell in sorted(by_expiry[label].items(), key=lambda kv: float(kv[0])):
+                rows.append({"horizon_s": float(horizon), **cell})
+            edf = pd.DataFrame(rows)
+            if "n_attempted" in edf.columns:
+                n_att = pd.to_numeric(edf["n_attempted"], errors="coerce")
+                n_ok = pd.to_numeric(edf["n"], errors="coerce")
+                edf["coverage"] = (n_ok / n_att).where(n_att > 0, 0.0)
+            with tab:
+                tab.dataframe(edf, use_container_width=True, hide_index=True)
 
 
 def render_quotes_latency(out_dir: Optional[Path]) -> None:
@@ -618,8 +736,11 @@ def main() -> None:
     st.header("Positions")
     render_positions(db_path, out_dir, run_meta)
 
-    st.header("Fills (latest 50)")
-    render_fills(out_dir)
+    st.header("Open orders")
+    render_open_orders(db_path, run_meta)
+
+    st.header("Fills (latest 50 per expiry)")
+    render_fills(out_dir, db_path, run_meta)
 
     st.header("Risk")
     render_risk_panel(db_path)

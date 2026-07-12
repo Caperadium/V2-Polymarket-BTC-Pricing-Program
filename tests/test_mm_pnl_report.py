@@ -714,3 +714,100 @@ def test_markout_by_region_rollup_collapses_tte_bucket():
     rollup = report["by_region"]["belly"]["60.0"]
     assert rollup["n"] == 2
     assert rollup["mk_avg"] == pytest.approx(0.0)  # (+0.10 + -0.10) / 2
+
+
+# ---------------------------------------------------------------------------
+# multi-expiry -- expiry_by_market stamping + expiry_key=None TOTAL mode
+# ---------------------------------------------------------------------------
+
+
+def test_expiry_by_market_stamps_per_market_rows():
+    fills = [
+        _fill("m-a", Side.BUY_YES, 0.40, 5.0),
+        _fill("m-b", Side.BUY_YES, 0.30, 2.0, order_id="o2"),
+    ]
+    inv = {
+        "m-a": ContractInv(q=5.0, avg_cost=0.40, q_max=100.0, age_weighted_holding=0.0),
+        "m-b": ContractInv(q=2.0, avg_cost=0.30, q_max=100.0, age_weighted_holding=0.0),
+    }
+    rows = compute_pnl_rows(
+        NOW, None, fills, inv, {"m-a": None, "m-b": None}, {"m-a": None, "m-b": None},
+        1000.0, expiry_by_market={"m-a": "2026-07-06", "m-b": "2026-07-07"},
+    )
+    by_market = {r.market_id: r for r in rows}
+    assert by_market["m-a"].expiry_key == "2026-07-06"
+    assert by_market["m-b"].expiry_key == "2026-07-07"
+    # TOTAL row keeps the passed expiry_key (None = all expiries)
+    assert by_market[None].expiry_key is None
+    # and is still exactly the sum of per-market rows
+    assert by_market[None].realized == pytest.approx(
+        by_market["m-a"].realized + by_market["m-b"].realized
+    )
+
+
+def test_expiry_key_none_settlement_breakdown_spans_all_expiries():
+    fills = [_fill("m-a", Side.BUY_YES, 0.40, 5.0)]
+    inv = {"m-a": ContractInv(q=0.0, avg_cost=0.0, q_max=100.0, age_weighted_holding=0.0)}
+    def _sev(expiry_key, pnl):
+        return SettlementEvent(
+            ts=NOW, settlement_ts=NOW, market_id="m-a", expiry_key=expiry_key,
+            strike=98000.0, outcome=SettlementOutcome.YES, spot_used=101000.0,
+            spot_source=SpotSource.INTRADAY, q_settled=5.0, payoff=5.0,
+            pnl_realized=pnl, excluded_from_gate=False,
+        )
+
+    settlements = [_sev("2026-07-06", 3.0), _sev("2026-07-05", 0.5)]
+    # None -> BOTH expiries' settlement pnl included
+    rows = compute_pnl_rows(NOW, None, fills, inv, {"m-a": None}, {"m-a": None},
+                            1000.0, settlements=settlements)
+    row_a = next(r for r in rows if r.market_id == "m-a")
+    assert row_a.settlement_pnl == pytest.approx(3.5)
+    # Legacy single-expiry filter unchanged: only the matching expiry counts.
+    rows2 = compute_pnl_rows(NOW, "2026-07-06", fills, inv, {"m-a": None}, {"m-a": None},
+                             1000.0, settlements=settlements)
+    row_a2 = next(r for r in rows2 if r.market_id == "m-a")
+    assert row_a2.settlement_pnl == pytest.approx(3.0)
+
+
+def test_legacy_default_without_expiry_by_market_unchanged():
+    fills = [_fill("m-a", Side.BUY_YES, 0.40, 5.0)]
+    inv = {"m-a": ContractInv(q=5.0, avg_cost=0.40, q_max=100.0, age_weighted_holding=0.0)}
+    rows = compute_pnl_rows(NOW, "2026-07-06", fills, inv, {"m-a": None}, {"m-a": None}, 1000.0)
+    assert all(r.expiry_key == "2026-07-06" for r in rows)
+
+
+# ---------------------------------------------------------------------------
+# multi-expiry -- markout_report by_expiry rollup
+# ---------------------------------------------------------------------------
+
+
+def test_markout_report_by_expiry_rollup():
+    ek_a, ek_b = "2026-07-06", "2026-07-07"
+    registry = {"m-a": (ek_a, 98000.0), "m-b": (ek_b, 98000.0)}
+    fills = [
+        _paper_fill("m-a", Side.BUY_YES, 0.40, 5.0, mid_at_fill=0.50, ts=NOW),
+        _paper_fill("m-b", Side.BUY_NO, 0.60, 2.0, mid_at_fill=0.60, ts=NOW, order_id="o2"),
+    ]
+
+    def _mid_lookup(market_id, ts, ts_max):
+        return {"m-a": 0.55, "m-b": 0.58}[market_id]
+
+    report = markout_report(fills, _mid_lookup, registry, (0.2, 0.8), horizons=(60.0,), now=NOW)
+    assert set(report["by_expiry"].keys()) == {ek_a, ek_b}
+    cell_a = report["by_expiry"][ek_a]["60.0"]
+    cell_b = report["by_expiry"][ek_b]["60.0"]
+    # BUY_YES @ 0.40 vs mid 0.55 -> +0.15; BUY_NO @ 0.60 vs mid 0.58 -> +0.02
+    assert cell_a["n"] == 1 and cell_a["mk_avg"] == pytest.approx(0.15)
+    assert cell_b["n"] == 1 and cell_b["mk_avg"] == pytest.approx(0.02)
+
+
+def test_markout_report_by_expiry_unknown_bucket_for_unregistered():
+    fills = [_paper_fill("m-x", Side.BUY_YES, 0.40, 1.0, mid_at_fill=0.50, ts=NOW)]
+
+    def _mid_lookup(market_id, ts, ts_max):
+        return None
+
+    report = markout_report(fills, _mid_lookup, {}, (0.2, 0.8), horizons=(60.0,), now=NOW)
+    assert set(report["by_expiry"].keys()) == {"unknown"}
+    cell = report["by_expiry"]["unknown"]["60.0"]
+    assert cell["n"] == 0 and cell["n_attempted"] == 1

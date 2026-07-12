@@ -477,3 +477,67 @@ def test_main_runs_end_to_end_against_tmp_control_dir(tmp_path, monkeypatch, cap
     rc = mm_alert_check.main(["--control-dir", str(control_dir)])
     assert rc == 0
     assert (control_dir / mm_alert_check.ALERT_STATE_FILENAME).exists()
+
+
+# ---------------------------------------------------------------------------
+# multi-expiry -- _check_ladder_settlement_timeouts / _check_no_active_expiries
+# ---------------------------------------------------------------------------
+
+
+def test_ladder_settlement_timeouts_fires_on_positive_count():
+    hb = {"ladder_settlement_timeouts": 2}
+    result = mm_alert_check._check_ladder_settlement_timeouts(hb)
+    assert result is not None
+    key, msg = result
+    assert key == "ladder_settlement_timeouts"
+    assert "2 ladder(s)" in msg
+
+
+def test_ladder_settlement_timeouts_noop_on_old_heartbeat():
+    # pre-multi-expiry heartbeat lacks the field entirely
+    assert mm_alert_check._check_ladder_settlement_timeouts({"tick": 5}) is None
+    assert mm_alert_check._check_ladder_settlement_timeouts(None) is None
+    assert mm_alert_check._check_ladder_settlement_timeouts(
+        {"ladder_settlement_timeouts": 0}
+    ) is None
+
+
+def test_no_active_expiries_sustained_fires():
+    state = {}
+    hb = {"n_expiries_active": 0}
+    # first observation only starts the clock
+    assert mm_alert_check._check_no_active_expiries(hb, _status(), state, now=1000.0) is None
+    # sustained past the threshold -> alert
+    result = mm_alert_check._check_no_active_expiries(
+        hb, _status(), state, now=1000.0 + mm_alert_check.FEED_UNHEALTHY_ALERT_S + 1.0
+    )
+    assert result is not None
+    assert result[0] == "no_active_expiries"
+
+
+def test_no_active_expiries_resets_when_active_or_stopped():
+    state = {}
+    hb_active = {"n_expiries_active": 2}
+    assert mm_alert_check._check_no_active_expiries(hb_active, _status(), state, now=1000.0) is None
+    assert state["last_expiries_active_ts"] == 1000.0
+    # 0 active but engine STOPPED -> intentional, no clock
+    hb_idle = {"n_expiries_active": 0}
+    assert mm_alert_check._check_no_active_expiries(
+        hb_idle, _status(state="STOPPED"), state, now=99999.0
+    ) is None
+    assert state["last_expiries_active_ts"] == 99999.0
+
+
+def test_no_active_expiries_noop_on_old_heartbeat():
+    state = {}
+    assert mm_alert_check._check_no_active_expiries({"tick": 3}, _status(), state, now=1.0) is None
+    assert state == {}
+
+
+def test_collect_alerts_includes_multi_expiry_checks():
+    hb = {"ladder_settlement_timeouts": 1, "n_expiries_active": 1}
+    alerts = mm_alert_check._collect_alerts(
+        _status(heartbeat=hb), {}, now=1000.0, repo_root=PROJECT_ROOT,
+    )
+    keys = [k for k, _m in alerts]
+    assert "ladder_settlement_timeouts" in keys

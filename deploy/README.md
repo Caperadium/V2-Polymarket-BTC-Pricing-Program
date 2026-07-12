@@ -72,11 +72,17 @@ sudo systemctl enable --now mm-paper.service
 ```
 
 `market_maker/paper_run_config.json` (checked in) is the config the unit
-points at: `event_slug: "auto"` (auto-rolls to the next `bitcoin-above`
-event via `resolve_next_event`), `state_db: "market_maker/mm_paper_state.db"`
-(persistent, survives restarts -- see "Resumable state" below), `minutes: 0`
-(run indefinitely). Edit it in place if you want different tick/reprice
-cadence or bankroll; no code changes needed.
+points at: `event_slug: "auto"` (multi-expiry acquisition via
+`resolve_events_multi`; rollover is now IN-PROCESS -- a settled ladder is
+torn down and replaced without a restart), `state_db:
+"market_maker/mm_paper_state.db"` (persistent, survives restarts -- see
+"Resumable state" below), `minutes: 0` (run indefinitely). Add
+`"max_expiries": N` (default 1) to quote up to N concurrent expiry ladders;
+the sizing bankroll is statically split as `bankroll / max_expiries` per
+ladder. Edit it in place if you want different tick/reprice cadence or
+bankroll; no code changes needed. The persistent state db is forward- and
+backward-compatible with the multi-expiry runner as-is (no schema changes;
+expiry attribution joins through the existing `markets` registry).
 
 **Start the 72h acceptance run (section 5) on a fresh `--state-db`.**
 Resuming a pre-fix state-db that has an open BUY_NO position will show a
@@ -206,41 +212,45 @@ graceful and always the right tool for routine stops.
 
 ### What exit code 42 means
 
-The runner intentionally exits **42** when a ladder finishes settling
-(`ladder_settled`) or when it gives up waiting for an UNSETTLEABLE market
-(`settlement_timeout`, after `--max-settlement-wait-h`, default 26h). This
-is a *rollover signal*, not a fault: `RestartForceExitStatus=42` in
-`mm-paper.service` makes systemd treat it the same as `Restart=on-failure`,
-so the process restarts and (with `event_slug: "auto"`) picks up the next
-`bitcoin-above` event automatically. `settlement_timeout` specifically also
-triggers a page from `mm-alert` (an UNSETTLEABLE market needs a human to
-check why BTC data coverage was missing at the settlement instant) --
-unsettled positions themselves are not lost: they stay open in the
-persisted state db and are retried by the next start's resume/catch-up.
+In **auto mode** (`event_slug: "auto"`), rollover is now IN-PROCESS: a
+ladder that finishes settling (or times out waiting on an UNSETTLEABLE
+market after `--max-settlement-wait-h`, default 26h) is torn down in place
+and acquisition immediately probes for a replacement event -- the process
+does NOT exit for this. The runner exits **42** only for
+`no_quotable_events`: zero active ladders AND the acquisition probe found
+nothing quotable. `RestartForceExitStatus=42` in `mm-paper.service` makes
+systemd treat it the same as `Restart=on-failure`, so the process restarts
+at `RestartSec=60` and retries until the venue lists a suitable event --
+expected behavior when Polymarket has not yet published the next daily
+markets, not a fault.
+
+In **fixed-slug mode** (a concrete `--event-slug`), the legacy behavior is
+unchanged: `ladder_settled` / `settlement_timeout` -> exit 42.
+
+An in-process settlement timeout pages via the mm-alert heartbeat check
+(`ladder_settlement_timeouts` > 0 -- an UNSETTLEABLE market needs a human
+to check why BTC data coverage was missing at the settlement instant).
+Unsettled positions themselves are not lost: they stay open in the
+persisted state db and are retried by the runner's recurring settlement
+catch-up pass (throttled ~1/60s while any orphaned market is past its
+instant and non-terminal) and by the next start's resume catch-up.
 
 Exit **1** (`feed_dead` / `tick_errors` / an early unhandled exception) is
 an ordinary supervised restart. Exit **0** (`completed` / `stop_file` /
 `sigterm` / `sigint`) means an intentional stop -- no restart.
 
-### Known benign crash-loop: no future event published yet
+### Known benign retry loop: no future event published yet
 
-After a rollover exit (42), `--event-slug auto` calls `resolve_next_event`,
-which probes the Gamma API for the next `bitcoin-above-on-<date>` event up
-to `auto_event_lead_days + 4` days out. If the venue has not published a
-market for any of those dates yet (this happens -- new daily markets are
-not always listed multiple days ahead), `resolve_next_event` raises
-`SystemExit`, the runner exits with an early-failure reason (`exit_reason`
-prefixed `error:`), and returns exit code 1. Systemd retries at
-`RestartSec=60` until a suitable event appears on the venue, then the run
-proceeds normally.
-
-This is **expected behavior**, not a fault, and does not need operator
-intervention -- it self-resolves once Polymarket lists the next market. The
-`mm-alert` de-dupe window (6h per alert key) keeps this to at most one page
-even if the retry loop runs for hours; the alert fires under the `CRASHED`
-state check (PID file present-then-gone between retries can also surface
-transiently as `STOPPED` with an `error:` exit_reason, which is not one of
-the alert conditions by itself -- only sustained `CRASHED`/`STALLED` pages).
+If the venue has not published quotable `bitcoin-above` events inside
+`auto_event_lead_days + 4` days (this happens -- new daily markets are not
+always listed multiple days ahead), the runner exits 42
+(`no_quotable_events`) and systemd retries at `RestartSec=60` until one
+appears. While the runner is alive with at least one ladder, an empty
+acquisition probe just backs off `acquire_retry_s` (default 600s) and the
+remaining ladders keep quoting. This is **expected behavior** and does not
+need operator intervention. A sustained zero-ladder state while running
+pages once via the `no_active_expiries` alert (15min threshold, 6h
+de-dupe).
 
 ## 4. Log rotation
 
@@ -276,18 +286,23 @@ Before trusting this for an unattended month, run the following once,
 end-to-end, on the actual VPS (not the dev machine):
 
 1. Start `mm-paper.service` against `event_slug: "auto"` so it picks up
-   whatever event is currently closest to settling (pick a moment where
-   settlement is within the 72h window so you actually observe a rollover).
+   whatever events are currently closest to settling (pick a moment where
+   a settlement is within the 72h window so you actually observe a
+   rollover).
 2. Let it run undisturbed long enough to observe: at least one full ladder
    reach `settlement_instant_utc`, settle (`_all_settled_terminal` true),
-   exit 42, and restart onto the next auto-resolved event.
+   and roll over IN-PROCESS onto the next auto-resolved event (check the
+   log for "tearing down ladder ..." followed by "ladder acquired: ...";
+   the heartbeat's `ladders_settled_total` increments and the process PID
+   does not change). With `max_expiries` > 1, also confirm the other
+   ladder(s) kept quoting through the rollover.
 3. **Forced kill -9**: pick a moment mid-run, `sudo systemctl kill -s SIGKILL
    mm-paper.service` (or `kill -9 <pid>` directly). Confirm:
    - systemd restarts it (`Restart=on-failure` covers SIGKILL same as any
      other abnormal exit).
-   - The resume protocol fires (`mark_all_live_orders_unknown` ->
-     `loop.restart()` -> `loop.settle(catch_up=True)`) -- check the log for
-     "state db ... already existed; running resume protocol".
+   - The resume protocol fires (standalone settlement catch-up pass ->
+     per-slot filtered `resume_attach` -> one venue reconcile) -- check the
+     log for "state db ... already existed; running resume protocol".
    - Post-restart inventory matches `fold(fills)` (the runner's own
      `summary.md` on the eventual clean exit reports `fold(fills) ==
      inventory`; the check compares both `q` AND `avg_cost` per market;

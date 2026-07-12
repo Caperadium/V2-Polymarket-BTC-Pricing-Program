@@ -757,39 +757,73 @@ read-only in the monitoring dashboard (`app/pages/mm_monitor.py`).
   WebSocket, so real trade prints reach the fill simulator. This is what runs
   unattended on the VPS.
 
+### 15.1b Multi-expiry orchestration
+
+Stage B can quote up to `--max-expiries` concurrent expiry ladders
+(`multi_runner.MultiExpiryOrchestrator`). The single-expiry
+`PaperTradingLoop` is unchanged; the orchestrator owns one "ladder slot" per
+expiry -- each with its own loop, its own WS connection and its own sim
+clock -- over one shared state store, one shared vol gate, one shared BTC
+data provider and one shared pricing engine. The engine shares a single
+GARCH fit (and one set of calibrated jump params) across per-expiry ladder
+caches, and hands out ONE reprice token per tick: the first due expiry (in
+round-robin rotation) recomputes, the rest serve their cached ladder, and a
+brand-new expiry's slot is skipped entirely until its first-price grant
+lands -- so a tick never blocks for more than one engine call, and K fresh
+ladders warm up over K ticks. The sizing bankroll is statically split
+(`bankroll / max_expiries` per ladder); the Beuoy credibility bankroll was
+already per-expiry.
+
+Rollover is in-process: a fully-settled (or settlement-timed-out) ladder is
+torn down in place -- final settle attempt, scoped per-market order
+cancels, ladder-state flush, adapter stop -- and acquisition immediately
+probes for the next event (`resolve_events_multi`: capped, expiry-deduped,
+skip-on-thin-ladder, empty-list-on-nothing). The process itself only exits
+when there is nothing left to quote at all.
+
 ### 15.2 The control loop from outside
 
 A stdlib-only control-file protocol (`run_control.py`) governs the process:
 a PID file, a touch-to-stop file, a start lock, and `current_run.json`
-pointing at the latest run and its exit reason. Each run rewrites
-`heartbeat.json` every tick with tick counters, feed health, BTC-data age,
-resume discrepancies, and the bankroll-frozen flag; `engine_status()` derives
-RUNNING / STARTING / STALLED / STOPPED / CRASHED from these files. Exit codes
-are contracts with systemd: 42 means expected rollover (ladder settled, or
-settlement timed out) and triggers a restart onto the next event
-(`--event-slug auto`); 1 means a supervised restart (dead feed, repeated tick
-errors); 0 means a clean stop.
+pointing at the latest run and its exit reason (plus an `events` list of
+every active ladder; the legacy singular fields point at the nearest
+expiry). Each run rewrites `heartbeat.json` every tick with tick counters,
+feed health (AND over active ladders), BTC-data age, resume discrepancies,
+the bankroll-frozen flag (OR over ladders), and per-expiry breakdowns
+(`n_expiries_active`, `ladders_settled_total`, `ladder_settlement_timeouts`,
+`expiries`); `engine_status()` derives RUNNING / STARTING / STALLED /
+STOPPED / CRASHED from these files. Exit codes are contracts with systemd:
+42 means "nothing quotable" in auto mode (`no_quotable_events` -- rollover
+itself is in-process now) or the legacy settled/timeout signal in fixed-slug
+mode, and triggers a retry restart; 1 means a supervised restart (dead feed,
+repeated tick errors); 0 means a clean stop.
 
 Two guards run every tick: the **BTC staleness guard** stats the intraday CSV
 (refreshed by a separate systemd timer, never by the runner) and flips
 `manual_override=True` -- pull everything -- if it exceeds 2 h; and the alert
 timer (`scripts/mm_alert_check.py`, every 5 min) pages a webhook on CRASHED /
 STALLED / unhealthy-feed streak / stale data / low disk / resume discrepancies
-/ frozen bankroll, de-duplicated, plus one daily heartbeat message so webhook
-silence is distinguishable from a dead alert pipeline.
+/ frozen bankroll / in-process ladder settlement timeouts / sustained
+zero-active-expiries, de-duplicated, plus one daily heartbeat message so
+webhook silence is distinguishable from a dead alert pipeline.
 
 ### 15.3 Surviving restarts
 
 With `--state-db`, the SQLite state store (orders, fills, inventory, markets
 registry, mid log; WAL mode) persists across restarts. A resumed run executes
-a strict sequence: mark all previously-live orders UNKNOWN -> rebuild
-inventory by replaying the full fills table into a fresh InventoryManager ->
-run catch-up settlement over the merged market registry (a previous event's
-still-open positions settle before quoting resumes) -> reconcile against the
-venue. Any position discrepancy found holds `manual_override=True` (quotes
-pulled) until the first clean tick, and is surfaced in the heartbeat and the
-alert path. The design principle: **the fills table is the source of truth**;
-everything in memory must be reconstructible from it.
+a strict sequence: ONE standalone catch-up settlement pass over the merged
+market registry (a previous event's still-open positions settle -- via
+SETTLEMENT pseudo-fills written through the fills table -- BEFORE any
+replay) -> each ladder's loop rebuilds its inventory by replaying ONLY its
+own markets' fills (`resume_attach`) -> ONE venue reconcile (all fill sims
+are empty at process start, so stale orders cancel and the position check is
+the global fold vs the global store inventory). Any position discrepancy
+found holds `manual_override=True` (quotes pulled) until the first clean
+tick, and is surfaced in the heartbeat and the alert path. Mid-run-acquired
+ladders never run the reconcile (it is store-global); a recurring throttled
+catch-up pass re-drives orphaned UNSETTLEABLE positions as fresh BTC data
+lands. The design principle: **the fills table is the source of truth**;
+everything in memory must be reconstructible from it, per ladder.
 
 ---
 

@@ -21,11 +21,20 @@ What it does, once per invocation:
        - heartbeat.resume_discrepancies > 0 (the resume protocol found a
          store/venue position mismatch on restart -- plan Wave 0 W0.1)
        - heartbeat.bankroll_frozen is true (the Beuoy bankroll degenerated
-         and has not yet auto-unfrozen -- plan Wave 1 W1.3)
+         and has not yet auto-unfrozen -- plan Wave 1 W1.3; under
+         multi-expiry this is the OR over active ladders' anchors)
+       - heartbeat.ladder_settlement_timeouts > 0 (multi-expiry: a ladder
+         was torn down IN-PROCESS on its settlement timeout -- auto mode no
+         longer exits the process for this, so the STOPPED-based check below
+         cannot see it)
+       - heartbeat.n_expiries_active == 0 sustained > 15 min while RUNNING
+         (multi-expiry: alive but quoting nothing; acquisition empty)
        - free disk on the repo-root filesystem is below 1 GB
        - the engine is STOPPED and the last run's current_run.json recorded
          exit_reason == "settlement_timeout" (an UNSETTLEABLE ladder that
          needs operator attention -- see deploy/README.md)
+     The multi-expiry checks are tolerant of their fields' absence, so old
+     single-expiry heartbeats simply no-op them.
   3. For each triggered condition, POST `{"text": "<message>"}` to
      `$MM_ALERT_WEBHOOK` (a generic JSON webhook body -- works with Discord/
      Slack/ntfy-style relays). If the env var is unset, the message is
@@ -215,6 +224,57 @@ def _check_bankroll_frozen(heartbeat: Optional[Dict[str, Any]]) -> Optional[Tupl
             "FIXED_BLEND_FALLBACK until enough consecutive clean BEUOY ticks auto-unfreeze it")
 
 
+def _check_ladder_settlement_timeouts(heartbeat: Optional[Dict[str, Any]]) -> Optional[Tuple[str, str]]:
+    """heartbeat.ladder_settlement_timeouts > 0 -- a multi-expiry ladder was
+    torn down IN-PROCESS on its per-ladder settlement timeout (auto mode no
+    longer exits the process for this, so the old STOPPED+settlement_timeout
+    check would never see it). Absent on old single-expiry heartbeats ->
+    no-op. The counter is monotonic for the life of the run; the 6h de-dupe
+    bounds paging on a persisting count."""
+    if not isinstance(heartbeat, dict):
+        return None
+    n = heartbeat.get("ladder_settlement_timeouts")
+    if not isinstance(n, (int, float)) or n <= 0:
+        return None
+    return ("ladder_settlement_timeouts",
+            "mm-paper tore down %d ladder(s) on settlement timeout (in-process rollover) -- "
+            "unsettled positions stay open in the state db and are retried by the recurring "
+            "settlement catch-up pass, but this needs operator attention" % int(n))
+
+
+def _check_no_active_expiries(
+    heartbeat: Optional[Dict[str, Any]], status: Any, state: Dict[str, Any], now: float,
+    threshold_s: float = FEED_UNHEALTHY_ALERT_S,
+) -> Optional[Tuple[str, str]]:
+    """heartbeat.n_expiries_active == 0 sustained while RUNNING -- the
+    multi-expiry runner is alive but quoting nothing (acquisition keeps
+    coming up empty). Absent on old single-expiry heartbeats -> no-op.
+    Sustained-streak tracked across invocations like the feed-health check
+    (mutates `state` in place)."""
+    if not isinstance(heartbeat, dict):
+        return None
+    n = heartbeat.get("n_expiries_active")
+    if not isinstance(n, (int, float)):
+        return None  # pre-multi-expiry heartbeat
+    if n > 0 or getattr(status, "state", "") not in ("RUNNING", "STARTING"):
+        state["last_expiries_active_ts"] = now
+        return None
+    last_active = state.get("last_expiries_active_ts")
+    if last_active is None:
+        state["last_expiries_active_ts"] = now
+        return None
+    try:
+        age = now - float(last_active)
+    except (TypeError, ValueError):
+        state["last_expiries_active_ts"] = now
+        return None
+    if age > threshold_s:
+        return ("no_active_expiries",
+                "mm-paper has had 0 active expiry ladders for %.0fs (> %.0fs) while running -- "
+                "acquisition keeps finding no quotable events" % (age, threshold_s))
+    return None
+
+
 def _check_disk_free(repo_root: Path) -> Optional[Tuple[str, str]]:
     try:
         free = shutil.disk_usage(str(repo_root)).free
@@ -268,6 +328,9 @@ def _heartbeat_message(status: Any, repo_root: Path) -> str:
         parts.append("tick=%s" % hb.get("tick"))
         parts.append("feed_healthy=%s" % hb.get("feed_healthy"))
         parts.append("fills=%s" % hb.get("fills_total"))
+        if isinstance(hb.get("n_expiries_active"), (int, float)):
+            parts.append("expiries=%s" % int(hb["n_expiries_active"]))
+            parts.append("rolled=%s" % hb.get("ladders_settled_total", 0))
         age = hb.get("btc_data_age_s")
         if isinstance(age, (int, float)):
             parts.append("btc_age=%.0fs" % age)
@@ -292,6 +355,8 @@ def _collect_alerts(
         _check_btc_stale(status.heartbeat, btc_stale_max_s),
         _check_resume_discrepancies(status.heartbeat),
         _check_bankroll_frozen(status.heartbeat),
+        _check_ladder_settlement_timeouts(status.heartbeat),
+        _check_no_active_expiries(status.heartbeat, status, state, now),
         _check_disk_free(repo_root),
         _check_settlement_timeout(status),
     ]

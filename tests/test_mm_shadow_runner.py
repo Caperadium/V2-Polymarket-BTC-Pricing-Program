@@ -227,3 +227,132 @@ def test_garch_cache_expires_and_refits(monkeypatch):
     assert engine._garch_fitted_at == pytest.approx(150.0)
     assert engine._garch_cache == {"fit_marker": True}
     assert len(calls) == 3
+
+
+# ---------------------------------------------------------------------------
+# multi-expiry -- resolve_events_multi
+# ---------------------------------------------------------------------------
+
+
+def _multi_payload_router(events: dict):
+    """Build a _get stub: events maps slug -> (endDate, strikes tuple).
+    Unknown slugs 404."""
+    def _fake_get(url):
+        for slug, (end, strikes) in events.items():
+            if f"slug={slug}" in url:
+                return _event_payload(end, strikes)[0:1] if strikes else []
+        raise _http_error(404)
+    return _fake_get
+
+
+def test_resolve_events_multi_cap_and_ordering(monkeypatch):
+    cfg = MMConfig(near_resolution_pull_hours=24.0)
+    events = {
+        "bitcoin-above-on-july-10-2026": ("2026-07-10T12:00:00Z", (98000.0, 102000.0)),
+        "bitcoin-above-on-july-11-2026": ("2026-07-11T12:00:00Z", (98000.0, 102000.0)),
+        "bitcoin-above-on-july-12-2026": ("2026-07-12T12:00:00Z", (98000.0, 102000.0)),
+    }
+    monkeypatch.setattr(shadow_runner, "_get", _multi_payload_router(events))
+    monkeypatch.setattr(shadow_runner.time, "sleep", lambda s: None)
+
+    out = shadow_runner.resolve_events_multi(NOW, lead_days=5, max_n=2, config=cfg)
+    assert len(out) == 2  # capped at max_n
+    assert [ek for _s, ek, _l in out] == ["2026-07-10", "2026-07-11"]  # nearest first
+    for _slug, _ek, ladder in out:
+        assert len(ladder) == 2
+
+
+def test_resolve_events_multi_exclusion_set(monkeypatch):
+    cfg = MMConfig(near_resolution_pull_hours=24.0)
+    events = {
+        "bitcoin-above-on-july-10-2026": ("2026-07-10T12:00:00Z", (98000.0, 102000.0)),
+        "bitcoin-above-on-july-11-2026": ("2026-07-11T12:00:00Z", (98000.0, 102000.0)),
+    }
+    monkeypatch.setattr(shadow_runner, "_get", _multi_payload_router(events))
+    monkeypatch.setattr(shadow_runner.time, "sleep", lambda s: None)
+
+    out = shadow_runner.resolve_events_multi(
+        NOW, lead_days=5, max_n=3, exclude_expiries={"2026-07-10"}, config=cfg,
+    )
+    assert [ek for _s, ek, _l in out] == ["2026-07-11"]
+
+
+def test_resolve_events_multi_min_lead_filter(monkeypatch):
+    """An event settling within near_resolution_pull_hours + 12h of `now` has
+    no real quoting window and must be skipped."""
+    cfg = MMConfig(near_resolution_pull_hours=24.0)  # min lead = 36h
+    # NOW = 2026-07-07 10:00 UTC. July 8 settles 16:00 UTC on 07-08 = 30h out
+    # (< 36h, skipped); July 9 settles 54h out (kept).
+    events = {
+        "bitcoin-above-on-july-8-2026": ("2026-07-08T12:00:00Z", (98000.0, 102000.0)),
+        "bitcoin-above-on-july-9-2026": ("2026-07-09T12:00:00Z", (98000.0, 102000.0)),
+    }
+    monkeypatch.setattr(shadow_runner, "_get", _multi_payload_router(events))
+    monkeypatch.setattr(shadow_runner.time, "sleep", lambda s: None)
+
+    out = shadow_runner.resolve_events_multi(NOW, lead_days=5, max_n=3, config=cfg)
+    assert [ek for _s, ek, _l in out] == ["2026-07-09"]
+
+
+def test_resolve_events_multi_intra_call_expiry_dedup(monkeypatch):
+    """Padded and unpadded slug forms for day<10 can BOTH resolve to the same
+    expiry -- only one slot's worth of event may come back (reviewer RISK-5)."""
+    cfg = MMConfig(near_resolution_pull_hours=24.0)
+    events = {
+        "bitcoin-above-on-july-9-2026": ("2026-07-09T12:00:00Z", (98000.0, 102000.0)),
+        "bitcoin-above-on-july-09-2026": ("2026-07-09T12:00:00Z", (98000.0, 102000.0)),
+    }
+    monkeypatch.setattr(shadow_runner, "_get", _multi_payload_router(events))
+    monkeypatch.setattr(shadow_runner.time, "sleep", lambda s: None)
+
+    out = shadow_runner.resolve_events_multi(NOW, lead_days=3, max_n=3, config=cfg)
+    assert len(out) == 1
+    assert out[0][1] == "2026-07-09"
+
+
+def test_resolve_events_multi_empty_returns_no_raise(monkeypatch):
+    monkeypatch.setattr(shadow_runner, "_get", _multi_payload_router({}))
+    monkeypatch.setattr(shadow_runner.time, "sleep", lambda s: None)
+    out = shadow_runner.resolve_events_multi(NOW, lead_days=2, max_n=3)
+    assert out == []  # possibly-empty list, never SystemExit
+
+
+def test_resolve_events_multi_thin_ladder_candidate_skipped(monkeypatch):
+    """resolve_event raises SystemExit on a thin (<2 strike) ladder -- the
+    candidate must be SKIPPED, not kill the caller (reviewer RISK-4)."""
+    cfg = MMConfig(near_resolution_pull_hours=24.0)
+    events = {
+        # single-strike event -> resolve_event SystemExit("could not build")
+        "bitcoin-above-on-july-10-2026": ("2026-07-10T12:00:00Z", (98000.0,)),
+        "bitcoin-above-on-july-11-2026": ("2026-07-11T12:00:00Z", (98000.0, 102000.0)),
+    }
+    monkeypatch.setattr(shadow_runner, "_get", _multi_payload_router(events))
+    monkeypatch.setattr(shadow_runner.time, "sleep", lambda s: None)
+
+    out = shadow_runner.resolve_events_multi(NOW, lead_days=5, max_n=2, config=cfg)
+    assert [ek for _s, ek, _l in out] == ["2026-07-11"]
+
+
+def test_resolve_events_multi_venue_outage_returns_partial(monkeypatch):
+    """A venue/network outage mid-probe (SystemExit out of _get_retry) must
+    return whatever was already resolved instead of killing the process."""
+    cfg = MMConfig(near_resolution_pull_hours=24.0)
+    good = _multi_payload_router({
+        "bitcoin-above-on-july-10-2026": ("2026-07-10T12:00:00Z", (98000.0, 102000.0)),
+    })
+    state = {"resolved_one": False}
+
+    def _flaky_get(url):
+        if "july-10-2026" in url:
+            result = good(url)
+            state["resolved_one"] = True
+            return result
+        if state["resolved_one"]:
+            raise ConnectionError("venue down")  # -> _get_retry SystemExit
+        raise _http_error(404)
+
+    monkeypatch.setattr(shadow_runner, "_get", _flaky_get)
+    monkeypatch.setattr(shadow_runner.time, "sleep", lambda s: None)
+
+    out = shadow_runner.resolve_events_multi(NOW, lead_days=5, max_n=3, config=cfg)
+    assert [ek for _s, ek, _l in out] == ["2026-07-10"]

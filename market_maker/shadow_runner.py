@@ -179,6 +179,124 @@ def resolve_next_event(
     )
 
 
+def resolve_events_multi(
+    now: datetime,
+    lead_days: int,
+    max_n: int,
+    exclude_expiries: Optional[set] = None,
+    config: Optional[MMConfig] = None,
+) -> List[Tuple[str, str, List[Tuple[str, float, str]]]]:
+    """Multi-expiry event resolution: return up to `max_n` quotable
+    bitcoin-above events as `[(event_slug, expiry_key, ladder), ...]`,
+    probing the same `now+1 .. now+lead_days+4` window and the same
+    `near_resolution_pull_hours + 12h` min-lead rule as `resolve_next_event`.
+
+    Differences from `resolve_next_event` (multi-expiry orchestrator
+    contract):
+      - returns a possibly-EMPTY list instead of raising SystemExit when
+        nothing is found -- a running process with live ladders must not die
+        because acquisition came up empty;
+      - `exclude_expiries` skips expiries already active or already
+        completed this process (teardown exclusion set);
+      - intra-call dedup by expiry_key: for day<10 both the padded and
+        unpadded slug forms can resolve to the SAME event -- without dedup
+        that would build two slots for one expiry (duplicate markets, double
+        bankroll share);
+      - each candidate's full `resolve_event` is wrapped so its SystemExit
+        (404/empty event, thin ladder, or venue unreachable after retries)
+        skips THAT candidate instead of killing the process; a venue outage
+        during the cheap probe fetch aborts the remaining probe and returns
+        whatever was already resolved.
+    """
+    cfg = config if config is not None else MMConfig()
+    near_h = cfg.near_resolution_pull_hours
+    min_lead = timedelta(hours=near_h + 12.0)
+    horizon_days = int(lead_days) + 4
+    seen: set = set(exclude_expiries or ())
+
+    out: List[Tuple[str, str, List[Tuple[str, float, str]]]] = []
+    for offset in range(1, horizon_days + 1):
+        if len(out) >= max_n:
+            break
+        day = now + timedelta(days=offset)
+        for slug in _candidate_event_slugs(day):
+            if len(out) >= max_n:
+                break
+            try:
+                evs = _get_retry(f"{GAMMA_API}/events?slug={slug}")
+            except urllib.error.HTTPError as exc:
+                if exc.code == 404:
+                    continue  # no event published yet for this date/form
+                logger.warning("probe failed for %s: %s", slug, exc)
+                continue
+            except SystemExit as exc:
+                # Venue/network unreachable after retries: stop probing, keep
+                # whatever we already have (never kill a live process here).
+                logger.warning("venue unreachable during multi-event probe (%s); "
+                               "returning %d event(s) resolved so far", exc, len(out))
+                return out
+            if not evs:
+                continue
+            end = (evs[0].get("endDate") or "")
+            probe_ek = end[:10]
+            if not probe_ek or probe_ek in seen:
+                continue
+            try:
+                settle_at = settlement_instant_utc(probe_ek)
+            except Exception:
+                continue
+            if settle_at <= now + min_lead:
+                continue
+            try:
+                expiry_key, ladder = resolve_event(slug)
+            except SystemExit as exc:
+                logger.warning("resolve_events_multi: skipping %s: %s", slug, exc)
+                continue
+            if expiry_key in seen:
+                continue
+            seen.add(expiry_key)
+            seen.add(probe_ek)
+            out.append((slug, expiry_key, ladder))
+            logger.info("multi-resolved event %s (expiry %s, settles %s)",
+                        slug, expiry_key, settle_at.isoformat())
+    return out
+
+
+def load_jump_params_for_engine() -> Optional[Dict[str, Any]]:
+    """Load bipower-calibrated Kou jump params for calculate_probabilities.
+
+    Module-level so both `CachedEngine` (Stage-A/B single-expiry) and
+    `multi_runner.SharedPricingEngine` (multi-expiry) share one loader.
+    Mirrors run_full_pipeline's key mapping: load_calibrated_jumps returns
+    'lam'/'p_crash' keys, simulate_paths expects 'lambda'/'crash_prob' --
+    passing the raw dict through would silently drop the calibrated
+    lambda/crash back to module defaults. Returns None (engine defaults) if
+    calibration is unavailable or unconverged -- quoting must not die on a
+    calibration failure.
+    """
+    try:
+        from core.pricing.btc_pricing_engine import load_calibrated_jumps
+
+        cal = load_calibrated_jumps()
+        if not cal.get("fit_converged"):
+            logger.warning(
+                "jump calibration not converged; using engine default jumps"
+            )
+            return None
+        return {
+            "lambda": cal["lam"], "crash_prob": cal["p_crash"],
+            "eta_up": cal["eta_up"], "eta_down": cal["eta_down"],
+            "mu_v": cal["mu_v"], "rho_J": cal["rho_J"],
+            "rho_j_slope": cal.get("rho_j_slope", 0.0),
+        }
+    except Exception:
+        logger.warning(
+            "jump calibration load failed; using engine default jumps",
+            exc_info=True,
+        )
+        return None
+
+
 class CachedEngine:
     """Re-price at most every reprice_s; return the cached raw ladder between.
 
@@ -212,34 +330,9 @@ class CachedEngine:
         self.latencies: List[float] = []
 
     def _load_jump_params(self) -> Optional[Dict[str, Any]]:
-        """Load bipower-calibrated Kou jump params for calculate_probabilities.
-
-        Mirrors run_full_pipeline's key mapping: load_calibrated_jumps returns
-        'lam'/'p_crash' keys, simulate_paths expects 'lambda'/'crash_prob' --
-        passing the raw dict through would silently drop the calibrated
-        lambda/crash back to module defaults.
-        """
-        try:
-            from core.pricing.btc_pricing_engine import load_calibrated_jumps
-
-            cal = load_calibrated_jumps()
-            if not cal.get("fit_converged"):
-                logger.warning(
-                    "jump calibration not converged; using engine default jumps"
-                )
-                return None
-            return {
-                "lambda": cal["lam"], "crash_prob": cal["p_crash"],
-                "eta_up": cal["eta_up"], "eta_down": cal["eta_down"],
-                "mu_v": cal["mu_v"], "rho_J": cal["rho_J"],
-                "rho_j_slope": cal.get("rho_j_slope", 0.0),
-            }
-        except Exception:
-            logger.warning(
-                "jump calibration load failed; using engine default jumps",
-                exc_info=True,
-            )
-            return None
+        """Delegates to the module-level `load_jump_params_for_engine` (kept
+        as a method for existing callers/tests that patch it here)."""
+        return load_jump_params_for_engine()
 
     def __call__(self, strikes, hours_to_expiry, **kwargs):
         now = time.time()

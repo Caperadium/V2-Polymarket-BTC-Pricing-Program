@@ -731,7 +731,7 @@ class PaperTradingLoop:
 
     # -- invariant helper -------------------------------------------------
 
-    def fold_matches_inventory(self) -> bool:
+    def fold_matches_inventory(self, *, own_markets_only: bool = False) -> bool:
         """The 8.2 standing invariant: fold(fills).q == InventoryManager.q AND
         fold(fills).avg_cost == InventoryManager.avg_cost per market, each to
         1e-9 (q_max/age are not fill-derived, so only these two are
@@ -740,10 +740,20 @@ class PaperTradingLoop:
         fold_fills_to_inventory complemented BUY_NO cost-basis prices while
         InventoryManager did not, so the two could silently disagree on
         avg_cost while still agreeing on q -- this invariant would not have
-        caught that class of bug."""
+        caught that class of bug.
+
+        ``own_markets_only=True`` (multi-expiry): restrict the comparison to
+        THIS loop's markets. Under the multi-expiry orchestrator the fills
+        table (and its global fold) spans every expiry's loops, while this
+        loop's InventoryManager holds only its own ladder (``resume_attach``
+        replays filtered) -- the global-key comparison would spuriously fail
+        on every foreign-expiry market. Default False preserves the legacy
+        single-expiry check exactly."""
         folded = self.store.fold_fills_to_inventory()
         snap = self.inv.snapshot(self.clock.now())
         keys = set(folded) | set(snap.per_contract)
+        if own_markets_only:
+            keys = {k for k in keys if k in self.strike_by_mid}
         for k in keys:
             fq = folded[k].q if k in folded else 0.0
             iq = snap.per_contract[k].q if k in snap.per_contract else 0.0
@@ -825,6 +835,56 @@ class PaperTradingLoop:
         return result
 
     # -- restart protocol -------------------------------------------------
+
+    def resume_attach(self, now: Optional[datetime] = None,
+                      all_fills: Optional[List[Fill]] = None) -> int:
+        """Multi-expiry attach: rebuild the in-memory inventory from THIS
+        loop's own fills only, and reload this expiry's Beuoy bankroll state.
+        Returns the number of fills replayed.
+
+        The multi-expiry replacement for the ladder-local part of
+        ``restart()``: on a shared store, ``restart()``'s unfiltered
+        ``get_fills()`` replay would pull every OTHER loop's fills into this
+        loop's InventoryManager (``apply_fill`` auto-creates unregistered
+        markets at expiry_key=None), and its ``mark_all_live_orders_unknown``
+        + ``restart_reconcile`` are store-GLOBAL -- a mid-run-attached loop
+        calling ``restart()`` would mark the other live loops' orders UNKNOWN
+        and cancel them. So this method does NEITHER: no mark-unknown, no
+        venue reconcile, no catch-up sync.
+
+        Orchestrator ordering contract (cross-reference the invariant comment
+        on ``settle(catch_up=True)`` below): the orchestrator runs its
+        standalone store-wide settlement catch-up pass BEFORE calling this,
+        so any previous-event position is already closed by SETTLEMENT
+        pseudo-fills inside the fills table -- the filtered replay here then
+        reproduces post-settlement inventory exactly, and per-loop
+        ``fold_matches_inventory(own_markets_only=True)`` holds without ever
+        running the unfiltered catch-up sync on this loop.
+
+        ``all_fills`` lets the orchestrator fetch the (global) fills table
+        once and share it across N loops; None fetches from the store.
+        """
+        now = now or self.clock.now()
+        fills = self.store.get_fills() if all_fills is None else all_fills
+
+        # Full re-registration, exactly as restart(): without register_market
+        # + update_fair_x, q_max/fair_x/ladder membership are unset and the
+        # first tick's sizing/breach logic is wrong.
+        self.inv = InventoryManager(self.config)
+        for m, k in self.markets:
+            self.inv.register_market(m, self.expiry_key, k)
+            self.inv.update_fair_x(m, 0.0)
+
+        replayed = 0
+        for f in fills:
+            if f.market_id in self.strike_by_mid:
+                self.inv.apply_fill(f)
+                replayed += 1
+
+        loaded = self.store.get_latest_bankroll_state(self.expiry_key)
+        if loaded is not None:
+            self.bankroll_state = loaded
+        return replayed
 
     def restart(self, now: Optional[datetime] = None):
         """Restart protocol (plan Section 5): mark LIVE orders UNKNOWN, rebuild

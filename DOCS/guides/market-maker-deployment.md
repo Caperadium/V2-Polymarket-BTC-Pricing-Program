@@ -59,9 +59,16 @@ sudo systemctl enable --now mm-paper.service
 ```
 
 `market_maker/paper_run_config.json` (checked in) drives the engine:
-`event_slug: "auto"` auto-rolls to the next `bitcoin-above` event,
-`state_db` points at a persistent SQLite file so a restart resumes instead
-of starting flat, `minutes: 0` runs indefinitely.
+`event_slug: "auto"` acquires the next `bitcoin-above` event(s) and rolls
+over IN-PROCESS when one settles (no restart), `state_db` points at a
+persistent SQLite file so a restart resumes instead of starting flat,
+`minutes: 0` runs indefinitely. Add `"max_expiries": N` (default 1) to
+quote up to N concurrent expiry ladders -- each gets its own WS connection
+and quoting loop over one shared state db and one shared pricing engine
+(one GARCH fit; at most one engine reprice per tick, staggered
+round-robin), and the sizing bankroll is statically split as
+`bankroll / max_expiries` per ladder. The existing state db is forward-
+compatible as-is (no schema change).
 
 ## Checking status
 
@@ -85,9 +92,12 @@ heartbeat yet -- covers auto-event-resolution retries + WS warmup),
 `current_run.json`'s `exit_reason`), `CRASHED` (PID file present but that
 PID is dead).
 
-`heartbeat.json` fields worth watching: `feed_healthy`, `btc_data_age_s`
-(staleness of `DATA/btc_intraday_1m.csv`), `feed_restarts`,
-`noarb_violations`, `pulled_ticks`.
+`heartbeat.json` fields worth watching: `feed_healthy` (AND over active
+ladders' adapters), `btc_data_age_s` (staleness of
+`DATA/btc_intraday_1m.csv`), `feed_restarts`, `noarb_violations`,
+`pulled_ticks`, and the multi-expiry additions `n_expiries_active`,
+`ladders_settled_total`, `ladder_settlement_timeouts` and the per-expiry
+`expiries` dict (per-ladder state/feed/fills/frozen breakdown).
 
 ### mm_monitor dashboard over an SSH tunnel (optional)
 
@@ -117,22 +127,25 @@ sudo systemctl restart mm-paper.service
 
 ### Exit code 42
 
-The runner exits **42** when a ladder finishes settling (`ladder_settled`)
-or gives up on an UNSETTLEABLE market (`settlement_timeout`, after
-`--max-settlement-wait-h`, default 26h). `RestartForceExitStatus=42` makes
-systemd treat this as a restart trigger, so the process comes back up and
-(with `event_slug: "auto"`) rolls onto the next event automatically. This is
-a rollover signal, not a fault. Exit **1** (`feed_dead` / `tick_errors` /
+In auto mode, a settled (or settlement-timed-out) ladder is torn down
+IN-PROCESS and replaced by the next acquired event -- the process does not
+exit for a rollover anymore. Exit **42** now means `no_quotable_events`
+(zero active ladders and the acquisition probe found nothing);
+`RestartForceExitStatus=42` makes systemd retry every `RestartSec=60`
+until the venue lists a suitable event -- expected, not a fault. In
+fixed-slug mode the legacy behavior is unchanged: `ladder_settled` /
+`settlement_timeout` -> 42. Exit **1** (`feed_dead` / `tick_errors` /
 early failure) is an ordinary supervised restart. Exit **0** (`completed` /
 `stop_file` / `sigterm` / `sigint`) means an intentional stop -- no restart.
 
-### Known benign crash-loop
+### Known benign retry loop
 
-After a rollover, if the venue has not yet published a `bitcoin-above`
-market far enough out, `resolve_next_event` raises and the runner exits 1;
-systemd retries every `RestartSec=60` until a market appears. This is
-expected and self-resolves; the alert de-dupe window (6h per condition)
-keeps it to at most one page.
+If the venue has not yet published `bitcoin-above` markets far enough out,
+the runner exits 42 (`no_quotable_events`) and systemd retries every
+`RestartSec=60` until one appears; while at least one ladder is alive, an
+empty acquisition probe just backs off (`acquire_retry_s`, default 600s)
+and the remaining ladders keep quoting. Expected and self-resolving; the
+alert de-dupe window (6h per condition) keeps it to at most one page.
 
 ## Log rotation
 
@@ -158,11 +171,14 @@ Run once on the actual VPS before trusting an unattended month-long run:
 
 1. Start against `event_slug: "auto"` close enough to a settlement that a
    rollover happens within the 72h window.
-2. Observe a full ladder settle, exit 42, and roll onto the next event.
+2. Observe a full ladder settle and roll over IN-PROCESS onto the next
+   event (log shows "tearing down ladder ..." then "ladder acquired: ...";
+   heartbeat `ladders_settled_total` increments; the PID does not change;
+   with `max_expiries` > 1 the other ladders keep quoting throughout).
 3. **Forced `kill -9`** mid-run: confirm systemd restarts it, the resume
-   protocol fires (`mark_all_live_orders_unknown -> restart ->
-   settle(catch_up=True)`), inventory matches `fold(fills)` afterward, and
-   exactly one alert fires for the fault.
+   protocol fires (standalone settlement catch-up pass -> per-slot filtered
+   `resume_attach` -> one venue reconcile), per-ladder inventory matches
+   `fold(own fills)` afterward, and exactly one alert fires for the fault.
 4. **Forced network cut** long enough to trip the feed watchdog
    (`--feed-dead-ticks`, default ~10 min): confirm the adapter rebuilds
    once, `feed_dead` exits and restarts cleanly if the outage persists, and
