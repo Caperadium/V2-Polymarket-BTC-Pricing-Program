@@ -29,6 +29,7 @@ from market_maker.pnl_report import (
     fill_cash,
     markout_report,
     markout_stats,
+    rebate_for_fill,
     tte_bucket_label,
 )
 from market_maker.settlement_handler import settlement_instant_utc
@@ -948,3 +949,158 @@ def test_tte_bucket_label_matches_private_alias():
     from market_maker.pnl_report import _tte_bucket
     for tte in (0.0, 0.5, 1.0, 1.5, 2.0, 3.9, 4.0, 10.0):
         assert tte_bucket_label(tte) == _tte_bucket(tte)
+
+
+# ---------------------------------------------------------------------------
+# Maker rebates (accounting layer, 2026-07-13)
+# ---------------------------------------------------------------------------
+
+
+def test_rebate_for_fill_hand_computed_values():
+    # 0.20 * 0.07 * p*(1-p) * size, per temp/mm_rebate_accounting_plan.md.
+    assert rebate_for_fill(0.5, 1.0) == pytest.approx(0.0035)
+    assert rebate_for_fill(0.1, 1.0) == pytest.approx(0.00126)
+
+
+def test_rebate_for_fill_scales_with_size():
+    assert rebate_for_fill(0.5, 10.0) == pytest.approx(0.035)
+    assert rebate_for_fill(0.5, 1.0) * 10.0 == pytest.approx(rebate_for_fill(0.5, 10.0))
+
+
+def test_rebate_for_fill_zero_at_p_zero_and_p_one():
+    assert rebate_for_fill(0.0, 5.0) == pytest.approx(0.0)
+    assert rebate_for_fill(1.0, 5.0) == pytest.approx(0.0)
+
+
+def test_rebate_for_fill_side_agnostic():
+    # rebate_for_fill takes no side/liquidity argument at all -- a BUY_NO
+    # fill stored at YES-scale price 0.6 (C0 convention, never complemented)
+    # and a BUY_YES fill at the same 0.6 read the identical price, so they
+    # must produce the identical rebate (price*(1-price) is symmetric).
+    buy_no_at_06 = rebate_for_fill(0.6, 4.0)
+    buy_yes_at_06 = rebate_for_fill(0.6, 4.0)
+    assert buy_no_at_06 == pytest.approx(buy_yes_at_06)
+    assert buy_no_at_06 == pytest.approx(0.20 * 0.07 * 0.6 * 0.4 * 4.0)
+
+
+def test_markout_report_rebate_avg_n_matched_maker_only():
+    # Two fills sharing one cell (same region/tte_bucket/horizon): fill_a is
+    # MAKER (earns rebate), fill_b is TAKER (excluded from rebate, but NOT
+    # excluded from the markout report itself -- only SETTLEMENT is). Both
+    # mid lookups HIT, so both contribute to mk_avg/n, but rebate_avg must
+    # average [reb_share_a, 0.0], not [reb_share_a] alone.
+    fill_a = _paper_fill(
+        "m1", Side.BUY_YES, 0.50, 5.0, mid_at_fill=0.50, order_id="a",
+        liquidity=LiquiditySource.MAKER,
+    )
+    fill_b = _paper_fill(
+        "m1", Side.BUY_YES, 0.50, 5.0, mid_at_fill=0.50, order_id="b",
+        ts=NOW + timedelta(minutes=10), liquidity=LiquiditySource.TAKER,
+    )
+    registry = {"m1": (FAR_EXPIRY, 100000.0)}
+    mid_rows = {"m1": [
+        (fill_a.ts + timedelta(seconds=60), 0.55),
+        (fill_b.ts + timedelta(seconds=60), 0.55),
+    ]}
+    report = markout_report(
+        [fill_a, fill_b], _mid_lookup_from_rows(mid_rows), registry, BELLY_BAND, horizons=(60.0,),
+    )
+    cell = report["cells"][0]
+    # Regression: n/n_attempted/mk_avg/mk_var unaffected by the rebate layer.
+    assert cell["n"] == 2
+    assert cell["n_attempted"] == 2
+    assert cell["mk_avg"] == pytest.approx(0.05)
+    expected_reb_avg = (rebate_for_fill(0.50, 1.0) + 0.0) / 2.0
+    assert cell["rebate_avg"] == pytest.approx(expected_reb_avg)
+    assert cell["rebate_avg"] == pytest.approx(0.0035 / 2.0)
+
+
+def test_markout_report_rebate_avg_excludes_missed_lookups():
+    # F2-style n-matching for rebates: fill_a's lookup hits, fill_b's misses.
+    # rebate_avg must be computed over ONLY the hit (fill_a's per-share
+    # rebate), matching mk_avg's n=1, NOT averaged in fill_b's non-rebate.
+    fill_a = _paper_fill(
+        "m1", Side.BUY_YES, 0.50, 5.0, mid_at_fill=0.50, order_id="a",
+        liquidity=LiquiditySource.MAKER,
+    )
+    fill_b = _paper_fill(
+        "m1", Side.BUY_YES, 0.50, 5.0, mid_at_fill=0.50, order_id="b",
+        ts=NOW + timedelta(hours=1), liquidity=LiquiditySource.MAKER,
+    )
+    registry = {"m1": (FAR_EXPIRY, 100000.0)}
+    # Only fill_a's window has a mid; fill_b's window (an hour later) is empty.
+    mid_rows = {"m1": [(fill_a.ts + timedelta(seconds=60), 0.55)]}
+    report = markout_report(
+        [fill_a, fill_b], _mid_lookup_from_rows(mid_rows), registry, BELLY_BAND, horizons=(60.0,),
+    )
+    cell = report["cells"][0]
+    assert cell["n"] == 1
+    assert cell["n_attempted"] == 2
+    assert cell["rebate_avg"] == pytest.approx(rebate_for_fill(0.50, 1.0))
+
+
+def test_markout_report_rebate_avg_zero_when_n_zero():
+    # A cell with n==0 (every lookup missed) must report rebate_avg=0.0, not
+    # raise (empty-list mean).
+    fill = _paper_fill("m1", Side.BUY_YES, 0.50, 5.0, mid_at_fill=0.50)
+    registry = {"m1": (FAR_EXPIRY, 100000.0)}
+    mid_rows = {"m1": []}
+    report = markout_report(
+        [fill], _mid_lookup_from_rows(mid_rows), registry, BELLY_BAND, horizons=(60.0,),
+    )
+    cell = report["cells"][0]
+    assert cell["n"] == 0
+    assert cell["rebate_avg"] == pytest.approx(0.0)
+
+
+def test_markout_report_rebate_avg_in_by_region_and_by_expiry_rollups():
+    ek_a, ek_b = "2026-07-06", "2026-07-07"
+    registry = {"m-a": (ek_a, 98000.0), "m-b": (ek_b, 98000.0)}
+    fills = [
+        _paper_fill("m-a", Side.BUY_YES, 0.40, 5.0, mid_at_fill=0.50, ts=NOW,
+                    liquidity=LiquiditySource.MAKER),
+        _paper_fill("m-b", Side.BUY_NO, 0.60, 2.0, mid_at_fill=0.60, ts=NOW, order_id="o2",
+                    liquidity=LiquiditySource.MAKER),
+    ]
+
+    def _mid_lookup(market_id, ts, ts_max):
+        return {"m-a": 0.55, "m-b": 0.58}[market_id]
+
+    report = markout_report(fills, _mid_lookup, registry, (0.2, 0.8), horizons=(60.0,), now=NOW)
+
+    # by_region: both fills land in "belly" (0.50 and 0.60 both inside [0.2,0.8]).
+    region_rollup = report["by_region"]["belly"]["60.0"]
+    assert region_rollup["rebate_avg"] == pytest.approx(
+        (rebate_for_fill(0.40, 1.0) + rebate_for_fill(0.60, 1.0)) / 2.0
+    )
+
+    # by_expiry: each expiry has exactly one fill, so its rebate_avg equals
+    # that single fill's per-share rebate.
+    cell_a = report["by_expiry"][ek_a]["60.0"]
+    cell_b = report["by_expiry"][ek_b]["60.0"]
+    assert cell_a["rebate_avg"] == pytest.approx(rebate_for_fill(0.40, 1.0))
+    assert cell_b["rebate_avg"] == pytest.approx(rebate_for_fill(0.60, 1.0))
+    # Regression: pre-existing mk_avg values (test_markout_report_by_expiry_
+    # rollup) are unaffected by the additive rebate_avg key.
+    assert cell_a["mk_avg"] == pytest.approx(0.15)
+    assert cell_b["mk_avg"] == pytest.approx(0.02)
+
+
+def test_markout_stats_resolution_unchanged_with_rebate_avg_key_present():
+    # markout_stats must resolve the SAME (mk_avg, mk_var, n, n_attempted)
+    # tuple whether or not the report carries the new additive rebate_avg
+    # key -- it deliberately never reads that key (quoting layer not
+    # implemented).
+    report = {
+        "cells": [
+            {"region": "belly", "tte_bucket": "0-1d", "horizon_s": 600.0,
+             "n": 25, "n_attempted": 30, "mk_avg": 0.02, "mk_var": 0.0004,
+             "rebate_avg": 0.0031},
+        ],
+        "by_region": {
+            "belly": {"600.0": {"n": 100, "n_attempted": 120, "mk_avg": 0.05,
+                                 "mk_var": 0.001, "rebate_avg": 0.0032}},
+        },
+    }
+    mk_avg, mk_var, n, n_attempted = markout_stats(report, "belly", "0-1d", 600.0, min_n=20)
+    assert (mk_avg, mk_var, n, n_attempted) == (0.02, 0.0004, 25, 30)

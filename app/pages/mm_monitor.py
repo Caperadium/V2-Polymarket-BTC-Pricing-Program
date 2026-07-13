@@ -441,16 +441,27 @@ def render_pnl(db_path: Optional[Path], run_meta: Optional[Dict[str, Any]]) -> N
     df["equity"] = bankroll + df["realized"] + df["unrealized_mid"]
     latest = df.iloc[-1]
 
-    c1, c2, c3, c4, c5 = st.columns(5)
+    # Secondary query for the maker-rebate accounting metric (display-only
+    # estimate, market_maker/pnl_report.py "Maker rebates" section). Must NOT
+    # early-return the panel on failure: load_db_table can return (None, err)
+    # -- rebates_from_fills_df tolerates that (-> 0.0) and the rest of the
+    # panel still renders from the already-loaded pnl frame above.
+    fills_df, _fills_err = load_db_table(db_path, "SELECT price, size, liquidity FROM fills")
+    rebates = mmh.rebates_from_fills_df(fills_df)
+
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("Equity", "%.2f" % latest["equity"])
     c2.metric("Realized", "%.2f" % latest["realized"])
     c3.metric("Unrealized (mid)", "%.2f" % latest["unrealized_mid"])
     c4.metric("Settlement PnL (info)", "%.2f" % latest["settlement_pnl"])
     c5.metric("Bankroll utilization", "%.1f%%" % (100.0 * latest["bankroll_utilization"]))
+    c6.metric("Rebates accrued (est)", "%.2f" % rebates)
     st.caption(
         "Equity = bankroll + realized + unrealized_mid. Settlement PnL is a "
         "report-only breakdown of realized -- it is already inside realized "
-        "and is NOT added to equity."
+        "and is NOT added to equity. Rebates accrued (est) is an off-equity "
+        "estimate of the Polymarket maker rebate on MAKER fills (venue pays "
+        "daily in pUSD) -- it is NOT included in Equity and sizing ignores it."
     )
 
     df["ts_dt"] = pd.to_datetime(df["ts"], errors="coerce")
@@ -630,7 +641,8 @@ def render_markout(out_dir: Optional[Path]) -> None:
         "mk_h = sign*(mid_h - fill price), sign=+1 BUY_YES / -1 BUY_NO (never "
         "complemented -- stored fill price is already YES-scale for both "
         "sides). coverage = n / n_attempted (share of eligible fills whose "
-        "horizon lookup found a mid). Generated %s." % report.get("generated_ts", "?")
+        "horizon lookup found a mid). Generated %s. Net per-share fill "
+        "quality (est) = mk_avg + rebate_avg." % report.get("generated_ts", "?")
     )
 
     by_expiry = report.get("by_expiry") or {}

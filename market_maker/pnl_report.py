@@ -61,13 +61,41 @@ measured edge with confidence proportional to the evidence (Baker-McHale on
 the harness uses to pull one (mk_avg, mk_var, n, n_attempted) tuple out of a
 report for a given (region, tte_bucket, horizon_s) -- see its own docstring
 for the cell -> region-rollup fallback order.
+
+Maker rebates (accounting layer, 2026-07-13)
+-----------------------------------------------
+Polymarket pays makers 20% of the crypto category's taker-fee pool daily in
+pUSD, pro-rata by filled-volume fee-equivalent. ``rebate_for_fill`` estimates
+one fill's share of that pool as
+``MAKER_REBATE_SHARE_CRYPTO * TAKER_FEE_RATE_CRYPTO * price*(1-price) * size``
+(``market_maker/config.py`` constants) -- an ESTIMATE, since it assumes the
+pro-rata pool identity returns exactly our own fee-equivalent share (holds
+when total maker fee-equivalent == total taker fee-equivalent per market;
+unverified against real daily payouts). Eligibility is MAKER-liquidity fills
+only (TAKER pays the fee instead of earning a rebate; SETTLEMENT pseudo-fills
+are not venue fills) -- the CALLER's job, ``rebate_for_fill`` is just the
+formula. ``price`` is used exactly as stored (always YES-scale for both
+sides, per the cash convention above), never complemented.
+
+``markout_report`` carries this into two ADDITIVE, n-matched ``rebate_avg``
+keys (per ``cells[]`` entry and per ``by_region``/``by_expiry`` rollup entry):
+the mean per-share rebate over exactly the fills whose mid lookup HIT (in
+lockstep with ``mk_avg`` -- a fill whose horizon lookup missed contributes no
+value to either), so ``mk_avg + rebate_avg`` reads as net-of-rebate per-share
+fill quality. This is strictly an ACCOUNTING/reporting addition: existing
+consumers ignore unknown keys, ``markout_stats`` and the sizing layer it
+feeds (``robustness_sizing``) DELIBERATELY do not read ``rebate_avg`` (the
+quoting layer -- folding rebate into sizing net edge, spread floor, etc. -- is
+NOT implemented). Hard rule, everywhere in this module: rebates never enter
+``realized``, ``equity``, ``PnlSnapshot``, the ``pnl`` table, bankroll, or
+sizing -- this is a read-only estimate for humans and dashboards.
 """
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
-from market_maker.config import in_belly_band
+from market_maker.config import MAKER_REBATE_SHARE_CRYPTO, TAKER_FEE_RATE_CRYPTO, in_belly_band
 from market_maker.contracts import ContractInv, Fill, LiquiditySource, SettlementEvent, Side
 from market_maker.settlement_handler import settlement_instant_utc
 from market_maker.state_store import PnlSnapshot
@@ -130,6 +158,21 @@ def fill_cash(side: Side, price: float, size: float) -> float:
     """
     sign = -1.0 if side is Side.BUY_YES else 1.0
     return sign * price * size
+
+
+def rebate_for_fill(price: float, size: float) -> float:
+    """Estimated Polymarket maker rebate for ONE eligible fill:
+    ``MAKER_REBATE_SHARE_CRYPTO * TAKER_FEE_RATE_CRYPTO * price*(1-price) *
+    size`` (see module docstring "Maker rebates" section for the derivation
+    and the pro-rata-pool-identity estimate caveat). ``price`` is used
+    directly -- already YES-scale for both sides, never complemented (same
+    convention as ``fill_cash``). Side-agnostic: ``price*(1-price)`` is
+    symmetric, so a BUY_NO fill stored at YES-scale price ``p`` yields the
+    identical value a BUY_YES fill at the same ``p`` would.
+
+    Eligibility (MAKER liquidity only) is the CALLER's job -- this is just
+    the formula, with no ``liquidity`` argument at all."""
+    return MAKER_REBATE_SHARE_CRYPTO * TAKER_FEE_RATE_CRYPTO * price * (1.0 - price) * size
 
 
 def cash_by_market(fills: Sequence[Fill]) -> Dict[str, float]:
@@ -289,6 +332,17 @@ def _summarize(vals: List[float]) -> Dict[str, object]:
     return {"n": n, "mk_avg": mk_avg, "mk_var": mk_var, "mk_total": total}
 
 
+def _rebate_avg(rebate_vals: List[float]) -> float:
+    """Mean of a cell's/rollup's parallel per-share rebate list, 0.0 when
+    empty (F2-style: n==0 must not divide by zero). Callers append to
+    ``rebate_vals`` in exact lockstep with the markout ``vals`` list (only on
+    a mid-lookup HIT), so this is always n-matched with ``_summarize``'s
+    ``mk_avg`` over the SAME fills -- ``mk_avg + rebate_avg`` is therefore
+    net-of-rebate per-share fill quality. Kept separate from ``_summarize``
+    (untouched) per the accounting-layer plan."""
+    return (sum(rebate_vals) / len(rebate_vals)) if rebate_vals else 0.0
+
+
 def markout_report(
     fills: Sequence[Fill],
     mid_lookup: Callable[[str, datetime, datetime], Optional[float]],
@@ -358,16 +412,28 @@ def markout_report(
         is missing from the registry (defensive fallback only -- every
         quoted market is registered on `PaperTradingLoop` construction).
 
+    Maker rebates (2026-07-13, ADDITIVE): every cell/rollup dict below also
+    carries a `"rebate_avg"` key -- the mean per-share estimated maker rebate
+    (`rebate_for_fill(fill.price, 1.0)` for MAKER-liquidity fills, `0.0` for
+    non-MAKER) over exactly the fills that contributed to that same `mk_avg`
+    (n-matched: appended only on a mid-lookup HIT, in lockstep with `mk`), so
+    `mk_avg + rebate_avg` is net-of-rebate per-share fill quality. `0.0` when
+    the cell/rollup has `n == 0`. Existing/older consumers ignore the unknown
+    key; `markout_stats` and the sizing layer it feeds deliberately do NOT
+    read it (module docstring "Maker rebates" section).
+
     Output is JSON-serializable:
         {"cells": [{"region", "tte_bucket", "horizon_s", "n", "n_attempted",
-                    "mk_avg", "mk_total"}, ...],
+                    "mk_avg", "mk_total", "rebate_avg"}, ...],
          "by_region": {region: {str(horizon_s): {"n", "n_attempted",
-                                                  "mk_avg", "mk_total"}}}
+                                                  "mk_avg", "mk_total",
+                                                  "rebate_avg"}}}
          (rolled up across tte_bucket -- the region x horizon summary is the
          headline "is this region's markout biased" view; the finer
          region x tte_bucket x horizon breakdown lives in "cells"),
          "by_expiry": {expiry_key: {str(horizon_s): {"n", "n_attempted",
-                                                      "mk_avg", "mk_total"}}}
+                                                      "mk_avg", "mk_total",
+                                                      "rebate_avg"}}}
          (multi-expiry rollup, keyed by the fill's OWN expiry via
          ``markets_registry``; "unknown" bucket for unregistered markets --
          additive key, existing consumers ignore it),
@@ -388,6 +454,11 @@ def markout_report(
     attempted: Dict[Tuple[str, str, float], int] = {}
     expiry_cells: Dict[Tuple[str, float], List[float]] = {}
     expiry_attempted: Dict[Tuple[str, float], int] = {}
+    # Parallel per-share-rebate lists (maker-rebate accounting layer): kept
+    # separate from `cells`/`expiry_cells` (never fed into `_summarize`,
+    # which stays untouched) but appended in exact lockstep with them below.
+    reb_cells: Dict[Tuple[str, str, float], List[float]] = {}
+    reb_expiry_cells: Dict[Tuple[str, float], List[float]] = {}
 
     for f in eligible:
         if cutoff is not None and f.ts < cutoff:
@@ -417,6 +488,10 @@ def markout_report(
                 tte_bucket = "unknown"
 
         sign = 1.0 if f.side is Side.BUY_YES else -1.0
+        # Per-share rebate estimate for this fill (MAKER-only; see module
+        # docstring "Maker rebates" section) -- constant across horizons
+        # since it depends only on the fill's own price, not the lookup.
+        reb_share = rebate_for_fill(f.price, 1.0) if f.liquidity is LiquiditySource.MAKER else 0.0
 
         for idx, h in enumerate(sorted_horizons):
             if idx + 1 < len(sorted_horizons):
@@ -427,10 +502,12 @@ def markout_report(
             key = (region, tte_bucket, float(h))
             attempted[key] = attempted.get(key, 0) + 1
             vals = cells.setdefault(key, [])
+            rebs = reb_cells.setdefault(key, [])
 
             ekey = (fill_expiry, float(h))
             expiry_attempted[ekey] = expiry_attempted.get(ekey, 0) + 1
             evals = expiry_cells.setdefault(ekey, [])
+            erebs = reb_expiry_cells.setdefault(ekey, [])
 
             mid_h = mid_lookup(f.market_id, f.ts + timedelta(seconds=h), f.ts + timedelta(seconds=hi_s))
             if mid_h is None:
@@ -438,30 +515,40 @@ def markout_report(
             mk = sign * (mid_h - f.price)
             vals.append(mk)
             evals.append(mk)
+            # n-matched with vals/evals: appended ONLY on the same mid-lookup
+            # HIT branch, so rebate_avg averages over exactly the same fills
+            # as mk_avg.
+            rebs.append(reb_share)
+            erebs.append(reb_share)
 
     cell_list: List[Dict[str, object]] = []
     for key in sorted(cells.keys()):
         region, tte_bucket, h = key
         summary = _summarize(cells[key])
         summary["n_attempted"] = attempted[key]
+        summary["rebate_avg"] = _rebate_avg(reb_cells.get(key, []))
         cell_list.append({"region": region, "tte_bucket": tte_bucket, "horizon_s": h, **summary})
 
     by_region: Dict[str, Dict[str, Dict[str, object]]] = {}
     grouped: Dict[Tuple[str, float], List[float]] = {}
     grouped_attempted: Dict[Tuple[str, float], int] = {}
+    grouped_reb: Dict[Tuple[str, float], List[float]] = {}
     for key, vals in cells.items():
         region, _bucket, h = key
         grouped.setdefault((region, h), []).extend(vals)
         grouped_attempted[(region, h)] = grouped_attempted.get((region, h), 0) + attempted[key]
+        grouped_reb.setdefault((region, h), []).extend(reb_cells.get(key, []))
     for (region, h), vals in grouped.items():
         summary = _summarize(vals)
         summary["n_attempted"] = grouped_attempted[(region, h)]
+        summary["rebate_avg"] = _rebate_avg(grouped_reb.get((region, h), []))
         by_region.setdefault(region, {})[str(h)] = summary
 
     by_expiry: Dict[str, Dict[str, Dict[str, object]]] = {}
     for (ek, h), vals in expiry_cells.items():
         summary = _summarize(vals)
         summary["n_attempted"] = expiry_attempted[(ek, h)]
+        summary["rebate_avg"] = _rebate_avg(reb_expiry_cells.get((ek, h), []))
         by_expiry.setdefault(ek, {})[str(h)] = summary
 
     return {

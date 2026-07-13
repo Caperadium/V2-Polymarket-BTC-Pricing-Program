@@ -176,6 +176,28 @@ def test_cmd_bankroll_frozen_warning(env):
     assert "FROZEN" in reply
 
 
+def test_cmd_bankroll_rebate_line_with_seeded_maker_fill(env):
+    # 0.20*0.07 * 0.5*0.5 * 6.0 = 0.014 * 0.25 * 6.0 = 0.021
+    src, store = env
+    store.append_pnl_snapshot(PnlSnapshot(
+        ts=NOW, market_id=None, expiry_key=None, realized=0.0,
+        unrealized_consensus=0.0, unrealized_mid=0.0, settlement_pnl=0.0,
+        bankroll_utilization=0.0))
+    store.append_fill(_fill(price=0.5, size=6.0, liquidity=LiquiditySource.MAKER))
+    store.append_fill(_fill(price=0.9, size=100.0, liquidity=LiquiditySource.TAKER))  # excluded
+    reply = bot.cmd_bankroll(src)
+    assert "rebates accrued (est, not in equity): 0.02" in reply
+
+
+def test_cmd_bankroll_rebate_line_tolerated_when_db_missing(tmp_path):
+    status = _status(run_info=None, heartbeat=None, state="STOPPED")
+    src = StubSource(tmp_path / "control", status,
+                     state_db_override=tmp_path / "missing.db")
+    reply = bot.cmd_bankroll(src)
+    assert "no state db found" in reply
+    assert "rebates accrued" not in reply
+
+
 def test_cmd_pnl_breakdown(env):
     src, store = env
     store.append_pnl_snapshot(PnlSnapshot(

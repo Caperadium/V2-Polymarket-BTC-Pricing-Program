@@ -13,6 +13,19 @@ from typing import Dict, Tuple
 
 from market_maker.contracts import ConfidenceTier
 
+# Polymarket venue fee parameters (crypto category, docs.polymarket.com,
+# verified 2026-07-13). Venue facts, not strategy knobs -- module constants,
+# not MMConfig fields. scripts/mm_telegram_bot.py duplicates the product
+# 0.20*0.07 = 0.014 in SQL by design (that script is stdlib-only and must not
+# import market_maker); keep the two in sync.
+# NOTE: contracts.VenueDescriptor already carries dormant maker_fee/
+# maker_rebate fields (hardcoded 0.0 in harness.py, consumed nowhere) -- they
+# are NOT the source of truth for the maker-rebate accounting layer
+# (market_maker/pnl_report.py's rebate_for_fill). Do not wire that knob
+# instead of this one.
+TAKER_FEE_RATE_CRYPTO = 0.07
+MAKER_REBATE_SHARE_CRYPTO = 0.20
+
 
 @dataclass
 class MMConfig:

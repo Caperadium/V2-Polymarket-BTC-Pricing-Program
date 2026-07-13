@@ -1,3 +1,5 @@
 # Changes
 
 <!-- Append one entry per logical task. Cleared after each push. -->
+
+- Add a display-only Polymarket maker-rebate accounting layer to the paper-traded market maker: new venue constants (`market_maker/config.py`), a pure `rebate_for_fill` helper plus additive n-matched `rebate_avg` keys on every `markout_report()` cell/by_region/by_expiry entry (`market_maker/pnl_report.py`), a `rebates_from_fills_df` dashboard helper (`app/mm_monitor_helpers.py`), a "Rebates accrued (est)" metric on the mm_monitor PnL panel (`app/pages/mm_monitor.py`), and a rebates line on the Telegram bot's `/bankroll` command (`scripts/mm_telegram_bot.py`). Rebate = `MAKER_REBATE_SHARE_CRYPTO * TAKER_FEE_RATE_CRYPTO * price*(1-price) * size`, MAKER-liquidity fills only; strictly additive/reporting -- realized, equity, bankroll, `markout_stats`, and `robustness_sizing` are byte-identical, no schema changes. Quoting-layer use of rebates (net sizing edge, spread floor) is deliberately out of scope. Tests added/extended in `tests/test_mm_pnl_report.py`, `tests/test_mm_monitor_helpers.py`, `tests/test_mm_telegram_bot.py`; full suite green (747 passed).

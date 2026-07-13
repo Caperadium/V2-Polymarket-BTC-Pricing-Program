@@ -134,7 +134,7 @@ waiting for the daily heartbeat. Commands:
 | Command | Answer |
 |---------|--------|
 | `/status` | Engine state (`engine_status()`), tick, feed health, per-expiry lines |
-| `/bankroll` | Initial bankroll (run_meta.json) + current equity from the latest pnl TOTAL row |
+| `/bankroll` | Initial bankroll (run_meta.json) + current equity from the latest pnl TOTAL row + rebates accrued (est, maker-rebate accounting layer -- off-equity estimate, not included in the equity figure) |
 | `/pnl` | Realized / unrealized (mid + consensus) / settlement breakdown |
 | `/fills` | Fill counts by liquidity (maker/taker/settlement), last-24h count, last fill |
 | `/inventory` | Open positions (q != 0) with expiry/strike |

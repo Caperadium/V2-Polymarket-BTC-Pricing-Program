@@ -10,6 +10,7 @@ Commands
 --------
   /status     engine state (run_control), tick, feed health, per-expiry lines
   /bankroll   initial bankroll + current equity (latest pnl TOTAL row)
+              + rebates accrued (est, maker-rebate accounting layer)
   /pnl        realized / unrealized / settlement breakdown of the TOTAL row
   /fills      fill counts (maker/taker/settlement, last 24h) + last fill
   /inventory  open positions (q != 0) with strike/expiry
@@ -281,6 +282,14 @@ def cmd_bankroll(src: MetricsSource) -> str:
         except (TypeError, ValueError):
             pass
         lines.append("as of %s" % _short_ts(ts))
+    reb = src.query(
+        # 0.014 = MAKER_REBATE_SHARE_CRYPTO * TAKER_FEE_RATE_CRYPTO
+        # (market_maker/config.py) -- duplicated here because this script is
+        # stdlib-only by design; keep in sync.
+        "SELECT COALESCE(SUM(0.014 * price * (1.0 - price) * size), 0.0) "
+        "FROM fills WHERE liquidity = 'MAKER'")
+    if reb:
+        lines.append("rebates accrued (est, not in equity): %s" % _money(reb[0][0]))
     if _hb(status).get("bankroll_frozen"):
         lines.append("WARNING: Beuoy bankroll FROZEN (fixed-blend fallback)")
     return "\n".join(lines)
@@ -423,7 +432,7 @@ def cmd_help(_src: MetricsSource) -> str:
     return "\n".join([
         "mm-paper metrics bot -- commands:",
         "/status    engine state, tick, feed, per-expiry",
-        "/bankroll  initial bankroll + current equity",
+        "/bankroll  initial bankroll + current equity + rebates (est)",
         "/pnl       realized/unrealized/settlement breakdown",
         "/fills     fill counts + last fill",
         "/inventory open positions",

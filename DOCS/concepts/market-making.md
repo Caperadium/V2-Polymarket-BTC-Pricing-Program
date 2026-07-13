@@ -875,6 +875,20 @@ much.
 The report is written to `markout_report.json` on a fixed cadence and rendered
 read-only in the monitoring dashboard (`app/pages/mm_monitor.py`).
 
+### 14.3 Maker-rebate accounting (display-only)
+
+Polymarket pays makers 20% of the crypto category's taker-fee pool daily in
+pUSD, pro-rata by filled-volume fee-equivalent. Each markout cell (and the
+`by_region`/`by_expiry` rollups) carries an additive `rebate_avg` -- the mean
+per-share estimated rebate (`0.20 * 0.07 * price*(1-price) * size`, MAKER
+fills only, `market_maker/config.py` constants) over the same fills that
+contributed `mk_avg`, so `mk_avg + rebate_avg` reads as net-of-rebate fill
+quality. This is a display-only accounting estimate (an off-equity "Rebates
+accrued (est)" metric on the dashboard PnL panel and a line on the Telegram
+bot's `/bankroll` command) -- it never feeds `markout_stats`, sizing, or
+equity/realized/bankroll. Folding rebates into the quoting layer (sizing net
+edge, spread floor) is deliberately not implemented.
+
 ---
 
 ## 15. Operations

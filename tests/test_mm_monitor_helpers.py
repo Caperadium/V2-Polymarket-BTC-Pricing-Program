@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -102,3 +103,38 @@ def test_event_meta_by_expiry_multi_and_legacy():
     by_ek2 = mmh.event_meta_by_expiry(legacy)
     assert by_ek2["2026-07-06"]["event_slug"] == "ev-a"
     assert mmh.event_meta_by_expiry(None) == {}
+
+
+# ---------------------------------------------------------------------------
+# rebates_from_fills_df (maker-rebate accounting layer, 2026-07-13)
+# ---------------------------------------------------------------------------
+
+
+def test_rebates_from_fills_df_maker_only():
+    from market_maker.config import MAKER_REBATE_SHARE_CRYPTO, TAKER_FEE_RATE_CRYPTO
+
+    fills_df = pd.DataFrame([
+        {"price": 0.50, "size": 5.0, "liquidity": "MAKER"},
+        {"price": 0.60, "size": 2.0, "liquidity": "TAKER"},   # excluded
+        {"price": 0.00, "size": 3.0, "liquidity": "SETTLEMENT"},  # excluded
+        {"price": 0.10, "size": 4.0, "liquidity": "MAKER"},
+    ])
+    per_share = MAKER_REBATE_SHARE_CRYPTO * TAKER_FEE_RATE_CRYPTO
+    expected = per_share * 0.50 * 0.50 * 5.0 + per_share * 0.10 * 0.90 * 4.0
+    result = mmh.rebates_from_fills_df(fills_df)
+    assert result == pytest.approx(expected)
+    assert result == pytest.approx(0.0035 * 5.0 + 0.00126 * 4.0)
+
+
+def test_rebates_from_fills_df_none_and_empty_and_missing_columns():
+    assert mmh.rebates_from_fills_df(None) == 0.0
+    assert mmh.rebates_from_fills_df(pd.DataFrame()) == 0.0
+    assert mmh.rebates_from_fills_df(pd.DataFrame([{"price": 0.5}])) == 0.0  # missing size/liquidity
+
+
+def test_rebates_from_fills_df_no_maker_rows():
+    fills_df = pd.DataFrame([
+        {"price": 0.50, "size": 5.0, "liquidity": "TAKER"},
+        {"price": 0.00, "size": 3.0, "liquidity": "SETTLEMENT"},
+    ])
+    assert mmh.rebates_from_fills_df(fills_df) == 0.0

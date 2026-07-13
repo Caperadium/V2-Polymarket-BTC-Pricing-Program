@@ -16,6 +16,8 @@ from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
+from market_maker.config import MAKER_REBATE_SHARE_CRYPTO, TAKER_FEE_RATE_CRYPTO
+
 UNKNOWN_EXPIRY = "unknown"
 
 
@@ -117,3 +119,34 @@ def event_meta_by_expiry(run_meta: Optional[Dict[str, Any]]) -> Dict[str, Dict[s
             "strikes": run_meta.get("strikes") or [],
         }}
     return {}
+
+
+def rebates_from_fills_df(fills_df: Optional[pd.DataFrame]) -> float:
+    """Total estimated Polymarket maker rebate over a raw `fills`-table
+    DataFrame (columns: price, size, liquidity) -- MAKER rows only (TAKER
+    pays the fee instead of earning a rebate; SETTLEMENT pseudo-fills are not
+    venue fills). Tolerant of None, empty, or missing-column frames (returns
+    0.0): the PnL panel's secondary fills query is not allowed to block the
+    rest of the panel from rendering (see app/pages/mm_monitor.py render_pnl).
+
+    Vectorized pandas arithmetic using the two market_maker.config venue
+    constants directly (same formula as market_maker.pnl_report.
+    rebate_for_fill, applied per-row here instead of per-fill object) -- a
+    light import that keeps this module dependency-light; deliberately does
+    NOT import market_maker.pnl_report.
+
+    This is a display-only ESTIMATE (pro-rata pool identity assumption, see
+    pnl_report's module docstring "Maker rebates" section) -- never added to
+    equity/realized/bankroll/sizing."""
+    if fills_df is None or fills_df.empty:
+        return 0.0
+    required = {"price", "size", "liquidity"}
+    if not required.issubset(fills_df.columns):
+        return 0.0
+    maker = fills_df[fills_df["liquidity"] == "MAKER"]
+    if maker.empty:
+        return 0.0
+    price = pd.to_numeric(maker["price"], errors="coerce")
+    size = pd.to_numeric(maker["size"], errors="coerce")
+    rebate = MAKER_REBATE_SHARE_CRYPTO * TAKER_FEE_RATE_CRYPTO * price * (1.0 - price) * size
+    return float(rebate.fillna(0.0).sum())
