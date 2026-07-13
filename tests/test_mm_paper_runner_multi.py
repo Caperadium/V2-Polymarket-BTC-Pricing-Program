@@ -184,6 +184,9 @@ def test_auto_two_expiries_heartbeat_and_run_pointers(tmp_path, monkeypatch):
     assert hb["feed_healthy"] is True
     assert hb["bankroll_frozen"] in (True, False)  # OR over loops, present
     assert hb["ladders_settled_total"] == 0
+    # noarb_repairs: true violating-ladder count (sum over ladders), distinct
+    # from the legacy warm-up 'noarb_violations' counter
+    assert hb["noarb_repairs"] >= 0
     # per-expiry payload
     assert set(hb["expiries"].keys()) == {ek_a, ek_b}
     for ek, slug in ((ek_a, "ev-a"), (ek_b, "ev-b")):
@@ -191,6 +194,7 @@ def test_auto_two_expiries_heartbeat_and_run_pointers(tmp_path, monkeypatch):
         assert e["event_slug"] == slug
         assert e["state"] == "active"
         assert "mode_counts" in e and "fills" in e
+        assert e["noarb_repairs"] >= 0
 
     # run pointers: events list + legacy singular fields = nearest expiry
     run_meta = json.loads((out_dir / "run_meta.json").read_text(encoding="ascii"))

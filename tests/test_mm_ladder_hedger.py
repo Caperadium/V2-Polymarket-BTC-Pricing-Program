@@ -106,6 +106,23 @@ def test_reject_mode_returns_none_and_journals():
     assert len(h.journal) == 1
     assert h.journal[0]["event"] == "reject"
     assert h.journal[0]["violations"]
+    assert h.repair_count == 1
+
+
+def test_repair_count_increments_on_violation_only():
+    h = LadderHedger()
+    strikes = [90000.0, 100000.0, 110000.0]
+    cdf = {90000.0: 0.5, 100000.0: 0.5, 110000.0: 0.2}
+    clean = [_qs("m0", 0.68, 0.72), _qs("m1", 0.48, 0.52), _qs("m2", 0.18, 0.22)]
+    assert h.repair(clean, strikes, cdf) is not None
+    assert h.repair_count == 0  # clean ladder: no increment
+    bad = [_qs("m0", 0.48, 0.52), _qs("m1", 0.78, 0.82), _qs("m2", 0.18, 0.22)]
+    once = h.repair(bad, strikes, cdf)
+    assert once is not None
+    assert h.repair_count == 1
+    # repaired output is clean: re-checking it does not increment again
+    h.repair(once, strikes, cdf)
+    assert h.repair_count == 1
 
 
 # --- (b) vertical-spread internal hedge ----------------------------------

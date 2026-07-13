@@ -108,6 +108,10 @@ class LadderHedger:
     hedge_ttl_seconds: float = 300.0
     enable_beta_hedge: bool = False  # L2 flag, default OFF (risk 8.5)
     journal: List[dict] = field(default_factory=list)
+    # Count of ladders that arrived violating no-arb (whether repaired or
+    # rejected). The heartbeat reads this; the journal alone is in-memory
+    # detail that never leaves the process.
+    repair_count: int = 0
 
     # -- (a) no-arb -------------------------------------------------------
 
@@ -166,6 +170,7 @@ class LadderHedger:
             return [replace(qs, noarb_checked=True) for qs in quote_sets]
 
         if self.repair_or_reject == "reject":
+            self.repair_count += 1
             self.journal.append(
                 {
                     "event": "reject",
@@ -192,6 +197,7 @@ class LadderHedger:
             new_ask = _quantize(new_mid + hs, self.tick)
             out.append(replace(qs, bid_price=new_bid, ask_price=new_ask, noarb_checked=True))
 
+        self.repair_count += 1
         self.journal.append(
             {
                 "event": "repair",

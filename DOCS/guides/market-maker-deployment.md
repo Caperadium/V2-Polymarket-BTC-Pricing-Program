@@ -95,10 +95,17 @@ PID is dead).
 
 `heartbeat.json` fields worth watching: `feed_healthy` (AND over active
 ladders' adapters), `btc_data_age_s` (staleness of
-`DATA/btc_intraday_1m.csv`), `feed_restarts`, `noarb_violations`,
-`pulled_ticks`, and the multi-expiry additions `n_expiries_active`,
-`ladders_settled_total`, `ladder_settlement_timeouts` and the per-expiry
-`expiries` dict (per-ladder state/feed/fills/frozen breakdown).
+`DATA/btc_intraday_1m.csv`), `feed_restarts`, `noarb_repairs` (ladders
+that arrived at the LadderHedger violating no-arb and were PAV-repaired
+-- the true violation count, summed over all ladders this run including
+torn-down ones; a climbing rate means skew/anchor/spread terms are
+generating inconsistent ladders), `pulled_ticks`, and the multi-expiry
+additions `n_expiries_active`, `ladders_settled_total`,
+`ladder_settlement_timeouts` and the per-expiry `expiries` dict
+(per-ladder state/feed/fills/frozen breakdown, incl. per-ladder
+`noarb_repairs`). Note: the legacy `noarb_violations` field does NOT
+count arb violations -- it counts warm-up ticks before a slot's first
+checked ladder (kept under its old name for consumer compat).
 
 ### mm_monitor dashboard over an SSH tunnel (optional)
 

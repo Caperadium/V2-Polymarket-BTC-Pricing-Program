@@ -225,15 +225,22 @@ def _write_heartbeat(
     n_expiries_active: Optional[int] = None,
     ladders_settled_total: int = 0, ladder_settlement_timeouts: int = 0,
     expiries: Optional[Dict[str, Dict[str, Any]]] = None,
+    noarb_repairs: int = 0,
 ) -> None:
     # tick_s/reprice_s feed run_control._heartbeat_threshold: a reprice tick
     # blocks in calculate_probabilities for minutes, so the STALLED threshold
     # must exceed the reprice duration, not just 3x tick_s. The multi-expiry
     # reprice token guarantees at most ONE engine call per tick, so that
     # threshold math is unchanged.
+    # noarb_violations (legacy name): ticks where a slot had not yet produced
+    # its first checked ladder (warm-up), NOT arb violations -- kept for
+    # heartbeat-consumer compat. noarb_repairs: ladders that arrived at the
+    # LadderHedger actually violating no-arb and were PAV-repaired (or
+    # rejected), summed over all ladders this run incl. torn-down ones.
     payload: Dict[str, Any] = {
         "ts_utc": ts.isoformat(), "tick": tick, "feed_healthy": bool(feed_healthy),
         "n_msgs": n_msgs, "fills_total": fills_total, "noarb_violations": noarb_violations,
+        "noarb_repairs": int(noarb_repairs),
         "unhealthy_ticks": unhealthy_ticks, "pulled_ticks": pulled_ticks,
         "tick_s": tick_s, "reprice_s": reprice_s,
         "btc_data_age_s": btc_data_age_s, "feed_restarts": feed_restarts,
@@ -373,6 +380,10 @@ def run(argv: Optional[List[str]] = None) -> int:
     tick_n = 0
     n_fills_total = 0
     noarb_violations = 0
+    # Last-seen LadderHedger.repair_count per expiry; entries are RETAINED
+    # after a ladder is torn down so the heartbeat aggregate stays monotone
+    # across in-process rollovers.
+    noarb_repairs_by_expiry: Dict[str, int] = {}
     pulled_ticks = 0
     unhealthy_ticks = 0
     # 2.6 tick-failure circuit breaker.
@@ -402,11 +413,14 @@ def run(argv: Optional[List[str]] = None) -> int:
                 fh = bool(s.adapter.healthy())
             except Exception:
                 fh = False
+            repairs = int(getattr(s.loop.hedger, "repair_count", 0))
+            noarb_repairs_by_expiry[s.expiry_key] = repairs
             out[s.expiry_key] = {
                 "event_slug": s.event_slug, "state": s.state,
                 "feed_healthy": fh, "feed_restarts": s.feed_restarts,
                 "bankroll_frozen": bool(s.loop.bankroll_state.frozen),
                 "fills": s.fills_total, "mode_counts": mode_counts,
+                "noarb_repairs": repairs,
             }
         return out
 
@@ -424,6 +438,7 @@ def run(argv: Optional[List[str]] = None) -> int:
             ladders_settled_total=orch.ladders_settled_total if orch is not None else 0,
             ladder_settlement_timeouts=orch.ladder_settlement_timeouts if orch is not None else 0,
             expiries=expiries,
+            noarb_repairs=sum(noarb_repairs_by_expiry.values()),
         )
 
     def _events_meta() -> List[Dict[str, Any]]:
@@ -1029,7 +1044,8 @@ def run(argv: Optional[List[str]] = None) -> int:
         f"(settlement timeouts: {orch.ladder_settlement_timeouts})\n"
         f"- ending open inventory:\n" + ("\n".join(inv_lines) or "    - flat") + "\n"
         f"- fold(own fills) == inventory per ladder:\n" + ("\n".join(fold_lines) or "    - n/a") + "\n"
-        f"- self-inflicted no-arb violations (post-repair): {noarb_violations}\n"
+        f"- ticks before first checked ladder (legacy 'noarb_violations'): {noarb_violations}\n"
+        f"- no-arb violating ladders PAV-repaired: {sum(noarb_repairs_by_expiry.values())}\n"
         f"- PULLED (market,tick) rows: {pulled_ticks}\n"
         f"- re-price latencies (s): {['%.1f' % v for v in engine.latencies]}\n"
         f"- feed restarts: {orch.feed_restarts_total}\n"

@@ -1,3 +1,5 @@
 # Changes
 
 <!-- Append one entry per logical task. Cleared after each push. -->
+
+- Add a true no-arb violation counter to the market-maker heartbeat. `LadderHedger` gains `repair_count`, incremented whenever a ladder arrives violating no-arb (both repair and reject modes); `paper_runner` threads it into `heartbeat.json` as top-level `noarb_repairs` (summed over all ladders this run, monotone across in-process rollovers via a retained per-expiry dict) and per-expiry `expiries[ek].noarb_repairs`, and disambiguates the run-summary lines. The legacy `noarb_violations` heartbeat field was found to count warm-up ticks before a slot's first checked ladder (never actual violations, since the default `repair` hedger mode never returns None); it keeps its name and semantics for consumer compat, now documented. Files: `market_maker/ladder_hedger.py`, `market_maker/paper_runner.py`, tests (`test_mm_ladder_hedger.py`, `test_mm_paper_runner_multi.py`), `CLAUDE.md`, `DOCS/guides/market-maker-deployment.md`.
