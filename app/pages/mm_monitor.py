@@ -316,7 +316,7 @@ def _run_tick_s(run_meta: Optional[Dict[str, Any]]) -> float:
 
 
 def render_status_row(status: "run_control.EngineStatus") -> None:
-    cols = st.columns(6)
+    cols = st.columns(8)
 
     text = "%s -- %s" % (status.state, status.detail)
     if status.state == "RUNNING":
@@ -349,6 +349,10 @@ def render_status_row(status: "run_control.EngineStatus") -> None:
     cols[3].metric("Feed healthy", "yes" if feed_healthy else ("no" if feed_healthy is not None else "n/a"))
     cols[4].metric("Fills total", str(hb.get("fills_total", "n/a")))
     cols[5].metric("No-arb violations", str(hb.get("noarb_violations", "n/a")))
+    # Additive (plan Change E); absent on old heartbeats -> "n/a" via .get.
+    cols[6].metric("Stranded mkts", str(hb.get("stranded_markets", "n/a")))
+    stranded_shares = hb.get("stranded_shares")
+    cols[7].metric("Stranded shares", "%.2f" % stranded_shares if stranded_shares is not None else "n/a")
 
     # Multi-expiry: per-expiry badges from the additive heartbeat `expiries`
     # dict (absent on old single-expiry heartbeats -> nothing rendered).
@@ -358,11 +362,13 @@ def render_status_row(status: "run_control.EngineStatus") -> None:
         parts = []
         for ek in sorted(expiries):
             e = expiries[ek]
-            parts.append("%s [%s] feed=%s fills=%s%s" % (
+            stranded = e.get("stranded", 0)
+            parts.append("%s [%s] feed=%s fills=%s%s%s" % (
                 ek, e.get("state", "?"),
                 "ok" if e.get("feed_healthy") else "DOWN",
                 e.get("fills", "?"),
                 " FROZEN" if e.get("bankroll_frozen") else "",
+                " STRANDED:%s" % stranded if stranded else "",
             ))
         st.caption("Active expiries (%s): %s" % (n_active, "  |  ".join(parts)))
 

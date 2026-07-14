@@ -226,6 +226,7 @@ def _write_heartbeat(
     ladders_settled_total: int = 0, ladder_settlement_timeouts: int = 0,
     expiries: Optional[Dict[str, Dict[str, Any]]] = None,
     noarb_repairs: int = 0,
+    stranded_markets: int = 0, stranded_shares: float = 0.0,
 ) -> None:
     # tick_s/reprice_s feed run_control._heartbeat_threshold: a reprice tick
     # blocks in calculate_probabilities for minutes, so the STALLED threshold
@@ -237,6 +238,9 @@ def _write_heartbeat(
     # heartbeat-consumer compat. noarb_repairs: ladders that arrived at the
     # LadderHedger actually violating no-arb and were PAV-repaired (or
     # rejected), summed over all ladders this run incl. torn-down ones.
+    # stranded_markets/stranded_shares (plan Change E): CURRENT-tick values,
+    # not cumulative (unlike pulled_ticks) -- matches bankroll_frozen
+    # semantics, so the reader sees "now".
     payload: Dict[str, Any] = {
         "ts_utc": ts.isoformat(), "tick": tick, "feed_healthy": bool(feed_healthy),
         "n_msgs": n_msgs, "fills_total": fills_total, "noarb_violations": noarb_violations,
@@ -246,6 +250,8 @@ def _write_heartbeat(
         "btc_data_age_s": btc_data_age_s, "feed_restarts": feed_restarts,
         "resume_discrepancies": resume_discrepancies,
         "bankroll_frozen": bool(bankroll_frozen),
+        "stranded_markets": int(stranded_markets),
+        "stranded_shares": float(stranded_shares),
     }
     if n_expiries_active is not None:
         payload["n_expiries_active"] = int(n_expiries_active)
@@ -401,13 +407,16 @@ def run(argv: Optional[List[str]] = None) -> int:
     # can re-emit a truthful payload without new adapter calls.
     hb_agg: Dict[str, Any] = {"feed_healthy": False, "n_msgs": 0}
 
-    def _expiries_heartbeat_dict() -> Dict[str, Dict[str, Any]]:
+    def _expiries_heartbeat_dict() -> Tuple[Dict[str, Dict[str, Any]], int, float]:
         out: Dict[str, Dict[str, Any]] = {}
+        stranded_markets_total = 0
+        stranded_shares_total = 0.0
         if orch is None:
-            return out
+            return out, stranded_markets_total, stranded_shares_total
         for s in orch._sorted_slots():
+            directives = s.loop.last_directives or {}
             mode_counts: Dict[str, int] = {}
-            for d in (s.loop.last_directives or {}).values():
+            for d in directives.values():
                 mode_counts[d.mode.name] = mode_counts.get(d.mode.name, 0) + 1
             try:
                 fh = bool(s.adapter.healthy())
@@ -415,17 +424,48 @@ def run(argv: Optional[List[str]] = None) -> int:
                 fh = False
             repairs = int(getattr(s.loop.hedger, "repair_count", 0))
             noarb_repairs_by_expiry[s.expiry_key] = repairs
+
+            # Stranded-inventory metric (plan Change E): a market is stranded
+            # this tick iff it holds a nonzero position, its latest
+            # directive's effective mode is PULLED, and NEAR_RESOLUTION is
+            # NOT among its triggers (the settlement window legitimately
+            # parks inventory for its final hours, and would drown the
+            # signal). A transient one-tick pull cause can latch PULLED for
+            # ~60s after its original trigger clears, so this can briefly
+            # over-count; it self-clears and is monitor-only -- read it as
+            # "inventory not currently unwindable", not a hard defect count.
+            slot_stranded = 0
+            slot_stranded_shares = 0.0
+            try:
+                snap = s.loop.inv.snapshot(s.loop.clock.now())
+                for market_id, ci in snap.per_contract.items():
+                    if abs(ci.q) <= 1e-9:
+                        continue
+                    d = directives.get(market_id)
+                    if d is None or d.mode is not QuoteMode.PULLED:
+                        continue
+                    if RiskTrigger.NEAR_RESOLUTION in d.triggers:
+                        continue
+                    slot_stranded += 1
+                    slot_stranded_shares += abs(ci.q)
+            except Exception:
+                logger.warning("stranded-inventory computation failed for %s",
+                                s.expiry_key, exc_info=True)
+            stranded_markets_total += slot_stranded
+            stranded_shares_total += slot_stranded_shares
+
             out[s.expiry_key] = {
                 "event_slug": s.event_slug, "state": s.state,
                 "feed_healthy": fh, "feed_restarts": s.feed_restarts,
                 "bankroll_frozen": bool(s.loop.bankroll_state.frozen),
                 "fills": s.fills_total, "mode_counts": mode_counts,
                 "noarb_repairs": repairs,
+                "stranded": slot_stranded,
             }
-        return out
+        return out, stranded_markets_total, stranded_shares_total
 
     def _emit_heartbeat(ts: datetime) -> None:
-        expiries = _expiries_heartbeat_dict()
+        expiries, stranded_markets, stranded_shares = _expiries_heartbeat_dict()
         _write_heartbeat(
             out_dir, ts, tick_n, hb_agg["feed_healthy"], hb_agg["n_msgs"],
             n_fills_total, noarb_violations, unhealthy_ticks, pulled_ticks,
@@ -439,6 +479,8 @@ def run(argv: Optional[List[str]] = None) -> int:
             ladder_settlement_timeouts=orch.ladder_settlement_timeouts if orch is not None else 0,
             expiries=expiries,
             noarb_repairs=sum(noarb_repairs_by_expiry.values()),
+            stranded_markets=stranded_markets,
+            stranded_shares=stranded_shares,
         )
 
     def _events_meta() -> List[Dict[str, Any]]:

@@ -56,10 +56,11 @@ def _rc(latch=0.0):
 
 def _eval(rc, now=T0, *, tte=5.0, age=0.0, vg=None, breaches=None,
           liq=LiquidityRegime.NORMAL, feed=True, spot=None, strike=None,
-          manual=False, fv_age=None):
+          manual=False, fv_age=None, inventory_q=None):
     return rc.evaluate(
         "m1", now, tte_days=tte, pricer_snapshot=_snap(now, age, tte),
-        inventory_breaches=breaches, liquidity_regime=liq, feed_healthy=feed,
+        inventory_breaches=breaches, inventory_q=inventory_q,
+        liquidity_regime=liq, feed_healthy=feed,
         spot=spot, strike=strike, manual_override=manual,
         vol_gate_result=vg if vg is not None else StubVG(),
         fair_value_age_s=fv_age,
@@ -130,9 +131,24 @@ def test_c_short_breach_bid_only():
     assert RiskTrigger.INV_CAP in d.triggers
 
 
-def test_c_extreme_breach_pulls():
+def test_c_extreme_breach_one_sided():
+    # Stranded-inventory fix 2026-07-14: ANY breach ratio (even > 1.5,
+    # formerly "extreme") emits the one-sided away mode, never PULLED -- a
+    # one-sided-away mode never adds risk, so escalating to PULLED only
+    # removed the unwind path.
     d = _eval(_rc(), breaches=[InvBreach("m1", is_long=True, ratio=1.6)])
-    assert d.mode == QuoteMode.PULLED
+    assert d.mode == QuoteMode.ASK_ONLY
+    assert d.mode != QuoteMode.PULLED
+    assert d.cancel_all is False
+    assert RiskTrigger.INV_CAP in d.triggers
+
+
+def test_c_extreme_breach_one_sided_short():
+    # Short twin of the above: extreme short breach -> BID_ONLY, not PULLED.
+    d = _eval(_rc(), breaches=[InvBreach("m1", is_long=False, ratio=1.6)])
+    assert d.mode == QuoteMode.BID_ONLY
+    assert d.mode != QuoteMode.PULLED
+    assert d.cancel_all is False
     assert RiskTrigger.INV_CAP in d.triggers
 
 
@@ -164,6 +180,68 @@ def test_f_liquidity_degenerate_pulls():
     d = _eval(_rc(), liq=LiquidityRegime.DEGENERATE)
     assert d.mode == QuoteMode.PULLED
     assert RiskTrigger.LIQ_DEGENERATE in d.triggers
+
+
+# ---------------------------------------------------------------------------
+# (f) rule update -- stranded-inventory fix 2026-07-14: DEGENERATE liquidity
+# with real (non-dust) inventory quotes the reduce-only side instead of
+# pulling entirely. The default inventory_q=None (test above) preserves the
+# pre-fix PULLED behavior byte-identically.
+# ---------------------------------------------------------------------------
+
+
+def test_f_degenerate_with_long_inventory_ask_only():
+    d = _eval(_rc(), liq=LiquidityRegime.DEGENERATE, inventory_q=3.0)
+    assert d.mode == QuoteMode.ASK_ONLY
+    assert RiskTrigger.LIQ_DEGENERATE in d.triggers
+
+
+def test_f_degenerate_with_short_inventory_bid_only():
+    d = _eval(_rc(), liq=LiquidityRegime.DEGENERATE, inventory_q=-3.0)
+    assert d.mode == QuoteMode.BID_ONLY
+    assert RiskTrigger.LIQ_DEGENERATE in d.triggers
+
+
+def test_f_degenerate_with_flat_inventory_pulls():
+    # inventory_q=0.0 (flat, not None) is still "no real inventory" -- dust
+    # threshold, not None-ness, gates the reduce-only branch.
+    d = _eval(_rc(), liq=LiquidityRegime.DEGENERATE, inventory_q=0.0)
+    assert d.mode == QuoteMode.PULLED
+    assert RiskTrigger.LIQ_DEGENERATE in d.triggers
+
+
+# ---------------------------------------------------------------------------
+# Co-fire: rules (c)/(f) agree on side (no accidental PULLED escalation),
+# but (d)/(b) still win when they co-fire with a one-sided (c)/(f) result.
+# ---------------------------------------------------------------------------
+
+
+def test_cofire_degenerate_and_extreme_breach_agree_no_escalation():
+    # DEGENERATE (f) + extreme short breach (c), both derived from the same
+    # short inventory_q -- agreeing sides (BID_ONLY) must not escalate to
+    # PULLED via _more_restrictive's opposite-sides rule.
+    d = _eval(_rc(), liq=LiquidityRegime.DEGENERATE, inventory_q=-3.0,
+              breaches=[InvBreach("m1", is_long=False, ratio=1.6)])
+    assert d.mode == QuoteMode.BID_ONLY
+    assert RiskTrigger.LIQ_DEGENERATE in d.triggers
+    assert RiskTrigger.INV_CAP in d.triggers
+
+
+def test_cofire_degenerate_with_inventory_feed_loss_still_pulls():
+    # Rule (d) feed loss is mandatory and ranks above one-sided -- wins even
+    # with real inventory present.
+    d = _eval(_rc(), liq=LiquidityRegime.DEGENERATE, inventory_q=-3.0, feed=False)
+    assert d.mode == QuoteMode.PULLED
+    assert d.cancel_all is True
+    assert RiskTrigger.FEED_STALE in d.triggers
+
+
+def test_cofire_degenerate_with_inventory_near_resolution_still_pulls():
+    # Rule (b) near-resolution wins over the (f) reduce-only side even with
+    # real inventory present. tte=0.2d = 4.8h, inside the 6h default window.
+    d = _eval(_rc(), liq=LiquidityRegime.DEGENERATE, inventory_q=-3.0, tte=0.2)
+    assert d.mode == QuoteMode.PULLED
+    assert RiskTrigger.NEAR_RESOLUTION in d.triggers
 
 
 # ---------------------------------------------------------------------------

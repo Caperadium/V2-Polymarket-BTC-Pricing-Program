@@ -74,6 +74,17 @@ class _FakeAdapter:
         return {slug: [] for slug in self.tokens}
 
 
+class _AlwaysUnhealthyAdapter(_FakeAdapter):
+    """Every constructed instance reports unhealthy forever (mirrors
+    test_mm_paper_runner_ws2's adapter of the same name) -- forces a genuine,
+    non-NEAR_RESOLUTION FEED_STALE PULLED (risk_controller rule d, mandatory
+    + cancel_all) so the stranded-inventory heartbeat metric (plan Change E)
+    has something real to count."""
+
+    def healthy(self) -> bool:
+        return False
+
+
 class _FakeEngine:
     """Stands in for CachedEngine: same constructor signature, no GARCH."""
 
@@ -412,3 +423,101 @@ def test_config_file_merge_and_cli_override(tmp_path, monkeypatch):
 def test_event_slug_required_without_config():
     with pytest.raises(SystemExit):
         paper_runner.run(["--minutes", "0"])
+
+
+# ---------------------------------------------------------------------------
+# stranded-inventory heartbeat metric (plan Change E, 2026-07-14)
+# ---------------------------------------------------------------------------
+
+
+def test_write_heartbeat_payload_includes_stranded_fields(tmp_path):
+    """Direct unit test of _write_heartbeat: the additive stranded_markets/
+    stranded_shares kwargs land top-level in the JSON payload (current-tick
+    values, matching bankroll_frozen semantics), and a passed per-expiry
+    dict's "stranded" key round-trips unchanged."""
+    out_dir = tmp_path / "out"
+    out_dir.mkdir(parents=True)
+    ts = datetime.now(timezone.utc)
+
+    paper_runner._write_heartbeat(
+        out_dir, ts, 7, True, 10, 2, 0, 0, 0, 15.0, 300.0,
+        expiries={
+            "2026-07-20": {
+                "event_slug": "ev", "state": "active", "feed_healthy": True,
+                "feed_restarts": 0, "bankroll_frozen": False, "fills": 2,
+                "mode_counts": {"PULLED": 1}, "noarb_repairs": 0,
+                "stranded": 3,
+            },
+        },
+        n_expiries_active=1,
+        stranded_markets=3, stranded_shares=12.5,
+    )
+
+    hb = json.loads((out_dir / "heartbeat.json").read_text(encoding="ascii"))
+    assert hb["stranded_markets"] == 3
+    assert hb["stranded_shares"] == pytest.approx(12.5)
+    assert hb["expiries"]["2026-07-20"]["stranded"] == 3
+
+    # Default (no stranded args passed) -> zero, not omitted.
+    paper_runner._write_heartbeat(
+        out_dir, ts, 8, True, 10, 2, 0, 0, 0, 15.0, 300.0,
+    )
+    hb2 = json.loads((out_dir / "heartbeat.json").read_text(encoding="ascii"))
+    assert hb2["stranded_markets"] == 0
+    assert hb2["stranded_shares"] == pytest.approx(0.0)
+
+
+def test_heartbeat_reports_stranded_markets_and_shares(tmp_path, monkeypatch):
+    """End-to-end: a market holding a real (pre-seeded) position that gets
+    PULLED for a reason other than NEAR_RESOLUTION -- here FEED_STALE, forced
+    by an always-unhealthy adapter -- is counted in the heartbeat's
+    stranded_markets/stranded_shares totals AND in its expiry's per-market
+    'stranded' entry (_expiries_heartbeat_dict, plan Change E)."""
+    _install_common_stubs(monkeypatch, tmp_path)
+    monkeypatch.setattr(paper_runner, "PolymarketFeedAdapter", _AlwaysUnhealthyAdapter)
+
+    out_dir = tmp_path / "out"
+    ctl_dir = tmp_path / "control"
+    out_dir.mkdir(parents=True)
+
+    # Pre-seed a real long YES position on m-98k through the same fills
+    # channel the settlement test above uses, so a pre-existing db (resume
+    # protocol) starts with real inventory for the risk controller to strand.
+    seed_ts = datetime.now(timezone.utc) - timedelta(hours=1)
+    pre_store = MMStateStore(str(out_dir / "paper_state.db"))
+    pre_store.record_fill_and_update_inventory(
+        Fill(ts=seed_ts, market_id="m-98k", order_id="seed", side=Side.BUY_YES,
+             price=0.40, size=5.0, liquidity=LiquiditySource.MAKER, venue_ts=seed_ts),
+        ContractInv(q=5.0, avg_cost=0.40, q_max=100.0, age_weighted_holding=0.0),
+    )
+    pre_store.close()
+
+    result: Dict[str, int] = {}
+
+    def _target():
+        result["code"] = paper_runner.run([
+            "--event-slug", "fake-event", "--minutes", "0", "--tick-s", "0.2",
+            "--warmup-s", "0", "--out", str(out_dir), "--control-dir", str(ctl_dir),
+        ])
+
+    t = threading.Thread(target=_target, daemon=True)
+    t.start()
+    try:
+        tick = _wait_for_heartbeat_tick(out_dir, 2)
+        assert tick >= 2, "runner did not reach tick 2 in time"
+        (ctl_dir / "mm_paper.stop").write_text("", encoding="ascii")
+        t.join(timeout=20.0)
+        assert not t.is_alive()
+    finally:
+        if t.is_alive():  # pragma: no cover
+            t.join(timeout=5.0)
+    assert result.get("code") == 0
+
+    hb = json.loads((out_dir / "heartbeat.json").read_text(encoding="ascii"))
+    assert hb["feed_healthy"] is False
+    assert hb["stranded_markets"] >= 1
+    assert hb["stranded_shares"] >= 5.0 - 1e-6
+
+    ek = next(iter(hb["expiries"]))
+    e = hb["expiries"][ek]
+    assert e["stranded"] >= 1

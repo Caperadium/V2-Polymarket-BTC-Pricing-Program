@@ -737,19 +737,36 @@ independent:
 | Trigger | Condition | Response |
 |---|---|---|
 | Vol gate | BTC realized-vol shock or extreme regime (via `core/strategy/vol_gate.py`) | PULLED; "high" regime widens instead (eps_add += edge_add_cents/100) |
-| Near resolution | tte < 24 h | PULLED -- endgame binaries are gamma bombs |
+| Near resolution | tte < `near_resolution_pull_hours` (6 h since the 2026-07-11 recal) | PULLED -- endgame binaries are gamma bombs |
 | Gap-through | spot within 0.5% of strike while vol elevated | PULLED |
-| Inventory breach | \|q\| >= q_max | one-sided *away* from the breach (long -> ASK_ONLY, i.e. only offer to sell down); > 1.5x cap -> PULLED |
+| Inventory breach | \|q\| >= q_max | one-sided *away* from the breach (long -> ASK_ONLY, i.e. only offer to sell down) at ANY breach ratio -- never PULLED (2026-07-14 stranded-inventory fix; the ratio > 1.5 "extreme" threshold no longer changes the mode) |
 | Feed dead | WebSocket unhealthy | PULLED + mandatory cancel_all |
 | Pricer stale | snapshot age > 300 s / > 600 s | widen / PULLED |
 | Fair value stale | consensus age > 300 s / > 600 s | widen / PULLED |
-| Liquidity degenerate | book effectively empty | PULLED |
+| Liquidity degenerate | book effectively empty | PULLED when flat; reduce-only side (away from the position) when holding inventory (2026-07-14 fix) |
 | Manual override | operator stop, stale BTC data, unresolved resume discrepancy | PULLED |
 
 Multiple triggers combine to the **most restrictive** mode; two *opposite*
 one-sided requirements escalate to PULLED (you cannot safely satisfy both);
 eps_add contributions sum. Ending PULLED always implies cancel_all -- pulled
 means no resting orders, not merely no new ones.
+
+Why the inventory-breach and degenerate-book rules stopped pulling
+(2026-07-14): a one-sided mode AWAY from the position never adds risk -- the
+add side is suppressed and the reduce leg is bounded by sizing (reduce-side
+floor min(|q|, s_presence); inventory headroom bid <= q_max - q / ask <=
+q_max + q always leaves the reduce side room). Escalating to PULLED therefore
+protected nothing and only removed the unwind path: q_max = q_max_scale *
+S'(x) shrinks under a FIXED position as p drifts toward a wing, so a filled
+strike that went deep ITM/OTM would cross the 1.5x "extreme" threshold and
+strand its inventory until settlement (observed live: 58000 short on all
+three ladders, PULLED for hours). Posting the reduce side as sole maker in a
+dead (degenerate) book is safe for the same reason: we set the price, the
+conservative queue-behind fill sim fills only against real prints, and the
+DEPTH cap floor (1 share) means the position drains gradually. Feed-dead,
+near-resolution, staleness, vol-shock and manual pulls are deliberately
+unchanged -- those are states where no quote can be trusted, and inventory
+parked by them is surfaced by the heartbeat's stranded metric instead.
 
 Note the graduated pattern that recurs: **widen first, pull at 2x**. Widening
 keeps earning (at a higher charge) through mild degradation; pulling forfeits
@@ -947,10 +964,14 @@ pointing at the latest run and its exit reason (plus an `events` list of
 every active ladder; the legacy singular fields point at the nearest
 expiry). Each run rewrites `heartbeat.json` every tick with tick counters,
 feed health (AND over active ladders), BTC-data age, resume discrepancies,
-the bankroll-frozen flag (OR over ladders), and per-expiry breakdowns
+the bankroll-frozen flag (OR over ladders), the stranded-inventory gauge
+(`stranded_markets` / `stranded_shares`, current-tick counts of markets
+holding inventory whose quotes are PULLED outside the near-resolution
+window -- "not currently unwindable", monitor-only, no alert; a transient
+latched pull can over-count for ~60 s), and per-expiry breakdowns
 (`n_expiries_active`, `ladders_settled_total`, `ladder_settlement_timeouts`,
-`expiries`); `engine_status()` derives RUNNING / STARTING / STALLED /
-STOPPED / CRASHED from these files. Exit codes are contracts with systemd:
+`expiries`, each expiry carrying a `stranded` count); `engine_status()`
+derives RUNNING / STARTING / STALLED / STOPPED / CRASHED from these files. Exit codes are contracts with systemd:
 42 means "nothing quotable" in auto mode (`no_quotable_events` -- rollover
 itself is in-process now) or the legacy settled/timeout signal in fixed-slug
 mode, and triggers a retry restart; 1 means a supervised restart (dead feed,

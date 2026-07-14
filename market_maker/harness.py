@@ -314,11 +314,14 @@ class PaperTradingLoop:
                 pass
             book.on_message(m)
 
-    def _breaches(self) -> List[InvBreach]:
+    def _breaches(self, inv_snap) -> List[InvBreach]:
+        """Inventory-cap breaches for the current tick. `inv_snap` is the
+        single per-tick inventory snapshot (hoisted by the caller so it is
+        taken once, not once per call -- stranded-inventory fix
+        2026-07-14, Change B)."""
         breaches: List[InvBreach] = []
-        snap = self.inv.snapshot(self.clock.now())
         for m, _ in self.markets:
-            ci = snap.per_contract.get(m)
+            ci = inv_snap.per_contract.get(m)
             if ci is None or ci.q_max <= 0.0:
                 continue
             ratio = abs(ci.q) / ci.q_max
@@ -645,8 +648,12 @@ class PaperTradingLoop:
         for m, k in self.markets:
             self.inv.update_fair_x(m, float(fv.consensus_x[k]))
 
-        # 4. risk directives
-        breaches = self._breaches()
+        # 4. risk directives -- one inventory snapshot per tick, reused by
+        # _breaches() and the per-market inventory_q lookup below
+        # (stranded-inventory fix 2026-07-14, Change B).
+        inv_snap = self.inv.snapshot(now)
+        breaches = self._breaches(inv_snap)
+        q_by_market = {m: ci.q for m, ci in inv_snap.per_contract.items()}
         # W1.2: age of the last successful consensus recompute, fed to the
         # risk controller's fair-value staleness rule; None until the first
         # recompute ever happens (inert -- see RiskController.evaluate).
@@ -660,7 +667,8 @@ class PaperTradingLoop:
             self.last_liquidity[m] = liq
             directive = self.risk.evaluate(
                 m, now, tte_days=snap.tte_days, pricer_snapshot=snap,
-                inventory_breaches=breaches, liquidity_regime=liq.regime,
+                inventory_breaches=breaches, inventory_q=q_by_market.get(m),
+                liquidity_regime=liq.regime,
                 feed_healthy=market_states[m].feed_healthy,
                 spot=snap.s0, strike=k, manual_override=manual_override,
                 vol_gate_result=vol_gate_result,

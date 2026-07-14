@@ -13,18 +13,26 @@ with the MOST RESTRICTIVE mode, summed eps_add, min kelly_mult, any cancel_all:
   (b) tte < near_resolution_pull_hours/24 days -> PULLED; spot within a
       threshold of strike while vol elevated (gap-through) -> PULLED.
   (c) inventory cap breach -> one-sided quoting AWAY from the breach (long/YES
-      breach -> ASK_ONLY to sell down; short breach -> BID_ONLY to cover);
-      extreme breach (ratio > 1.5x cap) -> PULLED.
+      breach -> ASK_ONLY to sell down; short breach -> BID_ONLY to cover), at
+      ANY breach ratio -- a one-sided-away mode never adds risk, so this rule
+      never escalates to PULLED (stranded-inventory fix 2026-07-14).
   (d) feed stale/unhealthy -> PULLED + cancel_all=True (mandatory).
   (e) pricer snapshot stale -> widen first (eps_add += pricer_stale_eps_add);
       older than 2x max age -> PULLED.
-  (f) liquidity DEGENERATE -> PULLED.
+  (f) liquidity DEGENERATE -> PULLED, unless the caller supplies a nonzero
+      signed `inventory_q` for the market, in which case it emits the
+      reduce-only side instead (ASK_ONLY if inventory_q > 0 else BID_ONLY) --
+      posting only the reduce side in a dead book is safe (stranded-inventory
+      fix 2026-07-14).
   (g) fair-value (consensus) staleness (plan Wave 1 W1.2) -- mirrors rule
       (e): `fair_value_age_s` older than `fv_max_age_s` -> widen
       (eps_add += pricer_stale_eps_add, the same widen constant reused);
       older than 2x `fv_max_age_s` -> PULLED. `fair_value_age_s=None`
       (default) is inert -- callers that do not thread it (e.g. Stage-A) see
       no behavior change.
+  Note: rules (c) and (f) both derive their one-sided direction from the SAME
+  underlying signed inventory q, so when both fire on one market they agree
+  and _more_restrictive does not escalate them to PULLED.
   manual override -> PULLED (MANUAL trigger).
 
 Any transition INTO a restrictive mode latches for latch_seconds (default 60s);
@@ -57,6 +65,7 @@ from market_maker.contracts import (
 _DEFAULT_LATCH_SECONDS = 60.0  # module default when config lacks it (plan 2.10)
 _DEFAULT_GAP_STRIKE_FRAC = 0.005  # |spot-strike|/strike gap-through band (open Q8)
 _DEFAULT_PRICER_STALE_EPS_ADD = 0.01  # widen on first-stage pricer staleness
+_INV_DUST = 1e-9  # |q| above this counts as inventory for the reduce-only degenerate rule
 
 # Mode restrictiveness rank (higher = more restrictive).
 _RANK = {
@@ -72,7 +81,9 @@ class InvBreach:
     """A per-market inventory cap breach handed to the controller.
 
     is_long True means excess YES (q > 0) -> reduce by quoting asks only.
-    ratio = |q| / q_max (>= 1 is a breach; > 1.5 is extreme).
+    ratio = |q| / q_max (>= 1 is a breach; > 1.5 is extreme -- kept for
+    journaling/analytics only; past the stranded-inventory fix 2026-07-14 the
+    extreme threshold no longer changes the resulting mode, see rule (c)).
     """
     market_id: str
     is_long: bool
@@ -128,6 +139,7 @@ class RiskController:
                  tte_days: float,
                  pricer_snapshot: PricerSnapshot,
                  inventory_breaches: Optional[List[InvBreach]] = None,
+                 inventory_q: Optional[float] = None,
                  liquidity_regime: LiquidityRegime = LiquidityRegime.NORMAL,
                  feed_healthy: bool = True,
                  spot: Optional[float] = None,
@@ -135,7 +147,16 @@ class RiskController:
                  manual_override: bool = False,
                  vol_gate_result: Optional[object] = None,
                  fair_value_age_s: Optional[float] = None) -> RiskDirective:
-        """Produce the RiskDirective for one market at one tick."""
+        """Produce the RiskDirective for one market at one tick.
+
+        inventory_q: signed per-market position (q > 0 = long/excess YES,
+        q < 0 = short/excess NO); None = unknown. Consumed only by rule (f):
+        a DEGENERATE liquidity regime with a nonzero (non-dust) inventory_q
+        quotes the reduce-only side instead of pulling entirely. Default
+        None preserves the pre-2026-07-14 PULLED-on-degenerate behavior for
+        callers that do not thread it (e.g. Stage-A shadow_runner, which is
+        fill-free by construction).
+        """
         vg = vol_gate_result
         if vg is None and self._vol_gate_fn is not None:
             vg = self._vol_gate_fn()
@@ -171,14 +192,19 @@ class RiskController:
             req_mode = _more_restrictive(req_mode, QuoteMode.PULLED)
             triggers.append(RiskTrigger.SPOT_GAPPING_STRIKE)
 
-        # (c) inventory cap breach
+        # (c) inventory cap breach -> one-sided quoting AWAY from the breach,
+        # at ANY breach ratio. A one-sided-away mode never adds risk: the add
+        # side is off, and the reduce side stays bounded by sizing's
+        # reduce-side floor (min(|q|, s_presence)) and the inventory headroom
+        # caps (bid <= q_max - q, ask <= q_max + q), which always leave
+        # headroom on the reduce side by construction. Escalating to PULLED
+        # here only removed the unwind path and stranded the position
+        # (stranded-inventory fix 2026-07-14) -- `breach.ratio` stays on
+        # InvBreach for journaling/analytics but no longer changes the mode.
         breach = self._breach_for(market_id, inventory_breaches)
         if breach is not None:
-            if breach.ratio > 1.5:
-                req_mode = _more_restrictive(req_mode, QuoteMode.PULLED)
-            else:
-                side_mode = QuoteMode.ASK_ONLY if breach.is_long else QuoteMode.BID_ONLY
-                req_mode = _more_restrictive(req_mode, side_mode)
+            side_mode = QuoteMode.ASK_ONLY if breach.is_long else QuoteMode.BID_ONLY
+            req_mode = _more_restrictive(req_mode, side_mode)
             triggers.append(RiskTrigger.INV_CAP)
 
         # (d) feed stale / unhealthy -- mandatory pull + cancel-all
@@ -197,9 +223,19 @@ class RiskController:
             eps_add += self._pricer_stale_eps_add
             triggers.append(RiskTrigger.PRICER_STALE)
 
-        # (f) liquidity regime degenerate
+        # (f) liquidity regime degenerate. With no (or dust) inventory this
+        # stays PULLED exactly as before. With real inventory, quoting the
+        # reduce-only side as sole maker in a dead book is safe -- we set
+        # the price, the conservative queue-behind fill sim only fills
+        # against real prints, and the add side stays off; materiality of a
+        # tiny q is handled by sizing's floors, not here (stranded-inventory
+        # fix 2026-07-14).
         if liquidity_regime == LiquidityRegime.DEGENERATE:
-            req_mode = _more_restrictive(req_mode, QuoteMode.PULLED)
+            if inventory_q is not None and abs(inventory_q) > _INV_DUST:
+                side_mode = QuoteMode.ASK_ONLY if inventory_q > 0 else QuoteMode.BID_ONLY
+                req_mode = _more_restrictive(req_mode, side_mode)
+            else:
+                req_mode = _more_restrictive(req_mode, QuoteMode.PULLED)
             triggers.append(RiskTrigger.LIQ_DEGENERATE)
 
         # (g) fair-value (consensus) staleness -- mirrors rule (e); inert

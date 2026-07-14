@@ -909,12 +909,15 @@ def test_w2_2_suppressed_side_zeroed_size_never_resurrected(store):
 def test_breach_interplay_hedge_fires_below_one_sided_threshold(store):
     """Hedge recs fire once |q| exceeds 50% of cap while quoting is still
     TWO_SIDED (below the risk controller's own 100% one-sided threshold);
-    at |q| > q_max the risk controller goes one-sided; at ratio > 1.5 it
-    goes PULLED. This test exercises the hedger's own threshold in
-    isolation (vertical_target_frac=0.5, the launch default) against the
-    risk controller's INV_CAP thresholds (harness._breaches at ratio>=1.0,
-    risk_controller PULLED at ratio>1.5), confirming the two fire at
-    different, correctly-ordered inventory levels."""
+    at |q| > q_max the risk controller goes one-sided and STAYS one-sided as
+    the breach deepens (stranded-inventory fix 2026-07-14, Change A: ANY
+    breach ratio -- including the formerly-"extreme" >1.5 -- emits the
+    one-sided away mode, never PULLED, since a one-sided-away mode never
+    adds risk). This test exercises the hedger's own threshold in isolation
+    (vertical_target_frac=0.5, the launch default) against the risk
+    controller's INV_CAP threshold (harness._breaches at ratio>=1.0),
+    confirming the two fire at different, correctly-ordered inventory
+    levels."""
     from market_maker.contracts import InventoryState, ContractInv
 
     market_id, other_market = MARKETS[0][0], MARKETS[1][0]
@@ -968,14 +971,56 @@ def test_breach_interplay_hedge_fires_below_one_sided_threshold(store):
     )
     assert directive_120.mode == QuoteMode.ASK_ONLY
 
-    # At ratio 1.6 (>1.5): risk controller goes PULLED.
+    # At ratio 1.6 (>1.5, formerly "extreme"): risk controller stays
+    # one-sided (ASK_ONLY, long position) -- it no longer escalates to
+    # PULLED at any breach ratio (stranded-inventory fix 2026-07-14).
     breaches_160 = [InvBreach(market_id=market_id, is_long=True, ratio=1.6)]
     directive_160 = loop.risk.evaluate(
         market_id, now, tte_days=loop.last_snapshot.tte_days, pricer_snapshot=loop.last_snapshot,
         inventory_breaches=breaches_160, liquidity_regime=loop.last_liquidity[market_id].regime,
         feed_healthy=True, spot=loop.last_snapshot.s0, strike=MARKETS[0][1],
     )
-    assert directive_160.mode == QuoteMode.PULLED
+    assert directive_160.mode == QuoteMode.ASK_ONLY
+    assert directive_160.mode != QuoteMode.PULLED
+
+
+def test_harness_wires_inventory_q_into_risk_evaluate(store, monkeypatch):
+    """Harness wiring (stranded-inventory fix 2026-07-14, Change B): the
+    tick loop hoists ONE inventory snapshot per tick (shared by _breaches()
+    and the per-market inventory_q lookup) and passes each market's signed q
+    into RiskController.evaluate as inventory_q -- confirms the position's
+    real q arrives for the market that holds it, and a flat market reads
+    0.0 (the harness always threads a value from the snapshot, never omits
+    the kwarg for a registered market)."""
+    market_id, other_market = MARKETS[0][0], MARKETS[1][0]
+    loop = PaperTradingLoop(
+        store=store, expiry_key=EXPIRY, markets=MARKETS, engine_fn=_engine(),
+        config=MMConfig(gamma=0.5, k_arrival=1.0), clock=SimClock(START), vol_gate_fn=_vol_gate(),
+    )
+    loop.tick(_moving_books(MARKETS, 0.0))
+    now = loop.clock.now()
+
+    # Grow market_id's inventory to a real, nonzero long position via the
+    # normal fill channel (mirrors _build_long_position's other call sites);
+    # other_market stays flat.
+    _build_long_position(loop, market_id, now, target_q=3.0)
+
+    captured = []
+    orig_evaluate = loop.risk.evaluate
+
+    def spy(*args, **kwargs):
+        captured.append((args, kwargs))
+        return orig_evaluate(*args, **kwargs)
+
+    monkeypatch.setattr(loop.risk, "evaluate", spy)
+
+    loop.tick(_moving_books(MARKETS, 0.1))
+
+    assert captured, "risk.evaluate was not called this tick"
+    inventory_q_by_market = {args[0]: kwargs.get("inventory_q") for args, kwargs in captured}
+    assert set(inventory_q_by_market) == {market_id, other_market}
+    assert inventory_q_by_market[market_id] == pytest.approx(3.0)
+    assert inventory_q_by_market[other_market] == pytest.approx(0.0)
 
 
 def test_beta_hedge_flag_off_is_inert(store, monkeypatch):

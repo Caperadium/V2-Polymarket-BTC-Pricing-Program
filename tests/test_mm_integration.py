@@ -318,7 +318,7 @@ def test_forced_noarb_reject_blocks_orders(store):
 # ---------------------------------------------------------------------------
 
 
-def test_inventory_cap_goes_one_sided_then_pulls(store):
+def test_inventory_cap_goes_one_sided_and_stays_one_sided(store):
     # Small q_max so a few fills breach it. Large bankroll -> large resting bid;
     # SMALL prints (3 shares/tick) PARTIALLY fill it so the same bid stays live
     # every tick. The ratio steps through the (1,1.5] one-sided band and holds
@@ -327,11 +327,14 @@ def test_inventory_cap_goes_one_sided_then_pulls(store):
     # accumulation once headroom is exhausted), so the OLD mechanism for this
     # test (fills alone running q past 1.5x q_max) is exactly the sizing bug
     # the plan fixes and can no longer overshoot via resting-bid fills.
-    # A genuine >1.5x extreme breach still arises the way it would live: q_max
-    # itself shrinks (S'(x) falls as consensus_x moves away from ATM) under an
-    # ALREADY-large position, without requiring any further fill. Drive that
-    # by moving the underlying spot away from the strike after the position is
-    # built up to the one-sided band.
+    # A deeper breach still arises the way it would live: q_max itself shrinks
+    # (S'(x) falls as consensus_x moves away from ATM) under an ALREADY-large
+    # position, without requiring any further fill. Drive that by moving the
+    # underlying spot away from the strike after the position is built up to
+    # the one-sided band, and confirm the mode STAYS one-sided (never PULLED
+    # via INV_CAP) as the breach deepens past 1.5 -- stranded-inventory fix
+    # 2026-07-14, Change A: a one-sided-away mode never adds risk, so rule (c)
+    # no longer escalates to PULLED at any breach ratio.
     cfg = MMConfig(q_max_scale=20.0, k_arrival=1.0)  # q_max(ATM) = 20 * 0.25 = 5; k pinned to launch value, scenario is tuned to the wide-quote geometry
     loop = _make_loop(store, config=cfg, bankroll=5000.0)
 
@@ -347,7 +350,8 @@ def test_inventory_cap_goes_one_sided_then_pulls(store):
     one_sided_idx = modes.index(QuoteMode.ASK_ONLY)
 
     # Shift spot away from the strike so q_max (proportional to S'(x)) shrinks
-    # under the already-built position, without any new fills required.
+    # under the already-built position, without any new fills required. This
+    # deepens the breach ratio well past 1.5 (formerly "extreme").
     for i in range(6):
         s0_shift = S0 + 3000.0 * (i + 1)
         shifted = {m: _snapshot_msg(_p_of(k, s0=s0_shift)) for m, k in MARKETS}
@@ -356,12 +360,14 @@ def test_inventory_cap_goes_one_sided_then_pulls(store):
         fill_counts.append(len(store.get_fills("m-100k")))
         assert loop.fold_matches_inventory()
 
-    first_pull = next((i for i, m in enumerate(modes) if m == QuoteMode.PULLED), None)
-    assert first_pull is not None
-    assert one_sided_idx < first_pull  # one-sided BEFORE pull
-
-    # After the pull fires, no further fills occur (orders cancelled).
-    assert fill_counts[-1] == fill_counts[first_pull]
+    # The mode goes one-sided (ASK_ONLY, the away-from-breach side for a long
+    # position) at ratio >= 1.0 and REMAINS one-sided for the rest of the
+    # run -- INV_CAP alone must never escalate this to PULLED, however deep
+    # the breach gets.
+    assert modes[one_sided_idx] == QuoteMode.ASK_ONLY
+    for m in modes[one_sided_idx:]:
+        assert m == QuoteMode.ASK_ONLY
+    assert QuoteMode.PULLED not in modes
 
 
 # ---------------------------------------------------------------------------
