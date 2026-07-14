@@ -267,12 +267,25 @@ downstream: the spread builder widens quotes when credibility is low
 ### 4.4 Degeneracy and freezing
 
 If inputs are broken (non-finite mids, empty ladder) or the consensus escapes
-its sanity bound (per strike it must lie *between* the pricer value and the
-market mid -- a weighted average always does, so a violation means a bug or
-poisoned input), the anchor falls back to a fixed 50/50 blend and **freezes**
-the bankrolls so garbage ticks cannot corrupt the learned weights. The freeze
-auto-clears after 20 consecutive clean recomputes. A frozen bankroll is also
-surfaced in the heartbeat and pages the operator (Section 15).
+its sanity bound (per strike it must lie *between* the SANITIZED pricer and
+market ladders -- each raw ladder round-tripped through the bucket transform,
+which repairs non-monotone inputs such as crossed venue mids -- a weighted
+average always does, so a violation means a numeric bug), the anchor falls
+back to a fixed 50/50 blend and **freezes** the bankrolls so garbage ticks
+cannot corrupt the learned weights. The freeze auto-clears after 20
+consecutive clean recomputes. A frozen bankroll is also surfaced in the
+heartbeat and pages the operator (Section 15).
+
+Why sanitized, not raw (2026-07-14 fix): the consensus is built in bucket
+space from the sanitized ladders, so checking it against the *raw* inputs
+made one crossed mid pair anywhere in the ladder (routine on thin far-expiry
+wing books) a guaranteed per-strike violation at *every* strike -- the bucket
+renormalization is global. In production that froze a 3-DTE ladder's bankroll
+permanently: the anchor method was never BEUOY, so the 20-clean-tick
+auto-unfreeze could never start. Against the sanitized band the consensus is
+provably in-band (it is a convex combination of the sanitized ladders), so
+the check is a pure numeric safety net and crossed mids no longer freeze
+anything.
 
 One operational subtlety: the consensus only recomputes when *every* market in
 the ladder has a valid mid. On ticks where it cannot recompute, the previous

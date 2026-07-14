@@ -27,8 +27,10 @@ from market_maker.contracts import (
 from market_maker.fair_value_anchor import (
     DEFAULT_BANKROLL_FLOOR,
     ladder_to_buckets,
+    buckets_to_ladder,
     compute_fair_value,
 )
+import market_maker.fair_value_anchor as fva
 
 TS = datetime(2026, 7, 6, 12, 0, tzinfo=timezone.utc)
 
@@ -247,22 +249,132 @@ def test_fallback_on_all_zero_bankrolls():
     assert cp[3.0] == pytest.approx(0.25, abs=1e-9)
 
 
-def test_fallback_on_sanity_bound_violation():
+def test_non_monotone_pricer_sanitized_not_fallback():
+    # Was test_fallback_on_sanity_bound_violation. Under the OLD raw-ladder
+    # sanity band this non-monotone pricer ([0.3, 0.9, 0.2]) tripped the
+    # fallback. Under the fix (Change 1), the band is built from the
+    # SANITIZED (bucket-round-tripped) ladders, and the consensus is
+    # provably a convex combination of those same sanitized ladders, so this
+    # is now the normal BEUOY path -- non-monotone venue mids get repaired
+    # by the bucket transform instead of freezing the bankroll.
     strikes = [1.0, 2.0, 3.0]
-    # Non-monotone pricer forces bucket clipping -> consensus escapes the band.
+    pricer = np.array([0.3, 0.9, 0.2])
+    market = np.array([0.8, 0.5, 0.2])
     res = compute_fair_value(
-        _snapshot(strikes, [0.3, 0.9, 0.2]),
-        _mids(strikes, [0.8, 0.5, 0.2]),
+        _snapshot(strikes, pricer),
+        _mids(strikes, market),
         _bankrolls(0.5, 0.5),
+        CFG,
+    )
+    assert res.fair_value.anchor_method == AnchorMethod.BEUOY
+    assert res.bankroll_state.frozen is False
+
+    recon_pricer = buckets_to_ladder(ladder_to_buckets(pricer))
+    recon_market = buckets_to_ladder(ladder_to_buckets(market))
+    lo = np.minimum(recon_pricer, recon_market) - 1e-6
+    hi = np.maximum(recon_pricer, recon_market) + 1e-6
+
+    cp = res.fair_value.consensus_p
+    cons = np.array([cp[k] for k in strikes])
+    assert np.all(cons >= lo)
+    assert np.all(cons <= hi)
+    for a, b in zip(cons, cons[1:]):
+        assert b <= a + 1e-12
+
+    # Hand-checked (w=0.5/0.5): recon_pricer=[0.5625,0.5625,0.125],
+    # recon_market=[0.8,0.5,0.2], consensus=[0.68125,0.53125,0.1625].
+    assert recon_pricer == pytest.approx([0.5625, 0.5625, 0.125], abs=1e-9)
+    assert recon_market == pytest.approx([0.8, 0.5, 0.2], abs=1e-9)
+    assert cons == pytest.approx([0.68125, 0.53125, 0.1625], abs=1e-9)
+
+
+def test_crossed_wing_mids_production_regression():
+    # Actual VPS 2026-07-17 production ladder (crossed wing mids: K=70000
+    # mid 0.0055 < K=72000 mid 0.0140). Under the OLD raw-ladder sanity band
+    # this exact ladder fell back on 1949/1949 recomputes for the expiry
+    # (FIXED_BLEND_FALLBACK) and froze the bankroll for 7h+ -- auto-unfreeze
+    # (20 consecutive clean BEUOY ticks) could never even start. Under the
+    # sanitized-band fix (Change 1) it must price BEUOY, not frozen.
+    strikes = [
+        54000, 56000, 58000, 60000, 62000, 64000, 66000, 68000,
+        70000, 72000, 74000,
+    ]
+    mids = [
+        0.9980, 0.9935, 0.9745, 0.9045, 0.6550, 0.2850, 0.0745,
+        0.0115, 0.0055, 0.0140, 0.0045,
+    ]
+    pricer = [
+        0.9985, 0.9930, 0.9700, 0.9000, 0.6600, 0.2900, 0.0800,
+        0.0150, 0.0080, 0.0060, 0.0040,
+    ]
+    res = compute_fair_value(
+        _snapshot(strikes, pricer),
+        _mids(strikes, mids),
+        _bankrolls(0.5, 0.5),
+        CFG,
+    )
+    assert res.fair_value.anchor_method == AnchorMethod.BEUOY
+    assert res.bankroll_state.frozen is False
+
+
+def test_sanity_fallback_still_fires_on_band_violation(monkeypatch):
+    # Safety-net test for the band check itself. A CONSTANT monkeypatch
+    # offset would NOT work here: the band bounds are themselves built from
+    # buckets_to_ladder(forecasts[...]) output, so a constant shift moves the
+    # band together with the consensus and the check would never fire.
+    # Instead, wrap buckets_to_ladder with an INPUT-MATCHING perturbation:
+    # pass through unchanged when the input bucket vector matches either
+    # model's own forecast (used by the per-strike recon/band computation),
+    # and perturb only when it does not -- which isolates the wrap to the
+    # blended-consensus reconstruction. Distinct ladders + unequal bankrolls
+    # (0.7/0.3) make the consensus bucket vector differ from both forecasts,
+    # so exactly (and only) the consensus reconstruction gets perturbed.
+    fc_pricer = ladder_to_buckets(np.array([0.9, 0.6, 0.3]))
+    fc_market = ladder_to_buckets(np.array([0.8, 0.5, 0.2]))
+    _real_buckets_to_ladder = fva.buckets_to_ladder
+
+    def _wrapped_buckets_to_ladder(buckets):
+        out = _real_buckets_to_ladder(buckets)
+        b = np.asarray(buckets, dtype=float)
+        if np.allclose(b, fc_pricer) or np.allclose(b, fc_market):
+            return out
+        # Not either model's own forecast -> this is the blended consensus.
+        # Hand-checked margin to the nearest band edge for this ladder/weight
+        # combo is 0.03 (0.7*0.3*0.1 gap-per-strike), so +0.05 clears it.
+        return out + 0.05
+
+    monkeypatch.setattr(fva, "buckets_to_ladder", _wrapped_buckets_to_ladder)
+
+    strikes = [1.0, 2.0, 3.0]
+    res = compute_fair_value(
+        _snapshot(strikes, [0.9, 0.6, 0.3]),
+        _mids(strikes, [0.8, 0.5, 0.2]),
+        _bankrolls(0.7, 0.3),
         CFG,
     )
     assert res.fair_value.anchor_method == AnchorMethod.FIXED_BLEND_FALLBACK
     assert res.bankroll_state.frozen is True
-    cp = res.fair_value.consensus_p
-    # blend = 0.5*[0.3,0.9,0.2]+0.5*[0.8,0.5,0.2]=[0.55,0.7,0.2] -> monotone [0.55,0.55,0.2]
-    assert cp[1.0] == pytest.approx(0.55, abs=1e-9)
-    assert cp[2.0] == pytest.approx(0.55, abs=1e-9)
-    assert cp[3.0] == pytest.approx(0.2, abs=1e-9)
+
+
+def test_frozen_state_recovers_beuoy_on_crossed_mids():
+    # Contract: the anchor's top-level path prices BEUOY regardless of the
+    # incoming frozen flag -- frozen only skips the Bayes mark-to-market
+    # bankroll update, not the consensus computation. The anchor itself NEVER
+    # self-clears frozen; auto-unfreeze is owned entirely by the harness
+    # (harness.py:632-639), keyed on 20 consecutive clean BEUOY recomputes.
+    # This test documents that contract with a crossed-mid (non-monotone)
+    # ladder on top of an already-frozen bankroll state.
+    strikes = [1.0, 2.0, 3.0]
+    pricer = [0.9, 0.6, 0.3]
+    mids = [0.8, 0.5, 0.52]  # non-monotone: K3 mid (0.52) > K2 mid (0.5)
+    res = compute_fair_value(
+        _snapshot(strikes, pricer),
+        _mids(strikes, mids),
+        _bankrolls(0.5, 0.5, frozen=True),
+        CFG,
+    )
+    assert res.fair_value.anchor_method == AnchorMethod.BEUOY
+    assert res.bankroll_state.frozen is True
 
 
 # ---------------------------------------------------------------------------

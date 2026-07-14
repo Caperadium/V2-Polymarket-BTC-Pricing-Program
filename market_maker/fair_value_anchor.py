@@ -27,9 +27,13 @@ consensus and the BankrollState across refreshes (returned in AnchorResult).
 
 Degeneracy fallback (risk 8.8). On any failure -- non-finite inputs, all-zero
 bankrolls, or a per-strike sanity-bound violation (consensus must lie between the
-pricer and mid ladders) -- the anchor falls back to a fixed w=0.5 blend of pricer
-and mid per strike, freezes the bankrolls (BankrollState.frozen=True), tags
-AnchorMethod.FIXED_BLEND_FALLBACK, and logs a warning.
+SANITIZED pricer and mid ladders, i.e. each raw ladder round-tripped through
+ladder_to_buckets/buckets_to_ladder -- the bucket transform repairs non-monotone
+inputs, e.g. crossed venue mids, rather than triggering the fallback; the band
+check is now a numeric safety net) -- the anchor falls back to a fixed w=0.5
+blend of pricer and mid per strike, freezes the bankrolls
+(BankrollState.frozen=True), tags AnchorMethod.FIXED_BLEND_FALLBACK, and logs a
+warning.
 """
 from __future__ import annotations
 
@@ -256,9 +260,22 @@ def compute_fair_value(
 
     consensus_p = buckets_to_ladder(consensus_bucket)
 
-    # --- sanity bound: consensus must lie between pricer and mid per strike ---
-    lo_band = np.minimum(pricer_p, market_p) - _SANITY_TOL
-    hi_band = np.maximum(pricer_p, market_p) + _SANITY_TOL
+    # --- sanity bound: consensus must lie between the SANITIZED (bucket-round-
+    # tripped) pricer and mid ladders, not the raw inputs -- ladder_to_buckets
+    # clips/renormalizes non-monotone inputs (e.g. crossed venue mids), and the
+    # consensus is provably a convex combination of these sanitized ladders, so
+    # this check is now a numeric safety net rather than a real trigger path.
+    recon = {mid: buckets_to_ladder(forecasts[mid]) for mid in model_ids}
+    for mid in model_ids:
+        deviation = float(np.max(np.abs(raw_ladders[mid] - recon[mid])))
+        if deviation > 1e-9:
+            logger.debug(
+                "fair_value_anchor: model %s input ladder was non-monotone and "
+                "sanitized by the bucket transform (max deviation %.6g)",
+                mid, deviation,
+            )
+    lo_band = np.minimum.reduce([recon[m] for m in model_ids]) - _SANITY_TOL
+    hi_band = np.maximum.reduce([recon[m] for m in model_ids]) + _SANITY_TOL
     if (
         not np.all(np.isfinite(consensus_p))
         or np.any(consensus_p < lo_band)
