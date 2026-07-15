@@ -78,6 +78,12 @@ class MMConfig:
     q_max_mode: str = "shrinking"
     s_prime_floor: float = 1.0e-3  # eps_cap on S'(x) for q_max/beta (launch default)
     beta_max: float = 5.0  # cross-strike hedge clamp |beta| <= beta_max (launch default)
+    # risk-based inventory breach cap (package D, 2026-07-15): per-market
+    # remaining-loss-notional cap as a fraction of the loop's sizing bankroll
+    # (harness._breaches). Replaces the old |q|/q_max ratio, which punished
+    # wings hardest exactly where remaining per-share risk is smallest.
+    # LAUNCH DEFAULT pending fill data.
+    inv_loss_cap_frac: float = 0.10
 
     # --- wing/tail widening scale per confidence tier (plan 2.5) ---
     wing_widen_scale: Dict[ConfidenceTier, float] = field(

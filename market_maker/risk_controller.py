@@ -81,9 +81,16 @@ class InvBreach:
     """A per-market inventory cap breach handed to the controller.
 
     is_long True means excess YES (q > 0) -> reduce by quoting asks only.
-    ratio = |q| / q_max (>= 1 is a breach; > 1.5 is extreme -- kept for
-    journaling/analytics only; past the stranded-inventory fix 2026-07-14 the
-    extreme threshold no longer changes the resulting mode, see rule (c)).
+    ratio = remaining-loss notional / cap (package D, 2026-07-15): the
+    dollar mark-to-worst loss from here -- q * p_consensus for a long
+    position (marks to 0 on a NO outcome), |q| * (1 - p_consensus) for a
+    short position (marks to 1 on a YES outcome) -- divided by
+    config.inv_loss_cap_frac * bankroll. >= 1 is a breach; ratio can exceed
+    1 arbitrarily as the breach deepens, but (per rule (c)) never escalates
+    the resulting mode past one-sided-away, no "extreme" threshold. Replaces
+    the old |q| / q_max ratio, which was shape- rather than risk-sensitive
+    and punished wings hardest exactly where remaining per-share risk is
+    smallest (stranded-inventory fix 2026-07-14).
     """
     market_id: str
     is_long: bool

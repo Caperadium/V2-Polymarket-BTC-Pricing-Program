@@ -321,21 +321,31 @@ def test_forced_noarb_reject_blocks_orders(store):
 def test_inventory_cap_goes_one_sided_and_stays_one_sided(store):
     # Small q_max so a few fills breach it. Large bankroll -> large resting bid;
     # SMALL prints (3 shares/tick) PARTIALLY fill it so the same bid stays live
-    # every tick. The ratio steps through the (1,1.5] one-sided band and holds
-    # there -- sizing is now inventory-aware (mm_sizing_fix_plan.md C2: the
-    # bid side's headroom cap, q_max - q, hard-stops further bid-side
-    # accumulation once headroom is exhausted), so the OLD mechanism for this
-    # test (fills alone running q past 1.5x q_max) is exactly the sizing bug
-    # the plan fixes and can no longer overshoot via resting-bid fills.
-    # A deeper breach still arises the way it would live: q_max itself shrinks
-    # (S'(x) falls as consensus_x moves away from ATM) under an ALREADY-large
-    # position, without requiring any further fill. Drive that by moving the
-    # underlying spot away from the strike after the position is built up to
-    # the one-sided band, and confirm the mode STAYS one-sided (never PULLED
-    # via INV_CAP) as the breach deepens past 1.5 -- stranded-inventory fix
-    # 2026-07-14, Change A: a one-sided-away mode never adds risk, so rule (c)
-    # no longer escalates to PULLED at any breach ratio.
-    cfg = MMConfig(q_max_scale=20.0, k_arrival=1.0)  # q_max(ATM) = 20 * 0.25 = 5; k pinned to launch value, scenario is tuned to the wide-quote geometry
+    # every tick. sizing is inventory-aware (mm_sizing_fix_plan.md C2: the bid
+    # side's headroom cap, q_max - q, hard-stops further bid-side accumulation
+    # once headroom is exhausted), so fills alone cannot run q arbitrarily far
+    # past cap -- q settles at 7 here (one tick of transient overshoot past
+    # q_max=5, since a resting bid sized before the breach can still fill the
+    # tick it breaches).
+    #
+    # Package D (2026-07-15): the breach metric is now remaining-loss notional
+    # (L_m = q*p_consensus for a long position) over cap = inv_loss_cap_frac *
+    # bankroll, not the raw |q|/q_max share ratio -- see harness._breaches.
+    # At ATM (p~0.5) L_m grows slowly, so inv_loss_cap_frac is tuned tiny here
+    # (cap=$2.5) to still breach at this test's q of a handful of shares; a
+    # realistic launch-default cap (0.10 * bankroll) would NOT breach on a
+    # position this small (this is deliberate -- see the dedicated "wing
+    # position, huge q, tiny p -> no breach" regression in
+    # test_mm_harness_ws1.py). A deeper breach still arises the way it would
+    # live: p_consensus rises toward 1 as spot moves away from (above) the ATM
+    # strike, growing L_m under an ALREADY-large position without requiring
+    # any further fill. Drive that by moving the underlying spot away from the
+    # strike after the position is built up to the one-sided band, and confirm
+    # the mode STAYS one-sided (never PULLED via INV_CAP) as the breach
+    # deepens -- stranded-inventory fix 2026-07-14, Change A: a one-sided-away
+    # mode never adds risk, so rule (c) no longer escalates to PULLED at any
+    # breach ratio.
+    cfg = MMConfig(q_max_scale=20.0, k_arrival=1.0, inv_loss_cap_frac=0.0005)  # q_max(ATM) = 20 * 0.25 = 5; k pinned to launch value, scenario tuned to the wide-quote geometry; cap tuned small (see above) to reproduce a breach on this test's modest ATM position
     loop = _make_loop(store, config=cfg, bankroll=5000.0)
 
     modes = []
@@ -349,9 +359,10 @@ def test_inventory_cap_goes_one_sided_and_stays_one_sided(store):
     assert QuoteMode.ASK_ONLY in modes  # long breach -> quote asks only
     one_sided_idx = modes.index(QuoteMode.ASK_ONLY)
 
-    # Shift spot away from the strike so q_max (proportional to S'(x)) shrinks
-    # under the already-built position, without any new fills required. This
-    # deepens the breach ratio well past 1.5 (formerly "extreme").
+    # Shift spot away from (above) the strike so p_consensus rises toward 1
+    # under the already-built long position, growing L_m = q * p_consensus
+    # without any new fills required. This deepens the breach ratio well past
+    # 1.0.
     for i in range(6):
         s0_shift = S0 + 3000.0 * (i + 1)
         shifted = {m: _snapshot_msg(_p_of(k, s0=s0_shift)) for m, k in MARKETS}

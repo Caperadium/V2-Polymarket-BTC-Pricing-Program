@@ -8,6 +8,7 @@ conventions (fixed clock, deterministic scripted books).
 from __future__ import annotations
 
 import sys
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -22,6 +23,8 @@ from market_maker.config import MMConfig
 from market_maker.contracts import (
     AnchorMethod,
     ContractInv,
+    InventoryState,
+    LiquidityRegime,
     QuoteMode,
     SettlementEvent,
     SettlementOutcome,
@@ -982,6 +985,210 @@ def test_breach_interplay_hedge_fires_below_one_sided_threshold(store):
     )
     assert directive_160.mode == QuoteMode.ASK_ONLY
     assert directive_160.mode != QuoteMode.PULLED
+
+
+# ---------------------------------------------------------------------------
+# Package D -- risk-based inventory breach metric (mm_pnl_fix_plan.md
+# section 3, 2026-07-15). Replaces the raw |q| / q_max ratio with a
+# remaining-loss-notional metric: L_m = q * p_consensus (long) or
+# |q| * (1 - p_consensus) (short), over cap = inv_loss_cap_frac * bankroll.
+# ---------------------------------------------------------------------------
+
+
+def _inv_snap(loop, q_by_market, q_max=5.0):
+    """InventoryState for `loop`'s markets at the given signed q's (default
+    0.0, i.e. flat, for any market not named). q_max is irrelevant to the new
+    metric but ContractInv still requires a nonnegative value."""
+    now = loop.clock.now()
+    per = {
+        m: ContractInv(q=q_by_market.get(m, 0.0), avg_cost=0.5, q_max=q_max, age_weighted_holding=0.0)
+        for m, _k in loop.markets
+    }
+    return InventoryState(ts=now, per_contract=per, per_ladder={})
+
+
+def _fv_with_p(loop, p_by_market):
+    """`loop.last_fair_value` with consensus_p overridden at the given
+    markets' strikes, for deterministic L_m arithmetic independent of the
+    stub engine's logistic curve."""
+    fv = loop.last_fair_value
+    cp = dict(fv.consensus_p)
+    for m, k in loop.markets:
+        if m in p_by_market:
+            cp[k] = p_by_market[m]
+    return replace(fv, consensus_p=cp)
+
+
+def test_breach_metric_formula_both_signs(store):
+    """L_m formula: long (q>0) -> q*p_consensus; short (q<0) -> |q|*(1-p).
+    Breach emitted iff ratio = L_m / cap >= 1.0. Using the SAME p=0.8 for
+    both signs (rather than a symmetric p=0.5) proves the short branch
+    really uses (1-p), not p -- if it used p by mistake, the short q=-13
+    case below would ALSO breach, and it must not."""
+    market_id, other = MARKETS[0][0], MARKETS[1][0]
+    loop = PaperTradingLoop(
+        store=store, expiry_key=EXPIRY, markets=MARKETS, engine_fn=_engine(),
+        config=MMConfig(inv_loss_cap_frac=0.10), clock=SimClock(START),
+        vol_gate_fn=_vol_gate(), bankroll=100.0,  # cap = 10.0
+    )
+    loop.tick(_moving_books(MARKETS, 0.0))
+    fv = _fv_with_p(loop, {market_id: 0.8, other: 0.8})
+
+    # Long q=10, p=0.8 -> L=8.0 < cap=10.0 -> no breach.
+    assert loop._breaches(_inv_snap(loop, {market_id: 10.0}), fv, loop.bankroll) == []
+
+    # Long q=13, p=0.8 -> L=10.4 >= cap -> breach, is_long True.
+    breaches = loop._breaches(_inv_snap(loop, {market_id: 13.0}), fv, loop.bankroll)
+    assert len(breaches) == 1
+    assert breaches[0].market_id == market_id
+    assert breaches[0].is_long is True
+    assert breaches[0].ratio == pytest.approx(1.04)
+
+    # Short q=-13, SAME p=0.8 -> L=13*(1-0.8)=2.6 << cap -> no breach.
+    assert loop._breaches(_inv_snap(loop, {market_id: -13.0}), fv, loop.bankroll) == []
+
+    # Short q=-51, p=0.8 -> L=51*0.2=10.2 >= cap -> breach, is_long False.
+    breaches = loop._breaches(_inv_snap(loop, {market_id: -51.0}), fv, loop.bankroll)
+    assert len(breaches) == 1
+    assert breaches[0].is_long is False
+    assert breaches[0].ratio == pytest.approx(1.02)
+
+
+def test_breach_cap_scales_with_bankroll_and_frac(tmp_path):
+    """cap = inv_loss_cap_frac * bankroll: a larger bankroll (or a larger
+    inv_loss_cap_frac) enlarges the cap and can clear an existing breach.
+    cap <= 0 (zero/negative bankroll, or non-positive frac) emits no
+    breaches and raises no exception -- same guard shape as the old
+    q_max <= 0 skip."""
+    market_id, other = MARKETS[0][0], MARKETS[1][0]
+
+    store_a = MMStateStore(str(tmp_path / "a.db"))
+    loop = PaperTradingLoop(
+        store=store_a, expiry_key=EXPIRY, markets=MARKETS, engine_fn=_engine(),
+        config=MMConfig(inv_loss_cap_frac=0.05), clock=SimClock(START),
+        vol_gate_fn=_vol_gate(), bankroll=200.0,  # cap = 0.05 * 200 = 10.0
+    )
+    loop.tick(_moving_books(MARKETS, 0.0))
+    fv = _fv_with_p(loop, {market_id: 0.5, other: 0.5})
+    inv = _inv_snap(loop, {market_id: 21.0})  # L = 21 * 0.5 = 10.5
+
+    assert len(loop._breaches(inv, fv, loop.bankroll)) == 1  # cap=10.0 -> breach
+
+    # Bigger bankroll -> bigger cap (0.05 * 400 = 20.0) -> clears the breach.
+    assert loop._breaches(inv, fv, 400.0) == []
+
+    # cap <= 0 -> no breaches, no exception (zero and negative bankroll).
+    assert loop._breaches(inv, fv, 0.0) == []
+    assert loop._breaches(inv, fv, -50.0) == []
+    store_a.close()
+
+    # A larger inv_loss_cap_frac has the same cap-enlarging effect as a
+    # larger bankroll: cap = 0.20 * 200 = 40.0 clears the same L=10.5 breach.
+    store_b = MMStateStore(str(tmp_path / "b.db"))
+    loop2 = PaperTradingLoop(
+        store=store_b, expiry_key=EXPIRY, markets=MARKETS, engine_fn=_engine(),
+        config=MMConfig(inv_loss_cap_frac=0.20), clock=SimClock(START),
+        vol_gate_fn=_vol_gate(), bankroll=200.0,
+    )
+    loop2.tick(_moving_books(MARKETS, 0.0))
+    fv2 = _fv_with_p(loop2, {market_id: 0.5, other: 0.5})
+    inv2 = _inv_snap(loop2, {market_id: 21.0})
+    assert loop2._breaches(inv2, fv2, loop2.bankroll) == []
+
+    # Non-positive frac (config side of cap<=0) -> no breaches, no exception.
+    loop3 = PaperTradingLoop(
+        store=store_b, expiry_key=EXPIRY, markets=MARKETS, engine_fn=_engine(),
+        config=MMConfig(inv_loss_cap_frac=0.0), clock=SimClock(START),
+        vol_gate_fn=_vol_gate(), bankroll=200.0,
+    )
+    loop3.tick(_moving_books(MARKETS, 0.0))
+    fv3 = _fv_with_p(loop3, {market_id: 0.5, other: 0.5})
+    assert loop3._breaches(inv2, fv3, loop3.bankroll) == []
+    store_b.close()
+
+
+def test_wing_huge_q_tiny_p_no_breach_70k_case(store):
+    """Regression for the exact misfire in plan section 0: 70k jul-20 at
+    q=14.3, p~0.05 (deep OTM wing), flagged by the OLD |q|/q_max rule at
+    ratio 3.1x. With a realistic per-expiry sizing bankroll (333, matching
+    the live multi-expiry per-loop split) the risk-based metric must NOT
+    breach: L = 14.3 * 0.05 = 0.715 << cap = 0.10 * 333.33 = 33.3."""
+    market_id, other = MARKETS[0][0], MARKETS[1][0]
+    loop = PaperTradingLoop(
+        store=store, expiry_key=EXPIRY, markets=MARKETS, engine_fn=_engine(),
+        config=MMConfig(),  # inv_loss_cap_frac default 0.10
+        clock=SimClock(START), vol_gate_fn=_vol_gate(), bankroll=333.33,
+    )
+    loop.tick(_moving_books(MARKETS, 0.0))
+    fv = _fv_with_p(loop, {market_id: 0.05, other: 0.05})
+    # q_max mirrors the live ratio-3.1x figure (14.3 / 4.57); irrelevant to
+    # the new metric, kept only for documentary fidelity to the live case.
+    inv = _inv_snap(loop, {market_id: 14.3}, q_max=4.57)
+
+    assert loop._breaches(inv, fv, loop.bankroll) == []
+
+
+def test_short_itm_breach_fires_as_p_falls_toward_belly(store):
+    """Deep-ITM short (q<0, p near 1): remaining-loss notional
+    L = |q| * (1 - p_consensus) starts tiny (pennies) and GROWS as p falls
+    from deep-ITM toward the belly -- real risk growing as the position's
+    outcome becomes less certain -- breaching once L crosses cap. Mirrors
+    plan section 3's 'Behavior change on today's book': 'Deep ITM shorts:
+    L pennies -> no breach. A short whose p falls toward the belly (real
+    risk growing) breaches EARLIER than under the raw-shares rule.'"""
+    market_id, other = MARKETS[0][0], MARKETS[1][0]
+    loop = PaperTradingLoop(
+        store=store, expiry_key=EXPIRY, markets=MARKETS, engine_fn=_engine(),
+        config=MMConfig(inv_loss_cap_frac=0.05), clock=SimClock(START),
+        vol_gate_fn=_vol_gate(), bankroll=100.0,  # cap = 5.0
+    )
+    loop.tick(_moving_books(MARKETS, 0.0))
+    inv = _inv_snap(loop, {market_id: -20.0})  # short 20 shares, held fixed
+
+    breached_at = None
+    for p in (0.97, 0.9, 0.8, 0.7, 0.6):
+        fv = _fv_with_p(loop, {market_id: p, other: p})
+        breaches = loop._breaches(inv, fv, loop.bankroll)
+        loss = 20.0 * (1.0 - p)
+        if loss >= 5.0:  # cap
+            assert len(breaches) == 1
+            assert breaches[0].is_long is False
+            breached_at = p
+            break
+        assert breaches == [], (p, loss)
+    assert breached_at is not None, "expected the short breach to fire as p fell toward the belly"
+
+
+def test_breach_and_degenerate_liquidity_cofire_agree_not_pulled(store):
+    """Regression for the 2026-07-14 stranding bug, reconstructed via the
+    package-D metric: a real INV_CAP breach (new remaining-loss-notional
+    metric) and a DEGENERATE liquidity regime firing on the SAME market,
+    with the SAME signed q, must agree on the one-sided direction and never
+    escalate to PULLED via _more_restrictive -- rules (c) and (f) both
+    derive is_long / reduce-side from the same signed q."""
+    market_id, other = MARKETS[0][0], MARKETS[1][0]
+    loop = PaperTradingLoop(
+        store=store, expiry_key=EXPIRY, markets=MARKETS, engine_fn=_engine(),
+        config=MMConfig(inv_loss_cap_frac=0.05), clock=SimClock(START),
+        vol_gate_fn=_vol_gate(), bankroll=100.0,  # cap = 5.0
+    )
+    loop.tick(_moving_books(MARKETS, 0.0))
+    now = loop.clock.now()
+    fv = _fv_with_p(loop, {market_id: 0.5, other: 0.5})
+
+    # Long q=11, p=0.5 -> L=5.5 >= cap=5.0 -> breach, is_long True.
+    breaches = loop._breaches(_inv_snap(loop, {market_id: 11.0}), fv, loop.bankroll)
+    assert len(breaches) == 1
+    assert breaches[0].is_long is True
+
+    directive = loop.risk.evaluate(
+        market_id, now, tte_days=loop.last_snapshot.tte_days, pricer_snapshot=loop.last_snapshot,
+        inventory_breaches=breaches, inventory_q=11.0,  # SAME signed q as the breach
+        liquidity_regime=LiquidityRegime.DEGENERATE,
+        feed_healthy=True, spot=loop.last_snapshot.s0, strike=MARKETS[0][1],
+    )
+    assert directive.mode == QuoteMode.ASK_ONLY
+    assert directive.mode != QuoteMode.PULLED
 
 
 def test_harness_wires_inventory_q_into_risk_evaluate(store, monkeypatch):

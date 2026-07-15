@@ -317,17 +317,44 @@ class PaperTradingLoop:
                 pass
             book.on_message(m)
 
-    def _breaches(self, inv_snap) -> List[InvBreach]:
-        """Inventory-cap breaches for the current tick. `inv_snap` is the
-        single per-tick inventory snapshot (hoisted by the caller so it is
-        taken once, not once per call -- stranded-inventory fix
-        2026-07-14, Change B)."""
+    def _breaches(self, inv_snap, fv, bankroll: float) -> List[InvBreach]:
+        """Inventory-cap breaches for the current tick, risk-based (package D,
+        2026-07-15). `inv_snap` is the single per-tick inventory snapshot
+        (hoisted by the caller so it is taken once, not once per call --
+        stranded-inventory fix 2026-07-14, Change B). `fv` is this tick's
+        FairValue (consensus_p, keyed by strike) and `bankroll` is the loop's
+        sizing bankroll.
+
+        Metric = remaining-loss notional, not raw share ratio: the old
+        |q| / q_max rule punished wings hardest exactly where remaining
+        per-share risk is smallest (S'(x)-shrinking q_max), per the
+        2026-07-14 stranded-inventory decision (deferred "option C").
+        L_m = q * p_consensus (long YES: marks to 0 on a NO outcome) or
+        |q| * (1 - p_consensus) (short YES: marks to 1 on a YES outcome).
+        NOTE: consensus p is measurably rich in the OTM (section-0 FV-vs-mkt
+        audit), so wing L_m is slightly OVER-stated here -- conservative,
+        accepted.
+
+        `is_long` is derived from the RAW signed q (no hedge adjustment --
+        mandatory descope, phase 1): rules (c) and (f) in RiskController
+        must keep deriving their one-sided direction from the same signed
+        quantity, or `_more_restrictive` escalates opposite one-sided modes
+        to PULLED and re-introduces the 2026-07-14 stranding bug. Hedge-aware
+        q_eff is deferred to a follow-up (package D phase 2)."""
+        cap = float(self.config.inv_loss_cap_frac) * float(bankroll)
+        if cap <= 0.0:
+            return []
         breaches: List[InvBreach] = []
-        for m, _ in self.markets:
+        for m, k in self.markets:
             ci = inv_snap.per_contract.get(m)
-            if ci is None or ci.q_max <= 0.0:
+            if ci is None:
                 continue
-            ratio = abs(ci.q) / ci.q_max
+            p_consensus = float(fv.consensus_p[k])
+            if ci.q > 0.0:
+                loss = ci.q * p_consensus
+            else:
+                loss = abs(ci.q) * (1.0 - p_consensus)
+            ratio = loss / cap
             if ratio >= 1.0:
                 breaches.append(InvBreach(market_id=m, is_long=ci.q > 0.0, ratio=ratio))
         return breaches
@@ -655,7 +682,7 @@ class PaperTradingLoop:
         # _breaches() and the per-market inventory_q lookup below
         # (stranded-inventory fix 2026-07-14, Change B).
         inv_snap = self.inv.snapshot(now)
-        breaches = self._breaches(inv_snap)
+        breaches = self._breaches(inv_snap, fv, self.bankroll)
         q_by_market = {m: ci.q for m, ci in inv_snap.per_contract.items()}
         # W1.2: age of the last successful consensus recompute, fed to the
         # risk controller's fair-value staleness rule; None until the first
