@@ -235,7 +235,10 @@ class PaperTradingLoop:
         self.fill_sim = PaperFillSimulator(self.config, trade_through_only=trade_through_only)
         self.bridge = _PaperFillSimBridge(self.fill_sim, self.clock)
         self.venue = PaperVenueAdapter(self.bridge, store, self.venue_descriptor)
-        self.lifecycle = OrderLifecycleManager(self.venue, store, self.config, self.clock)
+        self.lifecycle = OrderLifecycleManager(
+            self.venue, store, self.config, self.clock,
+            min_order_size=self.venue_descriptor.min_size,
+        )
         self.risk = RiskController(self.config, vol_gate_fn=vol_gate_fn)
         self.settlement = SettlementHandler(store, self.config, data_provider)
 

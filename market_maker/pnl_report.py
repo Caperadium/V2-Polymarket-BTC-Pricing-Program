@@ -587,11 +587,19 @@ def markout_stats(
          markout_report builds this with `str(h)`, so a float-keyed lookup
          here would silently miss every time; must match that exactly).
       3. If that is also missing or still `n < min_n`, return
-         `(None, None, 0, best_n_attempted)` where `best_n_attempted` is the
-         largest `n_attempted` seen across whichever of the two lookups
-         above actually resolved (0 if neither did) -- callers (the wave 2
-         W4 exploration gate) use it to distinguish "never attempted" from
-         "attempted, still thin".
+         `(None, None, 0, cell_n_attempted)`.
+
+    n_attempted is ALWAYS the exact CELL's attempted count (0 if the cell is
+    absent), even when the measurement itself comes from the region rollup
+    (fix 2026-07-15): the wave 2 W4 exploration gate is per-cell by design
+    ("a never-measured cell can accumulate fills"), and returning the
+    rollup's n_attempted globalized ~23 fills' negative verdict across every
+    cell of the region -- gate closed fleet-wide, presence floor off, no
+    orders, no new fills, so the measurement could never update (the
+    2026-07-15 quote shutdown deadlock). mk_avg/mk_var/n keep rollup
+    semantics: a trusted-negative rollup still zeroes the Kelly leg; the
+    cell-scoped n_attempted only keeps the exploration probes flowing in
+    cells that have not themselves been measured.
 
     Never raises: a malformed, empty, or None `report`, or a report missing
     expected keys/shapes, degrades to the null tuple `(None, None, 0, 0)`
@@ -601,7 +609,10 @@ def markout_stats(
         if not report:
             return None, None, 0, 0
 
-        best_n_attempted = 0
+        # Per-cell attempted count -- the ONLY n_attempted this function ever
+        # returns (see docstring: the W4 exploration gate is per-cell; the
+        # rollup's n_attempted must never leak out of here).
+        cell_n_attempted = 0
 
         cells = report.get("cells") if isinstance(report, dict) else None
         if isinstance(cells, list):
@@ -614,14 +625,13 @@ def markout_stats(
                     and float(cell.get("horizon_s", float("nan"))) == float(horizon_s)
                 ):
                     n = int(cell.get("n", 0) or 0)
-                    n_attempted = int(cell.get("n_attempted", 0) or 0)
-                    best_n_attempted = max(best_n_attempted, n_attempted)
+                    cell_n_attempted = int(cell.get("n_attempted", 0) or 0)
                     if n >= min_n:
                         return (
                             float(cell.get("mk_avg", 0.0)),
                             float(cell.get("mk_var", 0.0)),
                             n,
-                            n_attempted,
+                            cell_n_attempted,
                         )
                     break  # exact cell found but thin; fall through to region rollup
 
@@ -632,16 +642,14 @@ def markout_stats(
                 horizon_entry = region_entry.get(str(horizon_s))
                 if isinstance(horizon_entry, dict):
                     n = int(horizon_entry.get("n", 0) or 0)
-                    n_attempted = int(horizon_entry.get("n_attempted", 0) or 0)
-                    best_n_attempted = max(best_n_attempted, n_attempted)
                     if n >= min_n:
                         return (
                             float(horizon_entry.get("mk_avg", 0.0)),
                             float(horizon_entry.get("mk_var", 0.0)),
                             n,
-                            n_attempted,
+                            cell_n_attempted,
                         )
 
-        return None, None, 0, best_n_attempted
+        return None, None, 0, cell_n_attempted
     except Exception:
         return None, None, 0, 0

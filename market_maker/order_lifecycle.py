@@ -128,17 +128,21 @@ class OrderLifecycleManager:
     """Converts (QuoteSet, RiskDirective) per market into venue actions.
 
     Desired state per side: an order at QuoteSet's price/size, or none if
-    that side's size is zero, or if the effective mode (intersection of
+    that side's size is zero or below `min_order_size` (the venue's minimum
+    order size -- a live venue rejects smaller orders, so the paper path
+    must not post them either), or if the effective mode (intersection of
     QuoteSet.risk_mode and RiskDirective.mode) suppresses that side.
     RiskDirective.cancel_all or either mode being PULLED cancels everything
     for that market.
     """
 
-    def __init__(self, venue: VenueAdapter, store: MMStateStore, config: MMConfig, clock: SimClock):
+    def __init__(self, venue: VenueAdapter, store: MMStateStore, config: MMConfig, clock: SimClock,
+                 min_order_size: float = 0.0):
         self.venue = venue
         self.store = store
         self.config = config
         self.clock = clock
+        self.min_order_size = min_order_size
 
     # -- public entry point ------------------------------------------------
 
@@ -159,11 +163,11 @@ class OrderLifecycleManager:
         )
 
         desired_bid: Optional[Tuple[float, float]] = None
-        if bid_allowed and quote_set.bid_size > 0.0:
+        if bid_allowed and quote_set.bid_size > 0.0 and quote_set.bid_size >= self.min_order_size:
             desired_bid = (quote_set.bid_price, quote_set.bid_size)
 
         desired_ask: Optional[Tuple[float, float]] = None
-        if ask_allowed and quote_set.ask_size > 0.0:
+        if ask_allowed and quote_set.ask_size > 0.0 and quote_set.ask_size >= self.min_order_size:
             # Sell-YES-via-buy-NO convention (see module docstring).
             desired_ask = (1.0 - quote_set.ask_price, quote_set.ask_size)
 

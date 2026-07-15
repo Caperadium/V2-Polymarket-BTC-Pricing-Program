@@ -497,19 +497,43 @@ m = max(m, 0)                                     # Glosten-Milgrom: no edge -> 
 f*, b = kelly_buy(price + m, price)               # belief_eff = price + m
 ```
 
+`kelly_buy` returns exactly 0 when `belief <= price` (an explicit early-out,
+2026-07-15): at `belief == price` -- every m-clamped no-edge leg -- the f
+formula's float rounding otherwise leaves a +/-1-ulp residue, and a positive
+residue survives every downstream cap (all of which only shrink sizes) to
+post as an ~1e-45-share dust order, as observed live on the 2026-07-20
+ladder.
+
 `mk_avg` is the per-fill realized markout for this market's (region,
 tte_bucket, horizon) cell from `pnl_report.markout_report` -- the actual
 value captured net of adverse price movement after each fill, the
 Conrad-Wahal "realized spread" -- resolved once per tick by the harness via
 `pnl_report.markout_stats` and passed in on `ContractSizingInput.mk_avg` /
 `mk_var` / `mk_n` / `mk_n_attempted`. Below `markout_min_n` fills in that
-cell the measurement is not trusted yet, and sizing falls back to the prior:
-structural edge minus the adverse-selection buffer already charged in the
-spread. A cold-start ladder (no fills yet anywhere) runs entirely on the
-prior path everywhere -- this is what restores the size-to-spread coupling a
-2026-07-12 defect had severed (sizing on the raw pre-widen proposal, with no
-adverse-selection haircut at all, left size unconditionally coupled to
-`p_hat` alone regardless of how thin the posted spread actually was).
+cell the measurement is not trusted yet: `markout_stats` first falls back to
+the region-only rollup (`by_region`), and only if that is also thin does
+sizing fall back to the prior: structural edge minus the adverse-selection
+buffer already charged in the spread. A cold-start ladder (no fills yet
+anywhere) runs entirely on the prior path everywhere -- this is what
+restores the size-to-spread coupling a 2026-07-12 defect had severed
+(sizing on the raw pre-widen proposal, with no adverse-selection haircut at
+all, left size unconditionally coupled to `p_hat` alone regardless of how
+thin the posted spread actually was).
+
+The `mk_n_attempted` returned by `markout_stats` is ALWAYS the exact cell's
+attempted count, even when the measurement itself came from the region
+rollup (fix 2026-07-15). The presence-floor exploration gate (next section)
+is per-cell by design; before the fix the rollup's n_attempted leaked out,
+so the moment a region rollup crossed `markout_min_n` with a negative
+mk_avg (wing n=23 at -1.7c, belly n=22 at -2.2c on 2026-07-14), every cell
+of that region -- measured or not -- had its gate closed simultaneously:
+Kelly zeroed by the m-clamp AND no presence floor, so the fleet stopped
+posting entirely, no new fills could arrive, and the negative verdict could
+never be re-measured (a self-locking shutdown observed live as ~0 resting
+orders across 3 ladders). With the cell-scoped count, a trusted-negative
+rollup still zeroes the Kelly leg everywhere in the region, but cells that
+have not themselves accumulated `markout_min_n` fills keep their
+presence-floor probes flowing, so the measurement keeps updating.
 
 Kelly's other catch is the *if your belief is exactly right*. It is
 notoriously aggressive under estimation error -- overbetting is punished far
@@ -808,9 +832,12 @@ activate later with data.
 with minimal churn: an existing order within the re-quote tolerances (price
 within 0.005, size within 10%) is left alone -- every needless cancel/replace
 surrenders queue position, which under the fill simulator's queue-behind rule
-(next section) is the MM's most valuable asset. On restart, all persisted
-orders are marked UNKNOWN and reconciled against the venue before quoting
-resumes.
+(next section) is the MM's most valuable asset. A side whose size is below
+the venue's minimum order size (`VenueDescriptor.min_size`, threaded in by
+the harness as `min_order_size`, 2026-07-15) is treated as no-quote -- a live
+venue would reject it, so the paper path does not post it either, and a
+resting order on that side is cancelled. On restart, all persisted orders
+are marked UNKNOWN and reconciled against the venue before quoting resumes.
 
 ---
 

@@ -107,6 +107,39 @@ def test_kelly_negative_floored():
     assert f == 0.0
 
 
+def test_kelly_exact_zero_at_belief_equals_price():
+    # belief == price (the m-clamped no-edge case, Glosten-Milgrom "no size")
+    # must return EXACTLY 0.0 for every price, not the +/-1-ulp rounding
+    # residue of the f formula: a positive residue survived the full sizing
+    # pipeline as ~1e-45-share dust orders on the live VPS run (2026-07-15,
+    # Jul-20 ladder). Sweep every venue tick price plus the exact float
+    # observed live.
+    for i in range(1, 100):
+        price = i / 100.0
+        f, _ = kelly_buy(price + 0.0, price)
+        assert f == 0.0, f"price={price!r} left rounding residue f={f!r}"
+    f, _ = kelly_buy(0.9400000000000001, 0.9400000000000001)
+    assert f == 0.0
+
+
+def test_measured_negative_markout_sizes_exactly_zero():
+    # Live repro (58k strike, Jul-20 expiry, 2026-07-15): trusted measured
+    # negative markout (wing region rollup n=23 >= markout_min_n) closes the
+    # presence-floor gate AND clamps m to 0; both sides must come out exactly
+    # 0 shares -- before the kelly_buy early-out, the bid side leaked
+    # 8.9e-45-share dust from float rounding at the awkward posted price.
+    cfg = MMConfig()
+    c = ContractSizingInput(
+        "m0", p_hat=0.9688, bid_price=0.9400000000000001, ask_price=0.99,
+        strike=58000.0, mk_avg=-0.0167, mk_var=0.0003, mk_n=23, mk_n_attempted=23,
+    )
+    dec, _ = size_ladder(
+        [c], _snap(1e-4, strikes=[58000.0]), bankroll=1000.0 / 3, ts=TS, config=cfg,
+    )
+    assert dec["m0"].bid_size == 0.0
+    assert dec["m0"].ask_size == 0.0
+
+
 # --- Stage 2: Baker-McHale -----------------------------------------------
 
 

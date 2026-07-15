@@ -208,6 +208,36 @@ def test_zero_size_side_produces_no_order(mgr, venue, store):
     assert len(orders) == 1
 
 
+def test_min_order_size_suppresses_sub_minimum_sides(venue, store, config, clock):
+    # min_order_size mirrors the venue's minimum: a side below it is treated
+    # as no-quote (2026-07-15 dust-order fix -- e-45-share rounding residue
+    # must never reach the venue), and a resting order on that side is
+    # cancelled rather than left stale.
+    mgr = OrderLifecycleManager(venue, store, config, clock, min_order_size=1.0)
+
+    q = _quote(bid_size=8.9e-45, ask_size=10.0)
+    mgr.apply("mkt-1", q, _risk())
+    submits = [c for c in venue.calls if c[0] == "submit"]
+    assert len(submits) == 1
+    assert submits[0][3] == Side.BUY_NO
+
+    # A previously resting side that drops below the minimum is cancelled.
+    q2 = _quote(seq=2, bid_size=10.0, ask_size=10.0)
+    mgr.apply("mkt-1", q2, _risk())
+    q3 = _quote(seq=3, bid_size=0.3, ask_size=10.0)
+    mgr.apply("mkt-1", q3, _risk())
+    live = store.get_live_orders("mkt-1")
+    assert {o.side for o in live} == {Side.BUY_NO}
+
+
+def test_min_order_size_default_zero_preserves_old_behavior(mgr, venue, store):
+    # Default construction (no min_order_size) still posts any positive size.
+    q = _quote(bid_size=0.25, ask_size=0.25)
+    mgr.apply("mkt-1", q, _risk())
+    submits = [c for c in venue.calls if c[0] == "submit"]
+    assert len(submits) == 2
+
+
 # ---------------------------------------------------------------------------
 # restart reconciliation
 # ---------------------------------------------------------------------------

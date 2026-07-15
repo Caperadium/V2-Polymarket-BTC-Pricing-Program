@@ -884,6 +884,9 @@ def test_markout_stats_exact_cell_resolution():
 
 
 def test_markout_stats_falls_back_to_region_rollup_when_cell_thin():
+    # Measurement comes from the rollup, but n_attempted stays CELL-scoped
+    # (8, not 120) -- the W4 exploration gate is per-cell (2026-07-15 fix:
+    # the rollup's n_attempted closed the gate on every cell of the region).
     report = {
         "cells": [
             {"region": "belly", "tte_bucket": "0-1d", "horizon_s": 600.0,
@@ -894,13 +897,13 @@ def test_markout_stats_falls_back_to_region_rollup_when_cell_thin():
         },
     }
     mk_avg, mk_var, n, n_attempted = markout_stats(report, "belly", "0-1d", 600.0, min_n=20)
-    assert (mk_avg, mk_var, n, n_attempted) == (0.05, 0.001, 100, 120)
+    assert (mk_avg, mk_var, n, n_attempted) == (0.05, 0.001, 100, 8)
 
 
-def test_markout_stats_null_tuple_reports_best_n_attempted():
-    # Neither the cell nor the region rollup reaches min_n -> null tuple, but
-    # n_attempted reports the LARGEST attempted count seen across both lookups
-    # (the W4 exploration gate's anti-starvation signal).
+def test_markout_stats_null_tuple_reports_cell_n_attempted():
+    # Neither the cell nor the region rollup reaches min_n -> null tuple;
+    # n_attempted is the CELL's attempted count (per-cell exploration gate),
+    # never the rollup's.
     report = {
         "cells": [
             {"region": "belly", "tte_bucket": "0-1d", "horizon_s": 600.0,
@@ -912,7 +915,27 @@ def test_markout_stats_null_tuple_reports_best_n_attempted():
     }
     mk_avg, mk_var, n, n_attempted = markout_stats(report, "belly", "0-1d", 600.0, min_n=20)
     assert mk_avg is None and mk_var is None and n == 0
-    assert n_attempted == 12
+    assert n_attempted == 5
+
+
+def test_markout_stats_rollup_measurement_keeps_unmeasured_cell_exploring():
+    # Live 2026-07-15 deadlock regression: trusted-NEGATIVE region rollup
+    # (wing n=23 >= min_n, mk_avg -1.7c) resolved for a cell with ZERO fills
+    # (wing/4d+). The measurement must still come back (Kelly leg zeroed),
+    # but n_attempted must be the cell's 0 so the sizing W4 gate
+    # (n_attempted < min_n) keeps the presence-floor probes flowing --
+    # otherwise no orders -> no fills -> the negative verdict can never be
+    # re-measured and the whole region stays dark permanently.
+    report = {
+        "cells": [],  # wing/4d+ never filled
+        "by_region": {
+            "wing": {"600.0": {"n": 23, "n_attempted": 23,
+                               "mk_avg": -0.0167, "mk_var": 0.0021}},
+        },
+    }
+    mk_avg, mk_var, n, n_attempted = markout_stats(report, "wing", "4d+", 600.0, min_n=20)
+    assert (mk_avg, mk_var, n) == (-0.0167, 0.0021, 23)
+    assert n_attempted == 0  # cell-scoped: exploration gate stays open
 
 
 def test_markout_stats_never_attempted_returns_zero():
@@ -923,13 +946,14 @@ def test_markout_stats_never_attempted_returns_zero():
 def test_markout_stats_region_horizon_key_is_str_not_float():
     # W6 required-change: by_region is keyed by str(horizon_s) ("600.0"), not
     # a float -- a report missing the exact cell must still resolve via the
-    # str-keyed region rollup, not silently miss.
+    # str-keyed region rollup, not silently miss. n_attempted is cell-scoped
+    # (cell absent -> 0), not the rollup's 60.
     report = {
         "cells": [],
         "by_region": {"wing": {"600.0": {"n": 50, "n_attempted": 60, "mk_avg": -0.01, "mk_var": 0.0002}}},
     }
     mk_avg, mk_var, n, n_attempted = markout_stats(report, "wing", "1-2d", 600.0, min_n=20)
-    assert (mk_avg, mk_var, n, n_attempted) == (-0.01, 0.0002, 50, 60)
+    assert (mk_avg, mk_var, n, n_attempted) == (-0.01, 0.0002, 50, 0)
 
 
 def test_markout_stats_malformed_report_never_raises():

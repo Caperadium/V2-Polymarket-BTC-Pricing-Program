@@ -213,10 +213,16 @@ class ContractSizingInput:
 def kelly_buy(belief_p: float, price: float) -> Tuple[float, float]:
     """Kelly fraction for buying a binary at `price` with win-probability
     belief `belief_p`. Returns (f_star, b) where b=(1-price)/price is the net
-    odds. Negative f_star is floored to 0 (do not bet that side)."""
+    odds. belief_p <= price (no edge) returns f_star exactly 0."""
     if not (0.0 < price < 1.0):
         return 0.0, 0.0
     b = (1.0 - price) / price
+    if belief_p <= price:
+        # Exact early-out, not redundant with the f < 0 floor below: at
+        # belief_p == price (the m-clamped no-edge case) the f formula
+        # leaves +/-1-ulp rounding residue from b, and a positive residue
+        # survives the whole sizing pipeline as an ~1e-45-share dust order.
+        return 0.0, b
     f = (b * belief_p - (1.0 - belief_p)) / b
     if not math.isfinite(f) or f < 0.0:
         f = 0.0
