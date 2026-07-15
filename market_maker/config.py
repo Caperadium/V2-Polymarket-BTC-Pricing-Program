@@ -40,13 +40,17 @@ class MMConfig:
     # All launch defaults (pending Stage A/B calibration): no fill history exists
     # to estimate arrival decay or risk aversion (plan 8.10, 10.3).
     gamma: float = 0.10  # risk aversion (launch default, pending calibration)
-    # k_arrival: 1.0 -> 10.0 (2026-07-11 zero-fill recal). The k=1 launch
-    # placeholder made the Dalen arrival term (1/k)ln(1+gamma/k) ~ 0.095
-    # x-units ~ 2.2c/side at ATM -- the single largest term in a 5.7c/side
-    # half-spread vs a 0.5c market half-touch (VPS run 20260711_184948 quote
-    # journal). k=10 prices the arrival term ~ 0.02c/side; interim judgment
-    # value until scripts/mm_calibrate_k.py fits k from recorded trade prints.
-    k_arrival: float = 10.0  # kappa, arrival decay (interim; pending trade-print calibration)
+    # k_arrival history: 1.0 -> 10.0 (2026-07-11 zero-fill recal; the k=1
+    # launch placeholder made the Dalen arrival term (1/k)ln(1+gamma/k) ~
+    # 0.095 x-units ~ 2.2c/side at ATM -- the single largest term in a
+    # 5.7c/side half-spread vs a 0.5c market half-touch, VPS run
+    # 20260711_184948 quote journal) -> 18.2 (2026-07-14, FITTED by
+    # scripts/mm_calibrate_k.py from 2457 joined trade prints / 289
+    # market-hours on the VPS state db: k=18.21, A=3.58/market-hour, implied
+    # arrival half-spread ~0.01c ATM). Caveats: only ~3 days of prints
+    # (recording began 2026-07-11), lumpy histogram head near the touch;
+    # REFIT planned ~2026-07-21 once a full weekly volume cycle is recorded.
+    k_arrival: float = 18.2  # kappa, arrival decay (fitted 2026-07-14; refit ~2026-07-21)
     arrival_scale_A: float = 1.0  # arrival scale A (launch default, pending calibration)
     sigma_b_floor: float = 0.05  # belief log-odds vol floor (launch default)
     sigma_b_cap: float = 5.0  # belief log-odds vol cap (launch default)
