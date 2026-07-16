@@ -1,5 +1,3 @@
 # Changes
 
 <!-- Append one entry per logical task. Cleared after each push. -->
-
-- fix(mm): 1-tick requote deadband kills quote boundary-flap churn. Live VPS quote journal showed spreads oscillating one tick at 15s cadence (64k jul-17: ask 0.80<->0.81, spread 0.13<->0.14, all seven spread terms byte-frozen) -- root cause is spread_builder._quantize's outward floor/ceil flipping a full tick whenever the raw price hovers on an exact tick boundary under sub-tick consensus jitter, and requote_price_tol=0.005 (half a tick) being dead for quantized prices, so every flap cancelled+reposted the order and surrendered paper-sim queue position. Raise MMConfig.requote_price_tol 0.005 -> 0.015 (strictly between 1 and 2 ticks): a 1-tick flap now holds the resting order, a >=2-tick move still reposts, bounding resting-vs-desired lag at 1 tick. Documented trade-off: cross-strike no-arb is only PAV-guaranteed between desired ladders; resting orders may transiently violate it by up to 2 ticks. Files: market_maker/config.py, tests/test_mm_order_lifecycle.py (2 new tests: flap holds, 2-tick reposts), DOCS/concepts/market-making.md section 11.3. 811 tests pass.
