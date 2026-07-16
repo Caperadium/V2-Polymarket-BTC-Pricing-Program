@@ -1275,3 +1275,306 @@ def test_beta_hedge_flag_on_calls_beta_hedges_with_placeholder_sigma_b(store, mo
     sigma_b_used = calls[0]
     for m, _ in MARKETS:
         assert sigma_b_used[m] == pytest.approx(loop.config.sigma_b_floor)
+
+
+# ---------------------------------------------------------------------------
+# Package E (2026-07-15): markout-fed spread widening (spread term 7) --
+# harness wiring (_compose_quote_sets resolves markout_stats_side per market
+# BEFORE the single compute_posted_prices call, region computed from
+# consensus_p_k moved above that call).
+# ---------------------------------------------------------------------------
+
+
+def _first_tick_tte_bucket(expiry_key=EXPIRY, start=START, tick_dt_s=60.0):
+    """The tte_bucket the harness will resolve on the FIRST tick of a freshly
+    constructed PaperTradingLoop(clock=SimClock(start)) -- tick() advances
+    the clock by tick_dt_s BEFORE computing tte, so `now` on tick 1 is
+    `start + tick_dt_s`, not `start` itself (harness.py:608-610)."""
+    from market_maker.pnl_report import tte_bucket_label
+    first_tick_now = start + timedelta(seconds=tick_dt_s)
+    tte_days = max((settlement_instant_utc(expiry_key) - first_tick_now).total_seconds() / 86400.0, 0.0)
+    return tte_bucket_label(tte_days)
+
+
+def test_markout_widen_moves_posted_bid_for_measured_toxic_side(tmp_path):
+    """A report with a trusted-negative BUY_YES side markout for the belly
+    region at cfg.markout_widen_horizon_s widens the posted BID on every
+    belly market vs a no-report control tick, by ~cfg.markout_widen_cap (the
+    mk_avg is set far more negative than the cap so the clamp binds); the
+    ask (BUY_NO side, thin/unmeasured in this report) is untouched."""
+    cfg = MMConfig(gamma=0.5, k_arrival=1.0)
+    # S0=100000, scale=2000 (default _engine()) -> all three strikes land
+    # comfortably inside the default belly_band (0.2, 0.8):
+    # 98k -> p~0.731, 100k -> p=0.5, 102k -> p~0.269.
+    markets = [("m-98k", 98000.0), ("m-100k", 100000.0), ("m-102k", 102000.0)]
+    tte_bucket = _first_tick_tte_bucket()
+
+    report = {
+        "cells": [
+            {"region": "belly", "tte_bucket": tte_bucket, "horizon_s": cfg.markout_widen_horizon_s,
+             "n": cfg.markout_min_n, "n_attempted": cfg.markout_min_n,
+             "mk_avg": -1.0, "mk_var": 0.001, "mk_total": -1.0 * cfg.markout_min_n,
+             "sides": {
+                 "BUY_YES": {"n": cfg.markout_min_n, "n_attempted": cfg.markout_min_n,
+                             "mk_avg": -1.0, "mk_var": 0.001},
+                 "BUY_NO": {"n": 0, "n_attempted": 0, "mk_avg": 0.0, "mk_var": 0.0},
+             }},
+        ],
+        "by_region": {},
+        "by_expiry": {},
+    }
+
+    store_control = MMStateStore(str(tmp_path / "control.db"))
+    store_treatment = MMStateStore(str(tmp_path / "treatment.db"))
+    try:
+        loop_control = PaperTradingLoop(
+            store=store_control, expiry_key=EXPIRY, markets=markets, engine_fn=_engine(),
+            config=cfg, clock=SimClock(START), vol_gate_fn=_vol_gate(),
+        )
+        loop_treatment = PaperTradingLoop(
+            store=store_treatment, expiry_key=EXPIRY, markets=markets, engine_fn=_engine(),
+            config=cfg, clock=SimClock(START), vol_gate_fn=_vol_gate(),
+            markout_provider=lambda: report,
+        )
+        loop_control.tick({m: _snapshot_msg(0.5) for m, _k in markets})
+        loop_treatment.tick({m: _snapshot_msg(0.5) for m, _k in markets})
+
+        for m, _k in markets:
+            qc = loop_control.last_quote_sets[m]
+            qt = loop_treatment.last_quote_sets[m]
+            assert qt.bid_price < qc.bid_price
+            assert (qc.bid_price - qt.bid_price) == pytest.approx(cfg.markout_widen_cap, abs=0.02)
+            # BUY_NO side is thin (n=0 < markout_min_n) -> ask widen stays 0.
+            assert qt.ask_price == pytest.approx(qc.ask_price, abs=1e-9)
+    finally:
+        store_control.close()
+        store_treatment.close()
+
+
+def test_markout_widen_scale_zero_disables_term_end_to_end(tmp_path):
+    """cfg.markout_widen_scale == 0.0 disables term 7 entirely, even with a
+    trusted-negative side markout report wired -- byte-identical prices to a
+    no-report control tick (regression: the term must be a strict opt-in)."""
+    cfg = MMConfig(gamma=0.5, k_arrival=1.0, markout_widen_scale=0.0)
+    markets = [("m-98k", 98000.0), ("m-100k", 100000.0), ("m-102k", 102000.0)]
+    tte_bucket = _first_tick_tte_bucket()
+
+    report = {
+        "cells": [
+            {"region": "belly", "tte_bucket": tte_bucket, "horizon_s": cfg.markout_widen_horizon_s,
+             "n": cfg.markout_min_n, "n_attempted": cfg.markout_min_n,
+             "mk_avg": -1.0, "mk_var": 0.001, "mk_total": -1.0 * cfg.markout_min_n,
+             "sides": {
+                 "BUY_YES": {"n": cfg.markout_min_n, "n_attempted": cfg.markout_min_n,
+                             "mk_avg": -1.0, "mk_var": 0.001},
+                 "BUY_NO": {"n": 0, "n_attempted": 0, "mk_avg": 0.0, "mk_var": 0.0},
+             }},
+        ],
+        "by_region": {},
+        "by_expiry": {},
+    }
+
+    store_control = MMStateStore(str(tmp_path / "control.db"))
+    store_treatment = MMStateStore(str(tmp_path / "treatment.db"))
+    try:
+        loop_control = PaperTradingLoop(
+            store=store_control, expiry_key=EXPIRY, markets=markets, engine_fn=_engine(),
+            config=cfg, clock=SimClock(START), vol_gate_fn=_vol_gate(),
+        )
+        loop_treatment = PaperTradingLoop(
+            store=store_treatment, expiry_key=EXPIRY, markets=markets, engine_fn=_engine(),
+            config=cfg, clock=SimClock(START), vol_gate_fn=_vol_gate(),
+            markout_provider=lambda: report,
+        )
+        loop_control.tick({m: _snapshot_msg(0.5) for m, _k in markets})
+        loop_treatment.tick({m: _snapshot_msg(0.5) for m, _k in markets})
+
+        for m, _k in markets:
+            qc = loop_control.last_quote_sets[m]
+            qt = loop_treatment.last_quote_sets[m]
+            assert qt.bid_price == pytest.approx(qc.bid_price, abs=1e-9)
+            assert qt.ask_price == pytest.approx(qc.ask_price, abs=1e-9)
+    finally:
+        store_control.close()
+        store_treatment.close()
+
+
+def _p_of_strike(k, s0=S0, scale=2000.0):
+    """Same sigmoid formula as _engine()'s default (s0, scale) -- used to
+    build a market book input that roughly AGREES with the pricer per
+    strike. Package E PAV-interaction tests below need this: a flat market
+    mid (e.g. _snapshot_msg(0.5) for every strike) pulls the Beuoy consensus
+    toward that one flat value for every market and collapses any intended
+    belly/wing split, since credibility starts 0.5/0.5."""
+    return 1.0 / (1.0 + np.exp((k - s0) / scale))
+
+
+def test_markout_widen_belly_only_no_spurious_noarb_at_realistic_strike_spacing(tmp_path):
+    """No-arb PAV repair interaction, NORMAL-geometry safety check (package
+    E, plan-pinned "No-arb PAV repair interaction" section): belly-only
+    negative BUY_YES markout at the LAUNCH DEFAULT markout_widen_cap (0.05)
+    over a realistic Polymarket-like strike ladder (2000-3000 wide strikes,
+    matching typical BTC daily granularity) does not introduce ANY no-arb
+    violation at all -- the natural adjacent-strike bid gaps at this
+    spacing (multiples of ten cents) comfortably exceed the 5c cap, so PAV
+    is never even invoked (repair_count stays 0). Confirms term 7 is safe in
+    the intended/normal operating regime; invariants (ii)/(iii) (every
+    belly bid strictly below baseline, no wing bid above baseline) hold
+    trivially since nothing gets pooled."""
+    cfg = MMConfig(gamma=0.5, k_arrival=1.0)  # DEFAULT markout_widen_cap=0.05
+    # S0=100000, scale=2000 (default _engine()): 95k/105k land outside the
+    # default belly_band (0.2, 0.8) -> wing; 98k/100k/102k -> belly.
+    markets = [
+        ("m-95k", 95000.0),
+        ("m-98k", 98000.0),
+        ("m-100k", 100000.0),
+        ("m-102k", 102000.0),
+        ("m-105k", 105000.0),
+    ]
+    belly_ids = {"m-98k", "m-100k", "m-102k"}
+    wing_ids = {"m-95k", "m-105k"}
+    tte_bucket = _first_tick_tte_bucket()
+
+    report = {
+        "cells": [
+            {"region": "belly", "tte_bucket": tte_bucket, "horizon_s": cfg.markout_widen_horizon_s,
+             "n": cfg.markout_min_n, "n_attempted": cfg.markout_min_n,
+             "mk_avg": -1.0, "mk_var": 0.001, "mk_total": -1.0 * cfg.markout_min_n,
+             "sides": {
+                 "BUY_YES": {"n": cfg.markout_min_n, "n_attempted": cfg.markout_min_n,
+                             "mk_avg": -1.0, "mk_var": 0.001},
+                 "BUY_NO": {"n": 0, "n_attempted": 0, "mk_avg": 0.0, "mk_var": 0.0},
+             }},
+        ],
+        "by_region": {},
+        "by_expiry": {},
+    }
+
+    store_control = MMStateStore(str(tmp_path / "control.db"))
+    store_treatment = MMStateStore(str(tmp_path / "treatment.db"))
+    try:
+        loop_control = PaperTradingLoop(
+            store=store_control, expiry_key=EXPIRY, markets=markets, engine_fn=_engine(),
+            config=cfg, clock=SimClock(START), vol_gate_fn=_vol_gate(),
+        )
+        loop_treatment = PaperTradingLoop(
+            store=store_treatment, expiry_key=EXPIRY, markets=markets, engine_fn=_engine(),
+            config=cfg, clock=SimClock(START), vol_gate_fn=_vol_gate(),
+            markout_provider=lambda: report,
+        )
+        loop_control.tick({m: _snapshot_msg(_p_of_strike(k)) for m, k in markets})
+        loop_treatment.tick({m: _snapshot_msg(_p_of_strike(k)) for m, k in markets})
+
+        assert loop_treatment.hedger.repair_count == 0  # no PAV invocation needed
+
+        strikes_sorted = sorted(k for _, k in markets)
+        by_strike = {k: loop_treatment.last_quote_sets[m] for m, k in markets}
+        qs_sorted = [by_strike[k] for k in strikes_sorted]
+        verdict = loop_treatment.hedger.check(qs_sorted, strikes_sorted)
+        assert verdict.ok, verdict.violations  # (i)
+
+        for m, _k in markets:
+            baseline_bid = loop_control.last_quote_sets[m].bid_price
+            treated_bid = loop_treatment.last_quote_sets[m].bid_price
+            if m in belly_ids:
+                assert treated_bid < baseline_bid  # (ii)
+            else:
+                assert m in wing_ids
+                assert treated_bid <= baseline_bid + 1e-9  # (iii)
+    finally:
+        store_control.close()
+        store_treatment.close()
+
+
+def test_markout_widen_belly_only_pav_pooled_bids_stay_within_baseline_bounds(tmp_path):
+    """No-arb PAV repair interaction, adversarial/tight-strike case: belly-
+    only negative BUY_YES markout at the LAUNCH DEFAULT markout_widen_cap
+    (0.05) with strikes tight enough (500 apart, straddling the belly/wing
+    boundary) that the natural adjacent-strike bid gap is smaller than the
+    cap -- a genuine PAV violation-and-repair is exercised (repair_count
+    increments). Post-repair:
+      (ii)  every belly bid is strictly below its no-widening baseline;
+      (iii) no wing bid is above its no-widening baseline;
+    both hold regardless of whether PAV pooling fully restores monotonicity
+    (the plan's algebra bounds pooled values against the pre-widening
+    baseline unconditionally for a non-negative one-sided widening -- this
+    does NOT depend on the reconstruction fully closing the gap).
+
+    DISCOVERED GAP (out of scope for package E to fix -- ladder_hedger.py is
+    not in package E's file list): `LadderHedger.repair()` pools the
+    ladder's MIDS via PAV, then reconstructs each market's bid/ask from the
+    pooled mid +/- that market's OWN pre-repair half-spread. A belly-only,
+    asymmetric (bid-only) widening enlarges ONLY the widened market's own
+    half-spread, so even when PAV pools mids correctly, reconstructing with
+    disparate preserved half-spreads can leave the OUTPUT ladder still
+    bid-monotonicity-violating (empirically confirmed non-convergent even
+    under repeated repair() calls). This is a structural property of the
+    "preserve own half-spread" reconstruction, not particular to any single
+    widening magnitude, and was not evident from the plan's simplified two-
+    point algebra (which implicitly assumed pooling acts directly on bid,
+    i.e. equal half-spreads). It only manifests at strike spacing tighter
+    than typical Polymarket BTC daily granularity (the sibling test above
+    confirms NO violation at all at realistic 2000-3000-wide spacing with
+    this same default cap) -- flagged here as a characterization, not
+    asserted as fixed; see the implementation report for the recommended
+    follow-up."""
+    cfg = MMConfig(gamma=0.5, k_arrival=1.0)  # DEFAULT markout_widen_cap=0.05
+    # Tight strikes straddling the p=0.2 belly/wing boundary (S0=100000,
+    # scale=2000): 102000/102500 -> belly (p~0.269/0.223); 103000/103500 ->
+    # wing (p~0.182/0.148).
+    markets = [
+        ("m-102000", 102000.0),
+        ("m-102500", 102500.0),
+        ("m-103000", 103000.0),
+        ("m-103500", 103500.0),
+    ]
+    belly_ids = {"m-102000", "m-102500"}
+    wing_ids = {"m-103000", "m-103500"}
+    tte_bucket = _first_tick_tte_bucket()
+
+    report = {
+        "cells": [
+            {"region": "belly", "tte_bucket": tte_bucket, "horizon_s": cfg.markout_widen_horizon_s,
+             "n": cfg.markout_min_n, "n_attempted": cfg.markout_min_n,
+             "mk_avg": -1.0, "mk_var": 0.001, "mk_total": -1.0 * cfg.markout_min_n,
+             "sides": {
+                 "BUY_YES": {"n": cfg.markout_min_n, "n_attempted": cfg.markout_min_n,
+                             "mk_avg": -1.0, "mk_var": 0.001},
+                 "BUY_NO": {"n": 0, "n_attempted": 0, "mk_avg": 0.0, "mk_var": 0.0},
+             }},
+        ],
+        "by_region": {},
+        "by_expiry": {},
+    }
+
+    store_control = MMStateStore(str(tmp_path / "control.db"))
+    store_treatment = MMStateStore(str(tmp_path / "treatment.db"))
+    try:
+        loop_control = PaperTradingLoop(
+            store=store_control, expiry_key=EXPIRY, markets=markets, engine_fn=_engine(),
+            config=cfg, clock=SimClock(START), vol_gate_fn=_vol_gate(),
+        )
+        loop_treatment = PaperTradingLoop(
+            store=store_treatment, expiry_key=EXPIRY, markets=markets, engine_fn=_engine(),
+            config=cfg, clock=SimClock(START), vol_gate_fn=_vol_gate(),
+            markout_provider=lambda: report,
+        )
+        loop_control.tick({m: _snapshot_msg(_p_of_strike(k)) for m, k in markets})
+        loop_treatment.tick({m: _snapshot_msg(_p_of_strike(k)) for m, k in markets})
+
+        # A genuine PAV violation-and-repair was exercised this tick -- not a
+        # vacuous pass where the invariants below hold only because nothing
+        # actually got pooled.
+        assert loop_treatment.hedger.repair_count >= 1
+
+        for m, _k in markets:
+            baseline_bid = loop_control.last_quote_sets[m].bid_price
+            treated_bid = loop_treatment.last_quote_sets[m].bid_price
+            if m in belly_ids:
+                assert treated_bid < baseline_bid  # (ii)
+            else:
+                assert m in wing_ids
+                assert treated_bid <= baseline_bid + 1e-9  # (iii)
+    finally:
+        store_control.close()
+        store_treatment.close()

@@ -343,6 +343,28 @@ def _rebate_avg(rebate_vals: List[float]) -> float:
     return (sum(rebate_vals) / len(rebate_vals)) if rebate_vals else 0.0
 
 
+def _side_summaries(
+    vals_by_side: Dict[Side, List[float]],
+    attempted_by_side: Dict[Side, int],
+) -> Dict[str, Dict[str, object]]:
+    """Per-side (BUY_YES / BUY_NO) markout summary for one cell/rollup key
+    (package E, spread term 7). Additive alongside the existing aggregate
+    summary -- see `markout_report`'s "Side-split markout data" docstring
+    section. Both sides are ALWAYS present (F2-style: a side with zero hits
+    still gets an entry, n=0, never a missing key), so `markout_stats_side`
+    can rely on the shape unconditionally. Deliberately narrower than
+    `_summarize`'s aggregate shape -- no `mk_total` -- per the plan's pinned
+    `{n, n_attempted, mk_avg, mk_var}` side-entry shape.
+    """
+    out: Dict[str, Dict[str, object]] = {}
+    for side in (Side.BUY_YES, Side.BUY_NO):
+        summary = _summarize(vals_by_side.get(side, []))
+        summary.pop("mk_total", None)
+        summary["n_attempted"] = attempted_by_side.get(side, 0)
+        out[side.value] = summary
+    return out
+
+
 def markout_report(
     fills: Sequence[Fill],
     mid_lookup: Callable[[str, datetime, datetime], Optional[float]],
@@ -422,12 +444,25 @@ def markout_report(
     key; `markout_stats` and the sizing layer it feeds deliberately do NOT
     read it (module docstring "Maker rebates" section).
 
+    Side-split markout data (package E, spread term 7, 2026-07-15, ADDITIVE):
+    every `cells[]` entry and every `by_region` rollup entry also carries a
+    `"sides"` key -- `{"BUY_YES": {"n", "n_attempted", "mk_avg", "mk_var"},
+    "BUY_NO": {...}}` -- populated in exact lockstep with the aggregate
+    lists above (same eligibility, same mid-lookup-hit gating, same attempted
+    counting), just additionally partitioned by the fill's own `Side`
+    (BUY_YES fills = our bid side; BUY_NO fills = our ask side; fills are
+    YES-scale both sides, see module docstring). Both sides are always
+    present, `n=0` when a side has no hits (never a missing key). `by_expiry`
+    does NOT get a side split (not needed by the spread-widening consumer).
+    `markout_stats_side` is the resolver that reads this key (region rollup
+    fallback, mirroring `markout_stats`).
+
     Output is JSON-serializable:
         {"cells": [{"region", "tte_bucket", "horizon_s", "n", "n_attempted",
-                    "mk_avg", "mk_total", "rebate_avg"}, ...],
+                    "mk_avg", "mk_total", "rebate_avg", "sides"}, ...],
          "by_region": {region: {str(horizon_s): {"n", "n_attempted",
                                                   "mk_avg", "mk_total",
-                                                  "rebate_avg"}}}
+                                                  "rebate_avg", "sides"}}}
          (rolled up across tte_bucket -- the region x horizon summary is the
          headline "is this region's markout biased" view; the finer
          region x tte_bucket x horizon breakdown lives in "cells"),
@@ -459,6 +494,15 @@ def markout_report(
     # which stays untouched) but appended in exact lockstep with them below.
     reb_cells: Dict[Tuple[str, str, float], List[float]] = {}
     reb_expiry_cells: Dict[Tuple[str, float], List[float]] = {}
+    # Side-split markout data (package E, spread term 7): parallel per-side
+    # (BUY_YES / BUY_NO) value/attempted trackers, keyed exactly like `cells`/
+    # `attempted` and populated in lockstep (same eligibility, same
+    # mid-lookup-hit gating, same attempted counting) -- just additionally
+    # partitioned by `f.side`. Never fed into `_summarize` directly (see
+    # `_side_summaries` below). by_expiry does NOT get a side split (only
+    # `cells` and `by_region` do, per plan "Side-split markout data").
+    side_cells: Dict[Tuple[str, str, float], Dict[Side, List[float]]] = {}
+    side_attempted: Dict[Tuple[str, str, float], Dict[Side, int]] = {}
 
     for f in eligible:
         if cutoff is not None and f.ts < cutoff:
@@ -503,6 +547,9 @@ def markout_report(
             attempted[key] = attempted.get(key, 0) + 1
             vals = cells.setdefault(key, [])
             rebs = reb_cells.setdefault(key, [])
+            side_att_key = side_attempted.setdefault(key, {})
+            side_att_key[f.side] = side_att_key.get(f.side, 0) + 1
+            side_vals = side_cells.setdefault(key, {}).setdefault(f.side, [])
 
             ekey = (fill_expiry, float(h))
             expiry_attempted[ekey] = expiry_attempted.get(ekey, 0) + 1
@@ -515,6 +562,7 @@ def markout_report(
             mk = sign * (mid_h - f.price)
             vals.append(mk)
             evals.append(mk)
+            side_vals.append(mk)
             # n-matched with vals/evals: appended ONLY on the same mid-lookup
             # HIT branch, so rebate_avg averages over exactly the same fills
             # as mk_avg.
@@ -527,21 +575,33 @@ def markout_report(
         summary = _summarize(cells[key])
         summary["n_attempted"] = attempted[key]
         summary["rebate_avg"] = _rebate_avg(reb_cells.get(key, []))
+        summary["sides"] = _side_summaries(side_cells.get(key, {}), side_attempted.get(key, {}))
         cell_list.append({"region": region, "tte_bucket": tte_bucket, "horizon_s": h, **summary})
 
     by_region: Dict[str, Dict[str, Dict[str, object]]] = {}
     grouped: Dict[Tuple[str, float], List[float]] = {}
     grouped_attempted: Dict[Tuple[str, float], int] = {}
     grouped_reb: Dict[Tuple[str, float], List[float]] = {}
+    grouped_side: Dict[Tuple[str, float], Dict[Side, List[float]]] = {}
+    grouped_side_attempted: Dict[Tuple[str, float], Dict[Side, int]] = {}
     for key, vals in cells.items():
         region, _bucket, h = key
         grouped.setdefault((region, h), []).extend(vals)
         grouped_attempted[(region, h)] = grouped_attempted.get((region, h), 0) + attempted[key]
         grouped_reb.setdefault((region, h), []).extend(reb_cells.get(key, []))
+        gs = grouped_side.setdefault((region, h), {})
+        for side, svals in side_cells.get(key, {}).items():
+            gs.setdefault(side, []).extend(svals)
+        gsa = grouped_side_attempted.setdefault((region, h), {})
+        for side, satt in side_attempted.get(key, {}).items():
+            gsa[side] = gsa.get(side, 0) + satt
     for (region, h), vals in grouped.items():
         summary = _summarize(vals)
         summary["n_attempted"] = grouped_attempted[(region, h)]
         summary["rebate_avg"] = _rebate_avg(grouped_reb.get((region, h), []))
+        summary["sides"] = _side_summaries(
+            grouped_side.get((region, h), {}), grouped_side_attempted.get((region, h), {})
+        )
         by_region.setdefault(region, {})[str(h)] = summary
 
     by_expiry: Dict[str, Dict[str, Dict[str, object]]] = {}
@@ -561,8 +621,56 @@ def markout_report(
 
 
 # ---------------------------------------------------------------------------
-# Markout lookup helper for sizing (wave 2 W6)
+# Markout lookup helpers for sizing (wave 2 W6) and quoting (package E)
 # ---------------------------------------------------------------------------
+
+
+def _find_cell(
+    report: Optional[dict], region: str, tte_bucket: str, horizon_s: float,
+) -> Optional[dict]:
+    """Exact `report["cells"]` entry for (region, tte_bucket, horizon_s), or
+    None. Shared lookup helper (package E review item -- factor once, use by
+    both `markout_stats` and `markout_stats_side`) so the malformed-input
+    defensiveness (non-dict report/cells/cell entries) and the horizon match
+    (`float(...) == float(horizon_s)`) live in exactly one place. Returns the
+    first match; the cells list is built with unique (region, tte_bucket,
+    horizon_s) keys, so there is at most one to find. Never raises on
+    malformed input -- callers wrap the whole resolution in try/except, but
+    this helper itself only reads with `.get`/`isinstance` guards."""
+    cells = report.get("cells") if isinstance(report, dict) else None
+    if not isinstance(cells, list):
+        return None
+    for cell in cells:
+        if not isinstance(cell, dict):
+            continue
+        if (
+            cell.get("region") == region
+            and cell.get("tte_bucket") == tte_bucket
+            and float(cell.get("horizon_s", float("nan"))) == float(horizon_s)
+        ):
+            return cell
+    return None
+
+
+def _region_rollup_entry(
+    report: Optional[dict], region: str, horizon_s: float,
+) -> Optional[dict]:
+    """Exact `report["by_region"][region][str(horizon_s)]` entry, or None.
+    CRITICAL TRAP (shared by both resolvers): by_region horizons are keyed by
+    `str(h)`, e.g. `"600.0"` -- `markout_report` builds this with `str(h)`, so
+    a float-keyed lookup here would silently miss every time; this helper is
+    the ONE place that string-keys the lookup, so `markout_stats` and
+    `markout_stats_side` cannot independently get it wrong."""
+    by_region = report.get("by_region") if isinstance(report, dict) else None
+    if not isinstance(by_region, dict):
+        return None
+    region_entry = by_region.get(region)
+    if not isinstance(region_entry, dict):
+        return None
+    horizon_entry = region_entry.get(str(horizon_s))
+    if not isinstance(horizon_entry, dict):
+        return None
+    return horizon_entry
 
 
 def markout_stats(
@@ -614,42 +722,86 @@ def markout_stats(
         # rollup's n_attempted must never leak out of here).
         cell_n_attempted = 0
 
-        cells = report.get("cells") if isinstance(report, dict) else None
-        if isinstance(cells, list):
-            for cell in cells:
-                if not isinstance(cell, dict):
-                    continue
-                if (
-                    cell.get("region") == region
-                    and cell.get("tte_bucket") == tte_bucket
-                    and float(cell.get("horizon_s", float("nan"))) == float(horizon_s)
-                ):
-                    n = int(cell.get("n", 0) or 0)
-                    cell_n_attempted = int(cell.get("n_attempted", 0) or 0)
-                    if n >= min_n:
-                        return (
-                            float(cell.get("mk_avg", 0.0)),
-                            float(cell.get("mk_var", 0.0)),
-                            n,
-                            cell_n_attempted,
-                        )
-                    break  # exact cell found but thin; fall through to region rollup
+        cell = _find_cell(report, region, tte_bucket, horizon_s)
+        if cell is not None:
+            n = int(cell.get("n", 0) or 0)
+            cell_n_attempted = int(cell.get("n_attempted", 0) or 0)
+            if n >= min_n:
+                return (
+                    float(cell.get("mk_avg", 0.0)),
+                    float(cell.get("mk_var", 0.0)),
+                    n,
+                    cell_n_attempted,
+                )
+            # exact cell found but thin; fall through to region rollup
 
-        by_region = report.get("by_region") if isinstance(report, dict) else None
-        if isinstance(by_region, dict):
-            region_entry = by_region.get(region)
-            if isinstance(region_entry, dict):
-                horizon_entry = region_entry.get(str(horizon_s))
-                if isinstance(horizon_entry, dict):
-                    n = int(horizon_entry.get("n", 0) or 0)
-                    if n >= min_n:
-                        return (
-                            float(horizon_entry.get("mk_avg", 0.0)),
-                            float(horizon_entry.get("mk_var", 0.0)),
-                            n,
-                            cell_n_attempted,
-                        )
+        horizon_entry = _region_rollup_entry(report, region, horizon_s)
+        if horizon_entry is not None:
+            n = int(horizon_entry.get("n", 0) or 0)
+            if n >= min_n:
+                return (
+                    float(horizon_entry.get("mk_avg", 0.0)),
+                    float(horizon_entry.get("mk_var", 0.0)),
+                    n,
+                    cell_n_attempted,
+                )
 
         return None, None, 0, cell_n_attempted
     except Exception:
         return None, None, 0, 0
+
+
+def markout_stats_side(
+    report: Optional[dict],
+    region: str,
+    tte_bucket: str,
+    horizon_s: float,
+    side: Side,
+    min_n: int,
+) -> Tuple[Optional[float], int]:
+    """Resolve (mk_avg, n) for one (region, tte_bucket, horizon_s, side)
+    quoting lookup out of a `markout_report()` dict's additive `"sides"` key
+    (package E, spread term 7 -- `spread_builder.markout_widen` haircuts the
+    posted bid/ask off this per side).
+
+    Resolution order identical to `markout_stats` (same shared helpers,
+    `_find_cell` / `_region_rollup_entry`, so the two resolvers cannot drift):
+      1. Exact cell's `sides[side.value]` entry, if its `n >= min_n`.
+      2. Else the region rollup's `sides[side.value]` entry, if its
+         `n >= min_n`.
+      3. Else `(None, 0)`.
+
+    Never raises: a malformed, empty, or None `report`, a report/cell/rollup
+    missing the `"sides"` key entirely (e.g. an older report predating
+    package E), or any other malformed shape degrades to `(None, 0)` rather
+    than propagating a KeyError/TypeError into the quoting pipeline.
+    """
+    try:
+        if not report:
+            return None, 0
+
+        side_key = side.value
+
+        cell = _find_cell(report, region, tte_bucket, horizon_s)
+        if cell is not None:
+            sides = cell.get("sides")
+            if isinstance(sides, dict):
+                side_entry = sides.get(side_key)
+                if isinstance(side_entry, dict):
+                    n = int(side_entry.get("n", 0) or 0)
+                    if n >= min_n:
+                        return float(side_entry.get("mk_avg", 0.0)), n
+
+        horizon_entry = _region_rollup_entry(report, region, horizon_s)
+        if horizon_entry is not None:
+            sides = horizon_entry.get("sides")
+            if isinstance(sides, dict):
+                side_entry = sides.get(side_key)
+                if isinstance(side_entry, dict):
+                    n = int(side_entry.get("n", 0) or 0)
+                    if n >= min_n:
+                        return float(side_entry.get("mk_avg", 0.0)), n
+
+        return None, 0
+    except Exception:
+        return None, 0

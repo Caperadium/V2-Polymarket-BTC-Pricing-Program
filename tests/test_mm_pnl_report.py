@@ -29,6 +29,7 @@ from market_maker.pnl_report import (
     fill_cash,
     markout_report,
     markout_stats,
+    markout_stats_side,
     rebate_for_fill,
     tte_bucket_label,
 )
@@ -1128,3 +1129,277 @@ def test_markout_stats_resolution_unchanged_with_rebate_avg_key_present():
     }
     mk_avg, mk_var, n, n_attempted = markout_stats(report, "belly", "0-1d", 600.0, min_n=20)
     assert (mk_avg, mk_var, n, n_attempted) == (0.02, 0.0004, 25, 30)
+
+
+# ---------------------------------------------------------------------------
+# Package E (2026-07-15): side-split markout data + markout_stats_side
+# ---------------------------------------------------------------------------
+
+
+def test_markout_side_split_flat_mid_buy_no_regression():
+    # Extends the reviewer's blocker gate (test_markout_flat_mid_buy_no_
+    # regression): a BUY_NO fill at YES-scale price 0.60 against a flat YES
+    # mid of 0.60 markouts to ~0 at every horizon in the AGGREGATE (already
+    # covered) AND in its own "sides"["BUY_NO"] entry; "sides"["BUY_YES"]
+    # must be present with n=0 (no BUY_YES fills at all in this report).
+    fill = _paper_fill("m1", Side.BUY_NO, 0.60, 10.0, mid_at_fill=0.60)
+    registry = {"m1": (FAR_EXPIRY, 100000.0)}
+    mid_rows = {"m1": [
+        (NOW + timedelta(seconds=60), 0.60),
+        (NOW + timedelta(seconds=600), 0.60),
+        (NOW + timedelta(seconds=3600), 0.60),
+    ]}
+    report = markout_report(
+        [fill], _mid_lookup_from_rows(mid_rows), registry, BELLY_BAND, horizons=(60.0, 600.0, 3600.0),
+    )
+    assert len(report["cells"]) == 3
+    for cell in report["cells"]:
+        assert cell["mk_avg"] == pytest.approx(0.0, abs=1e-12)
+        sides = cell["sides"]
+        assert set(sides.keys()) == {"BUY_YES", "BUY_NO"}
+        assert sides["BUY_NO"]["n"] == 1
+        assert sides["BUY_NO"]["n_attempted"] == 1
+        assert sides["BUY_NO"]["mk_avg"] == pytest.approx(0.0, abs=1e-12)
+        assert sides["BUY_YES"]["n"] == 0
+        assert sides["BUY_YES"]["n_attempted"] == 0
+        assert sides["BUY_YES"]["mk_avg"] == pytest.approx(0.0, abs=1e-12)
+
+
+def test_markout_side_split_n_sums_to_aggregate_n_per_cell():
+    # Two fills landing in the SAME cell, one per side -> per-cell side n
+    # values sum to the aggregate cell n.
+    fill_yes = _paper_fill(
+        "m1", Side.BUY_YES, 0.50, 5.0, mid_at_fill=0.50, order_id="y",
+    )
+    fill_no = _paper_fill(
+        "m1", Side.BUY_NO, 0.55, 5.0, mid_at_fill=0.55, order_id="n",
+        ts=NOW + timedelta(minutes=10),
+    )
+    registry = {"m1": (FAR_EXPIRY, 100000.0)}
+    mid_rows = {"m1": [
+        (fill_yes.ts + timedelta(seconds=60), 0.52),
+        (fill_no.ts + timedelta(seconds=60), 0.50),
+    ]}
+    report = markout_report(
+        [fill_yes, fill_no], _mid_lookup_from_rows(mid_rows), registry, BELLY_BAND, horizons=(60.0,),
+    )
+    assert len(report["cells"]) == 1
+    cell = report["cells"][0]
+    assert cell["n"] == 2
+    sides = cell["sides"]
+    assert sides["BUY_YES"]["n"] + sides["BUY_NO"]["n"] == cell["n"]
+    assert sides["BUY_YES"]["n"] == 1
+    assert sides["BUY_NO"]["n"] == 1
+
+
+def test_markout_side_split_n_attempted_sums_to_aggregate_n_attempted():
+    # One side hits, the other side's lookup misses -> side n_attempted
+    # values still sum to the aggregate n_attempted (F2-style: attempted
+    # counts regardless of hit/miss).
+    fill_yes = _paper_fill(
+        "m1", Side.BUY_YES, 0.50, 5.0, mid_at_fill=0.50, order_id="y",
+    )
+    fill_no = _paper_fill(
+        "m1", Side.BUY_NO, 0.55, 5.0, mid_at_fill=0.55, order_id="n",
+        ts=NOW + timedelta(hours=1),  # window empty -> lookup misses
+    )
+    registry = {"m1": (FAR_EXPIRY, 100000.0)}
+    mid_rows = {"m1": [(fill_yes.ts + timedelta(seconds=60), 0.52)]}
+    report = markout_report(
+        [fill_yes, fill_no], _mid_lookup_from_rows(mid_rows), registry, BELLY_BAND, horizons=(60.0,),
+    )
+    cell = report["cells"][0]
+    assert cell["n"] == 1
+    assert cell["n_attempted"] == 2
+    sides = cell["sides"]
+    assert sides["BUY_YES"]["n"] == 1 and sides["BUY_YES"]["n_attempted"] == 1
+    assert sides["BUY_NO"]["n"] == 0 and sides["BUY_NO"]["n_attempted"] == 1
+    assert sides["BUY_YES"]["n_attempted"] + sides["BUY_NO"]["n_attempted"] == cell["n_attempted"]
+
+
+def test_markout_side_split_present_in_by_region_rollup():
+    # Two fills, same region, DIFFERENT tte_bucket, one per side -- the
+    # by_region rollup collapses across tte_bucket (existing behavior) AND
+    # carries a "sides" key summing across both cells.
+    settle = settlement_instant_utc(FAR_EXPIRY)
+    fill_yes = _paper_fill(
+        "m1", Side.BUY_YES, 0.50, 10.0, mid_at_fill=0.50, order_id="y",
+        ts=settle - timedelta(hours=12),  # "0-1d"
+    )
+    fill_no = _paper_fill(
+        "m1", Side.BUY_NO, 0.50, 10.0, mid_at_fill=0.50, order_id="n",
+        ts=settle - timedelta(hours=36),  # "1-2d"
+    )
+    registry = {"m1": (FAR_EXPIRY, 100000.0)}
+    mid_rows = {"m1": [
+        (fill_yes.ts + timedelta(seconds=60), 0.55),
+        (fill_no.ts + timedelta(seconds=60), 0.45),
+    ]}
+    report = markout_report(
+        [fill_yes, fill_no], _mid_lookup_from_rows(mid_rows), registry, BELLY_BAND, horizons=(60.0,),
+    )
+    rollup = report["by_region"]["belly"]["60.0"]
+    assert rollup["n"] == 2
+    sides = rollup["sides"]
+    assert set(sides.keys()) == {"BUY_YES", "BUY_NO"}
+    assert sides["BUY_YES"]["n"] == 1
+    assert sides["BUY_NO"]["n"] == 1
+    assert sides["BUY_YES"]["n"] + sides["BUY_NO"]["n"] == rollup["n"]
+    # mk_avg per side matches the single fill's own markout (n=1 -> mean ==
+    # the one value): BUY_YES @ 0.50 vs mid 0.55 -> +0.05; BUY_NO @ 0.50 vs
+    # mid 0.45 -> -1*(0.45-0.50) = +0.05.
+    assert sides["BUY_YES"]["mk_avg"] == pytest.approx(0.05)
+    assert sides["BUY_NO"]["mk_avg"] == pytest.approx(0.05)
+
+
+def test_markout_side_split_sides_shape_has_no_mk_total():
+    # Plan's pinned side-entry shape is exactly {n, n_attempted, mk_avg,
+    # mk_var} -- no mk_total (unlike the aggregate cell/rollup dicts, which
+    # do carry mk_total).
+    fill = _paper_fill("m1", Side.BUY_YES, 0.50, 5.0, mid_at_fill=0.50)
+    registry = {"m1": (FAR_EXPIRY, 100000.0)}
+    mid_rows = {"m1": [(fill.ts + timedelta(seconds=60), 0.55)]}
+    report = markout_report(
+        [fill], _mid_lookup_from_rows(mid_rows), registry, BELLY_BAND, horizons=(60.0,),
+    )
+    cell = report["cells"][0]
+    assert "mk_total" in cell  # aggregate cell keeps it
+    for side_entry in cell["sides"].values():
+        assert set(side_entry.keys()) == {"n", "n_attempted", "mk_avg", "mk_var"}
+
+
+def test_markout_stats_side_exact_cell_resolution():
+    report = {
+        "cells": [
+            {"region": "belly", "tte_bucket": "0-1d", "horizon_s": 60.0,
+             "n": 10, "n_attempted": 12, "mk_avg": 0.01, "mk_var": 0.0002,
+             "sides": {
+                 "BUY_YES": {"n": 25, "n_attempted": 30, "mk_avg": -0.02, "mk_var": 0.0004},
+                 "BUY_NO": {"n": 5, "n_attempted": 8, "mk_avg": 0.01, "mk_var": 0.0001},
+             }},
+        ],
+        "by_region": {
+            "belly": {"60.0": {"n": 100, "n_attempted": 120, "mk_avg": 0.0, "mk_var": 0.0,
+                                "sides": {
+                                    "BUY_YES": {"n": 80, "n_attempted": 90, "mk_avg": -0.05, "mk_var": 0.001},
+                                    "BUY_NO": {"n": 20, "n_attempted": 30, "mk_avg": 0.02, "mk_var": 0.0005},
+                                }}},
+        },
+    }
+    mk_avg, n = markout_stats_side(report, "belly", "0-1d", 60.0, Side.BUY_YES, min_n=20)
+    # exact cell's BUY_YES side (n=25 >= min_n=20) wins over the (also-
+    # eligible) region rollup.
+    assert (mk_avg, n) == (-0.02, 25)
+
+
+def test_markout_stats_side_falls_back_to_region_rollup_when_cell_thin():
+    report = {
+        "cells": [
+            {"region": "belly", "tte_bucket": "0-1d", "horizon_s": 60.0,
+             "n": 10, "n_attempted": 12, "mk_avg": 0.01, "mk_var": 0.0002,
+             "sides": {
+                 "BUY_YES": {"n": 5, "n_attempted": 8, "mk_avg": -0.02, "mk_var": 0.0004},
+                 "BUY_NO": {"n": 5, "n_attempted": 8, "mk_avg": 0.01, "mk_var": 0.0001},
+             }},
+        ],
+        "by_region": {
+            "belly": {"60.0": {"n": 100, "n_attempted": 120, "mk_avg": 0.0, "mk_var": 0.0,
+                                "sides": {
+                                    "BUY_YES": {"n": 80, "n_attempted": 90, "mk_avg": -0.05, "mk_var": 0.001},
+                                    "BUY_NO": {"n": 20, "n_attempted": 30, "mk_avg": 0.02, "mk_var": 0.0005},
+                                }}},
+        },
+    }
+    # BUY_YES cell-side n=5 < min_n=20 -> falls back to the region rollup's
+    # BUY_YES side (n=80 >= 20).
+    mk_avg, n = markout_stats_side(report, "belly", "0-1d", 60.0, Side.BUY_YES, min_n=20)
+    assert (mk_avg, n) == (-0.05, 80)
+
+
+def test_markout_stats_side_both_thin_returns_null_tuple():
+    report = {
+        "cells": [
+            {"region": "belly", "tte_bucket": "0-1d", "horizon_s": 60.0,
+             "n": 3, "n_attempted": 5, "mk_avg": 0.0, "mk_var": 0.0,
+             "sides": {
+                 "BUY_YES": {"n": 3, "n_attempted": 5, "mk_avg": -0.02, "mk_var": 0.0004},
+                 "BUY_NO": {"n": 0, "n_attempted": 0, "mk_avg": 0.0, "mk_var": 0.0},
+             }},
+        ],
+        "by_region": {
+            "belly": {"60.0": {"n": 8, "n_attempted": 12, "mk_avg": 0.0, "mk_var": 0.0,
+                                "sides": {
+                                    "BUY_YES": {"n": 8, "n_attempted": 12, "mk_avg": -0.03, "mk_var": 0.0006},
+                                    "BUY_NO": {"n": 0, "n_attempted": 0, "mk_avg": 0.0, "mk_var": 0.0},
+                                }}},
+        },
+    }
+    assert markout_stats_side(report, "belly", "0-1d", 60.0, Side.BUY_YES, min_n=20) == (None, 0)
+    assert markout_stats_side(report, "belly", "0-1d", 60.0, Side.BUY_NO, min_n=20) == (None, 0)
+
+
+def test_markout_stats_side_region_horizon_key_is_str_not_float():
+    # Same CRITICAL TRAP as markout_stats: by_region is keyed by str(h).
+    report = {
+        "cells": [],
+        "by_region": {
+            "wing": {"60.0": {"n": 50, "n_attempted": 60, "mk_avg": -0.01, "mk_var": 0.0002,
+                               "sides": {
+                                   "BUY_YES": {"n": 50, "n_attempted": 60, "mk_avg": -0.04, "mk_var": 0.0009},
+                                   "BUY_NO": {"n": 0, "n_attempted": 0, "mk_avg": 0.0, "mk_var": 0.0},
+                               }}},
+        },
+    }
+    mk_avg, n = markout_stats_side(report, "wing", "1-2d", 60.0, Side.BUY_YES, min_n=20)
+    assert (mk_avg, n) == (-0.04, 50)
+
+
+def test_markout_stats_side_never_attempted_returns_null_tuple():
+    report = {"cells": [], "by_region": {}}
+    assert markout_stats_side(report, "belly", "0-1d", 60.0, Side.BUY_YES, min_n=20) == (None, 0)
+
+
+def test_markout_stats_side_malformed_report_never_raises():
+    assert markout_stats_side(None, "belly", "0-1d", 60.0, Side.BUY_YES, min_n=20) == (None, 0)
+    assert markout_stats_side({}, "belly", "0-1d", 60.0, Side.BUY_YES, min_n=20) == (None, 0)
+    assert markout_stats_side(
+        {"cells": "not-a-list"}, "belly", "0-1d", 60.0, Side.BUY_YES, min_n=20
+    ) == (None, 0)
+    assert markout_stats_side(
+        {"cells": [{"region": "belly"}]}, "belly", "0-1d", 60.0, Side.BUY_YES, min_n=20
+    ) == (None, 0)
+    assert markout_stats_side(
+        {"cells": [{"region": "belly", "tte_bucket": "0-1d", "horizon_s": 60.0, "sides": "not-a-dict"}]},
+        "belly", "0-1d", 60.0, Side.BUY_YES, min_n=20,
+    ) == (None, 0)
+    assert markout_stats_side(
+        {"cells": [], "by_region": {"belly": "not-a-dict"}}, "belly", "0-1d", 60.0, Side.BUY_YES, min_n=20,
+    ) == (None, 0)
+    assert markout_stats_side(
+        {"cells": [], "by_region": {"belly": {"60.0": "not-a-dict"}}}, "belly", "0-1d", 60.0, Side.BUY_YES, min_n=20,
+    ) == (None, 0)
+    assert markout_stats_side(
+        {"cells": [], "by_region": {"belly": {"60.0": {"sides": {"BUY_YES": "not-a-dict"}}}}},
+        "belly", "0-1d", 60.0, Side.BUY_YES, min_n=20,
+    ) == (None, 0)
+
+
+def test_markout_stats_side_resolution_unaffected_by_markout_stats_calls():
+    # markout_stats and markout_stats_side read from the same report but
+    # different keys ("sides" vs the aggregate) -- calling one must not
+    # affect the other's resolution (they are pure, independent reads).
+    report = {
+        "cells": [
+            {"region": "belly", "tte_bucket": "0-1d", "horizon_s": 60.0,
+             "n": 25, "n_attempted": 30, "mk_avg": 0.02, "mk_var": 0.0004,
+             "sides": {
+                 "BUY_YES": {"n": 25, "n_attempted": 30, "mk_avg": -0.03, "mk_var": 0.0004},
+                 "BUY_NO": {"n": 25, "n_attempted": 30, "mk_avg": 0.01, "mk_var": 0.0004},
+             }},
+        ],
+        "by_region": {},
+    }
+    agg = markout_stats(report, "belly", "0-1d", 60.0, min_n=20)
+    side = markout_stats_side(report, "belly", "0-1d", 60.0, Side.BUY_YES, min_n=20)
+    assert agg == (0.02, 0.0004, 25, 30)
+    assert side == (-0.03, 25)

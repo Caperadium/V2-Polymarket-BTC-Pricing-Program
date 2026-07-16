@@ -22,6 +22,7 @@ from market_maker.spread_builder import (
     compute_posted_prices,
     make_stub_directive,
     make_stub_sizing,
+    markout_widen,
 )
 
 TS = datetime(2026, 7, 6, 12, 0, tzinfo=timezone.utc)
@@ -379,3 +380,168 @@ def test_build_quote_set_posted_short_circuit_respected_verbatim():
     assert qs.bid_price == pytest.approx(0.111)
     assert qs.ask_price == pytest.approx(0.222)
     assert qs.terms == fake_posted[2]
+
+
+# ---------------------------------------------------------------------------
+# Package E (2026-07-15): markout_widen pure helper (term 7)
+# ---------------------------------------------------------------------------
+
+
+def test_markout_widen_none_mk_avg_is_zero():
+    assert markout_widen(None, scale=1.0, cap=0.05) == 0.0
+
+
+def test_markout_widen_positive_mk_avg_clamps_to_zero():
+    # Favorable/neutral markout -> no widening (one-directional term; there
+    # is no symmetric "tighten on good markout" branch).
+    assert markout_widen(0.02, scale=1.0, cap=0.05) == 0.0
+    assert markout_widen(0.0, scale=1.0, cap=0.05) == 0.0
+
+
+def test_markout_widen_negative_mk_avg_scales_linearly_below_cap():
+    assert markout_widen(-0.01, scale=1.0, cap=0.05) == pytest.approx(0.01)
+    assert markout_widen(-0.01, scale=2.0, cap=0.05) == pytest.approx(0.02)
+
+
+def test_markout_widen_cap_binds():
+    # Cap binds on the RAW clamped magnitude (clamp(-mk_avg, 0, cap)) BEFORE
+    # the scale multiply -- per the plan's pinned formula
+    # `clamp(-mk_avg, 0, cap) * scale` -- so with scale=1.0 the cap directly
+    # bounds the output, but a scale != 1.0 still scales the capped amount.
+    assert markout_widen(-1.0, scale=1.0, cap=0.05) == pytest.approx(0.05)
+    assert markout_widen(-10.0, scale=3.0, cap=0.02) == pytest.approx(0.02 * 3.0)
+
+
+def test_markout_widen_scale_zero_disables():
+    assert markout_widen(-0.5, scale=0.0, cap=0.05) == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Package E (2026-07-15): compute_posted_prices term 7 (markout-fed widening)
+# ---------------------------------------------------------------------------
+
+
+def test_compute_posted_prices_markout_widen_bid_only_moves_bid_not_ask():
+    config = MMConfig()
+    proposal = _proposal(r_x=0.0, delta_x=0.3)
+    directive = make_stub_directive("m1", TS)
+    bid0, ask0, terms0 = compute_posted_prices(
+        proposal, directive, VENUE, config,
+        sigma2=0.0002, confidence_tier=ConfidenceTier.FULL,
+        credibility=0.7, consensus_p=0.5,
+    )
+    bid1, ask1, terms1 = compute_posted_prices(
+        proposal, directive, VENUE, config,
+        sigma2=0.0002, confidence_tier=ConfidenceTier.FULL,
+        credibility=0.7, consensus_p=0.5, markout_widen_bid=0.03,
+    )
+    assert bid1 < bid0
+    assert (bid0 - bid1) == pytest.approx(0.03, abs=1e-9)
+    assert ask1 == pytest.approx(ask0, abs=1e-9)
+    assert terms1["markout_bid"] == pytest.approx(0.03)
+    assert terms1["markout_ask"] == pytest.approx(0.0)
+    assert terms0["markout_bid"] == pytest.approx(0.0)
+    assert terms0["markout_ask"] == pytest.approx(0.0)
+
+
+def test_compute_posted_prices_markout_widen_ask_only_moves_ask_not_bid():
+    config = MMConfig()
+    proposal = _proposal(r_x=0.0, delta_x=0.3)
+    directive = make_stub_directive("m1", TS)
+    bid0, ask0, _terms0 = compute_posted_prices(
+        proposal, directive, VENUE, config,
+        sigma2=0.0002, confidence_tier=ConfidenceTier.FULL,
+        credibility=0.7, consensus_p=0.5,
+    )
+    bid1, ask1, terms1 = compute_posted_prices(
+        proposal, directive, VENUE, config,
+        sigma2=0.0002, confidence_tier=ConfidenceTier.FULL,
+        credibility=0.7, consensus_p=0.5, markout_widen_ask=0.04,
+    )
+    assert ask1 > ask0
+    assert (ask1 - ask0) == pytest.approx(0.04, abs=1e-9)
+    assert bid1 == pytest.approx(bid0, abs=1e-9)
+    assert terms1["markout_ask"] == pytest.approx(0.04)
+    assert terms1["markout_bid"] == pytest.approx(0.0)
+
+
+def test_compute_posted_prices_markout_terms_keys_present_and_zero_by_default():
+    qs = _build()
+    assert "markout_bid" in qs.terms
+    assert "markout_ask" in qs.terms
+    assert qs.terms["markout_bid"] == pytest.approx(0.0)
+    assert qs.terms["markout_ask"] == pytest.approx(0.0)
+
+
+def test_compute_posted_prices_markout_widen_defaults_are_byte_identical_regression():
+    # Explicit pin: omitting the two new args entirely reproduces the exact
+    # pre-package-E prices (already implied by the existing grid test, but
+    # pinned directly here as the dedicated regression gate).
+    config = MMConfig()
+    proposal = _proposal(r_x=logit(0.65), delta_x=0.15, skew_x=0.01)
+    directive = make_stub_directive("m1", TS)
+    bid_a, ask_a, terms_a = compute_posted_prices(
+        proposal, directive, VENUE, config,
+        sigma2=0.0003, confidence_tier=ConfidenceTier.FULL,
+        credibility=0.6, consensus_p=0.65, tte_days=3.0,
+    )
+    bid_b, ask_b, terms_b = compute_posted_prices(
+        proposal, directive, VENUE, config,
+        sigma2=0.0003, confidence_tier=ConfidenceTier.FULL,
+        credibility=0.6, consensus_p=0.65, tte_days=3.0,
+        markout_widen_bid=0.0, markout_widen_ask=0.0,
+    )
+    assert bid_a == bid_b
+    assert ask_a == ask_b
+    assert terms_a == terms_b
+
+
+def test_compute_posted_prices_markout_widen_survives_floor_binding():
+    """Floor-binding interaction (plan item 4, "VERIFIED against code"): when
+    the pre-floor half-spread is below one tick, floor_half_spread forces it
+    up to exactly one tick and the CENTER is recomputed from the already-
+    asymmetric (bid-only-widened) prices -- the widen's effect is NOT erased
+    by flooring, even though it collapses to a symmetric half-spread around
+    the shifted center.
+
+    Hand-derived exact values (p_bid_center == p_ask_center == 0.5 here by
+    construction -- r_x=0, delta_x~0, so the arithmetic below is exact):
+      no widen:            half_spread_pre=0      -> floors to tick=0.01
+                            -> center=0.5 -> (bid, ask) = (0.49, 0.51)
+      markout_widen_bid=0.01: half_spread_pre=0.005 -> STILL floors to 0.01
+                            (0.005 < 0.01), but center shifts from 0.5 to
+                            0.495 -> pre-quantize (0.485, 0.505) -> quantized
+                            (0.48, 0.51).
+    Note ask quantizes to the SAME 0.51 as the no-widen case here -- not a
+    bug: floor-binding requires the pre-floor half-spread (which already
+    includes the widen) to be < tick, so the induced center shift
+    (0.5 * markout_widen_bid) is ALWAYS < tick whenever the floor binds --
+    ceil can (and here does) absorb a sub-tick shift into the same tick,
+    while floor's rounding direction happens to drop bid a full tick lower.
+    Either way the widen visibly moves the output; it is not silently
+    absorbed to bit-identical prices."""
+    config = MMConfig(
+        eps_base=0.0, k_arrival=1e6, belly_widen_base_p=0.0, belly_widen_slope_p_per_day=0.0,
+    )
+    proposal = _proposal(r_x=0.0, delta_x=1e-9)
+    directive = make_stub_directive("m1", TS)
+
+    bid0, ask0, terms0 = compute_posted_prices(
+        proposal, directive, VENUE, config,
+        sigma2=0.0, confidence_tier=ConfidenceTier.FULL,
+        credibility=1.0, consensus_p=0.5, credibility_widen_scale=0.0,
+    )
+    bid1, ask1, terms1 = compute_posted_prices(
+        proposal, directive, VENUE, config,
+        sigma2=0.0, confidence_tier=ConfidenceTier.FULL,
+        credibility=1.0, consensus_p=0.5, credibility_widen_scale=0.0,
+        markout_widen_bid=0.01,
+    )
+    assert terms0["floor_applied"] == 1.0
+    assert terms1["floor_applied"] == 1.0
+    assert bid0 == pytest.approx(0.49, abs=1e-6)
+    assert ask0 == pytest.approx(0.51, abs=1e-6)
+    assert bid1 == pytest.approx(0.48, abs=1e-6)
+    assert ask1 == pytest.approx(0.51, abs=1e-6)
+    # The widen's effect is not erased by flooring -- bid visibly moved.
+    assert bid1 < bid0

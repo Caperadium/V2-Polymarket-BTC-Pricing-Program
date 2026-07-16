@@ -1,7 +1,7 @@
 """Spread builder (plan Section 2.5, task S1, contract 4.5).
 
 Composes the final half-spread additively per side, in probability units, from
-six terms, then enforces floor/clamp/quantize/no-cross, in that order:
+seven terms, then enforces floor/clamp/quantize/no-cross, in that order:
 
 1. base arrival markup: 1/k_arrival is a delta_x (log-odds half-spread);
    converted to p-units at the quote center (proposal.r_x) via the EXACT
@@ -26,14 +26,64 @@ six terms, then enforces floor/clamp/quantize/no-cross, in that order:
    (MMConfig.belly_widen_base_p / belly_widen_slope_p_per_day /
    belly_widen_free_days) -- the belly is the model's softest region per
    temp/suitability.md (+4.8c bias at 1-2d growing to +8.6c at 5-7d).
+7. markout-fed widening (package E, 2026-07-15, SIDE-ASYMMETRIC): unlike
+   terms 2/4/5/6 (symmetric, applied to both sides equally), term 7 is two
+   independent quantities -- `markout_widen_bid` off the BUY_YES (our bid)
+   side's measured markout, `markout_widen_ask` off the BUY_NO (our ask)
+   side's -- each the output of `markout_widen()` (clamp(-mk_avg, 0, cap) *
+   scale) applied to `pnl_report.markout_stats_side` at
+   `MMConfig.markout_widen_horizon_s` (60s, deliberately different from
+   sizing's 600s `markout_horizon_s` -- see `markout_widen`'s docstring).
+   Sizing already trusts measured markout (posted-edge/markout Kelly, wave
+   2); this closes the reverse direction -- widen the QUOTE on the side that
+   is measurably getting picked off, mechanically, per the standing doctrine
+   "remaining spread floor cut only against measured fill markouts". Rebate
+   is deliberately NOT netted against the widening (conservative; the
+   accounting layer is display-only everywhere else too). Terms 2/4/5/6/7 are
+   applied to `compute_posted_prices`'s center BEFORE floor/clamp/quantize;
+   `markout_bid`/`markout_ask` land in `terms` as additive audit entries.
 
-Terms 2, 4, 5, 6 are symmetric (applied to bid down / ask up); terms 1 and 3
-are audit-only (already embedded in the proposal's x_bid/x_ask, reported in
-`terms` for decomposition, never added to the widening -- see the term-1
-inline comment). Composition mechanics per plan 2.5: widen -> floor half-spread to
->= 1 tick -> clamp to the venue price band -> tick-quantize (floor bid, ceil
-ask, so quantization never shrinks the spread) -> resolve any crossing left by
-quantization by widening the ask one tick.
+   No-arb PAV repair interaction (accepted, pinned by the plan): term 7 is
+   piecewise-constant across the ladder within a tick (one belly value, one
+   wing value per side), so widening one region's bid while a neighboring
+   region's bid stays put can invert the ladder's non-increasing-bid
+   invariant at a region boundary. The mandatory `LadderHedger.repair` PAV
+   step then pools the violating neighbors to their (weighted) average. This
+   is accepted, not a bug: PAV redistributes widening across the pooled
+   neighbors but never removes net widening (a pool average preserves the
+   sum), and no pooled bid can ever exceed its pre-widening baseline -- for
+   pre-widening monotone bids b0 >= b1 with only b0 widened by w, the pooled
+   average (b0 - w + b1) / 2 <= b0 - w/2 < b0 (symmetric argument for asks,
+   which only ever move UP under widening so a pooled average cannot fall
+   below its pre-widening baseline). Every belly quote still moves in the
+   intended direction post-repair; it just may not carry the FULL local
+   widening amount at a region boundary.
+
+   CHARACTERIZATION (found while implementing package E's required
+   PAV-interaction test, tests/test_mm_harness_ws1.py): the baseline-relative
+   bound above holds unconditionally and is what every consumer of term 7
+   should rely on. Full no-arb RESTORATION (LadderHedger.check().ok == True
+   after one repair() pass) is a SEPARATE, stronger property that is only
+   guaranteed at strike spacing wide enough that the natural adjacent-strike
+   bid gap exceeds markout_widen_cap (true at realistic Polymarket BTC daily
+   spacing with the launch-default cap, confirmed by test). At pathologically
+   tight strike spacing, `LadderHedger.repair()`'s "pool mid via PAV, then
+   reconstruct bid/ask from each market's OWN preserved half-spread" method
+   can leave a residual bid-monotonicity violation even after pooling,
+   because term 7's asymmetric (bid-only or ask-only) widening inflates only
+   the widened market's own half-spread -- confirmed non-convergent even
+   under repeated repair() calls. This is a structural property of
+   `ladder_hedger.py` (out of scope for package E), not something this
+   module works around.
+
+Terms 2, 4, 5, 6, 7 are symmetric-per-side (term 7 asymmetric between bid and
+ask, but each side's amount is applied independently, same as the others);
+terms 1 and 3 are audit-only (already embedded in the proposal's x_bid/x_ask,
+reported in `terms` for decomposition, never added to the widening -- see the
+term-1 inline comment). Composition mechanics per plan 2.5: widen -> floor
+half-spread to >= 1 tick -> clamp to the venue price band -> tick-quantize
+(floor bid, ceil ask, so quantization never shrinks the spread) -> resolve any
+crossing left by quantization by widening the ask one tick.
 """
 from __future__ import annotations
 
@@ -65,6 +115,25 @@ DEFAULT_ROBUST_SCALE: float = 1.0
 # come from measured fill markouts, not guesses.
 DEFAULT_CREDIBILITY_WIDEN_SCALE: float = 0.01  # prob units at credibility=0 (0.02 -> 0.01, 2026-07-11)
 DEFAULT_WING_BASE_P: float = 0.005  # prob units, before confidence-tier scaling (0.01 -> 0.005, 2026-07-11)
+
+
+def markout_widen(mk_avg: Optional[float], scale: float, cap: float) -> float:
+    """Term 7 widening amount for ONE side, off that side's measured markout
+    (package E, 2026-07-15): ``0.0`` if ``mk_avg`` is None (no trusted
+    measurement yet -- degrade to inert, matching every other markout-gated
+    consumer's cold-start behavior), else ``clamp(-mk_avg, 0, cap) * scale``.
+
+    A NEGATIVE ``mk_avg`` (we are measurably getting picked off on this side)
+    widens; a positive or zero ``mk_avg`` (favorable or neutral markout)
+    widens by exactly 0.0 -- this is deliberately one-directional, there is no
+    symmetric "tighten on good markout" branch. Rebate is deliberately NOT
+    netted against ``mk_avg`` here (conservative; consistent with the rest of
+    the maker-rebate accounting layer, which is display-only everywhere else
+    too -- see ``pnl_report``'s "Maker rebates" module docstring section).
+    """
+    if mk_avg is None:
+        return 0.0
+    return max(0.0, min(-mk_avg, cap)) * scale
 
 
 def make_stub_directive(market_id: str, ts: datetime) -> RiskDirective:
@@ -124,13 +193,28 @@ def compute_posted_prices(
     credibility_widen_scale: float = DEFAULT_CREDIBILITY_WIDEN_SCALE,
     wing_base_p: float = DEFAULT_WING_BASE_P,
     tte_days: Optional[float] = None,
+    markout_widen_bid: float = 0.0,
+    markout_widen_ask: float = 0.0,
 ) -> Tuple[float, float, Dict[str, float]]:
-    """Price-building half of build_quote_set (wave 2 W1 split): the six
+    """Price-building half of build_quote_set (wave 2 W1 split): the seven
     additive spread terms plus floor/clamp/quantize/no-cross composition.
     Pure function of (proposal, directive, venue, config, sigma2,
     confidence_tier, credibility, consensus_p) -- no sizing, no QuoteSet.
     Returns (bid_price, ask_price, terms); `terms` is the same audit dict
     build_quote_set has always returned on its QuoteSet.
+
+    `markout_widen_bid` / `markout_widen_ask` (package E, term 7, default
+    0.0 -- byte-identical to pre-package-E behavior): the caller's already-
+    resolved `spread_builder.markout_widen()` output for the BUY_YES (bid)
+    and BUY_NO (ask) side respectively, applied ASYMMETRICALLY (unlike every
+    other term, which widens both sides by the same amount) directly onto
+    the per-side center price below, BEFORE the floor/clamp/quantize steps --
+    the floor step recomputes the center from these already-asymmetric
+    prices, so the center shift survives flooring; when the floor binds, the
+    per-side amounts collapse to a symmetric half-spread around that shifted
+    center, so the directional signal is preserved even in the degenerate
+    case. See module docstring term 7 for the full rationale and the no-arb
+    PAV repair interaction.
     """
     p_lo, p_hi = config.p_clamp
 
@@ -181,8 +265,11 @@ def compute_posted_prices(
 
     p_bid_center = sigmoid(proposal.x_bid, p_lo, p_hi)
     p_ask_center = sigmoid(proposal.x_ask, p_lo, p_hi)
-    bid_price = p_bid_center - widen
-    ask_price = p_ask_center + widen
+    # term 7: markout-fed widening (package E) -- SIDE-ASYMMETRIC, unlike the
+    # symmetric terms above; each side's amount is independently resolved by
+    # the caller via markout_widen() and passed in (default 0.0, inert).
+    bid_price = p_bid_center - (widen + markout_widen_bid)
+    ask_price = p_ask_center + (widen + markout_widen_ask)
 
     half_spread_pre = 0.5 * (ask_price - bid_price)
     half_spread_floored = floor_half_spread(half_spread_pre, venue.tick_size)
@@ -201,6 +288,8 @@ def compute_posted_prices(
         "robust": robust_p,
         "wing": wing_p,
         "belly": belly_p,
+        "markout_bid": markout_widen_bid,
+        "markout_ask": markout_widen_ask,
         "floor_applied": floor_applied,
     }
 

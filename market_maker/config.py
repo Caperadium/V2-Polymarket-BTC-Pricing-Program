@@ -174,6 +174,20 @@ class MMConfig:
     markout_prior_var: float = (2 * 0.0085) ** 2  # uninformed sigma2_edge prior, ~2 AS-buffers wide
     depth_cap_floor_shares: float = 1.0  # depth cap never zeroes size below this (venue min order size)
 
+    # --- markout-fed spread widening (package E, spread term 7, 2026-07-15) ---
+    # Quoting's counterpart to the markout-based sizing haircut above: widen
+    # the posted price on whichever side is measurably getting picked off
+    # (spread_builder.markout_widen), instead of only assuming eps_base
+    # covers adverse selection. See spread_builder module docstring term 7.
+    markout_widen_scale: float = 1.0  # 0 disables the whole term
+    markout_widen_cap: float = 0.05  # hard cap per side, prob units (5c)
+    # 60s: the cleanest pick-off signal (measured -4.2c/-3.9c belly/wing at
+    # 60s, VPS evidence 2026-07-15) -- deliberately DIFFERENT from sizing's
+    # 600s markout_horizon_s above, which measures net edge for Kelly, not
+    # pick-off; 600s folds in slower BTC drift variance that dilutes the
+    # pick-off signal this term is meant to react to.
+    markout_widen_horizon_s: float = 60.0
+
 
 def in_belly_band(p: float, belly_band: Tuple[float, float]) -> bool:
     """Inclusive belly-band membership: belly_lo <= p <= belly_hi.

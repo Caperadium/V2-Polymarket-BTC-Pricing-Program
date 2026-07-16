@@ -82,7 +82,7 @@ from market_maker.liquidity_monitor import LiquidityMonitor
 from market_maker.market_data_client import BookMirror, FeedCapability
 from market_maker.order_lifecycle import OrderLifecycleManager, PaperVenueAdapter, SimClock
 from market_maker.paper_fill_sim import PaperFillSimulator
-from market_maker.pnl_report import markout_stats, tte_bucket_label
+from market_maker.pnl_report import markout_stats, markout_stats_side, tte_bucket_label
 from market_maker.pricer_adapter import build_snapshot
 from market_maker.quote_engine import estimate_sigma_b, make_quote_from_config
 from market_maker.risk_controller import InvBreach, RiskController
@@ -93,7 +93,7 @@ from market_maker.settlement_handler import (
     SettlementHandler,
     settlement_instant_utc,
 )
-from market_maker.spread_builder import build_quote_set, compute_posted_prices
+from market_maker.spread_builder import build_quote_set, compute_posted_prices, markout_widen
 from market_maker.state_store import MMStateStore
 
 logger = logging.getLogger("mm.harness")
@@ -380,13 +380,20 @@ class PaperTradingLoop:
         edges off our OWN posted quote, not the market mid); kept as a
         parameter for signature stability in case a future caller needs it.
 
-        Wave 2 W1/W7 ordering: for each market, build the proposal, then
-        `compute_posted_prices` (the six-term spread builder, computed ONCE),
-        then feed the posted bid/ask into `ContractSizingInput` (both as the
-        capital-at-risk price basis and as the Kelly edge price) plus this
-        tick's resolved markout stats (W6, via `markout_stats`), THEN size
-        the ladder, THEN `build_quote_set(..., posted=...)` so the QuoteSet's
-        prices are exactly the ones sizing used -- never recomputed."""
+        Wave 2 W1/W7 ordering (package E extends this, 2026-07-15): for each
+        market, build the proposal, resolve `region` from `consensus_p_k`,
+        then resolve term 7's per-side markout widening (`markout_stats_side`
+        at `cfg.markout_widen_horizon_s` -> `spread_builder.markout_widen`),
+        then `compute_posted_prices` (the seven-term spread builder, computed
+        ONCE, now including that widening), then feed the posted bid/ask into
+        `ContractSizingInput` (both as the capital-at-risk price basis and as
+        the Kelly edge price) plus this tick's resolved AGGREGATE markout
+        stats (W6, via `markout_stats` at `cfg.markout_horizon_s` -- a
+        deliberately different horizon and a deliberately different
+        aggregate-vs-side-split basis than term 7, see spread_builder module
+        docstring "Deliberate basis inconsistencies"), THEN size the ladder,
+        THEN `build_quote_set(..., posted=...)` so the QuoteSet's prices are
+        exactly the ones sizing used -- never recomputed."""
         cfg = self.config
         now = self.clock.now()
         tte = max(snap.tte_days, 0.0)
@@ -431,15 +438,41 @@ class PaperTradingLoop:
             proposals[m] = prop
 
             consensus_p_k = float(fv.consensus_p[k])
+            # region moved above compute_posted_prices (package E, round-2
+            # review item 4): consensus_p_k is already available here, and
+            # term 7's markout_stats_side lookups (below) need it BEFORE the
+            # single compute_posted_prices call, not after.
+            region = "belly" if in_belly_band(consensus_p_k, cfg.belly_band) else "wing"
+
+            # term 7 (package E): markout-fed widening, resolved per side off
+            # the SIDE-SPLIT markout report (BUY_YES -> bid, BUY_NO -> ask) at
+            # cfg.markout_widen_horizon_s (60s, deliberately different from
+            # sizing's cfg.markout_horizon_s below). A cold/unwired provider
+            # (report is None) degrades both sides to 0.0 widening, same as
+            # the sizing markout fields below.
+            if report is not None:
+                mk_avg_bid_side, _mk_n_bid_side = markout_stats_side(
+                    report, region, tte_bucket, cfg.markout_widen_horizon_s,
+                    Side.BUY_YES, cfg.markout_min_n,
+                )
+                mk_avg_ask_side, _mk_n_ask_side = markout_stats_side(
+                    report, region, tte_bucket, cfg.markout_widen_horizon_s,
+                    Side.BUY_NO, cfg.markout_min_n,
+                )
+            else:
+                mk_avg_bid_side, mk_avg_ask_side = None, None
+            markout_widen_bid = markout_widen(mk_avg_bid_side, cfg.markout_widen_scale, cfg.markout_widen_cap)
+            markout_widen_ask = markout_widen(mk_avg_ask_side, cfg.markout_widen_scale, cfg.markout_widen_cap)
+
             posted = compute_posted_prices(
                 prop, directives[m], self.venue_descriptor, cfg,
                 sigma2=float(snap.sigma2[k]), confidence_tier=snap.confidence_tier,
                 credibility=fv.credibility, consensus_p=consensus_p_k, tte_days=tte,
+                markout_widen_bid=markout_widen_bid, markout_widen_ask=markout_widen_ask,
             )
             posted_by_market[m] = posted
             posted_bid, posted_ask, _terms = posted
 
-            region = "belly" if in_belly_band(consensus_p_k, cfg.belly_band) else "wing"
             if report is not None:
                 mk_avg, mk_var, mk_n, mk_n_attempted = markout_stats(
                     report, region, tte_bucket, cfg.markout_horizon_s, cfg.markout_min_n
