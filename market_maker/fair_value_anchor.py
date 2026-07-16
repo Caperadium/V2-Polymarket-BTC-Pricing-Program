@@ -395,12 +395,25 @@ def compute_fair_value(
                         ratio = consensus_new_bucket[idxs] * pi_prev[idxs] / cprev[idxs]
                     factors[i] = float(np.sum(ratio))
                 if not ok or not np.all(np.isfinite(factors)):
-                    continue  # 3.3: non-finite factor (incl. a zero/degenerate
-                    # divisor restricted to this region's own buckets) -> skip
+                    # 3.3: non-finite factor (incl. a zero/degenerate divisor
+                    # restricted to this region's own buckets) -> skip. Logged
+                    # (review 2026-07-15): a persistently-skipping region means
+                    # its credibility never updates -- exactly the wing-learning
+                    # failure B2 exists to fix -- and must be visible.
+                    logger.debug(
+                        "fair_value_anchor: region %s bankroll update skipped "
+                        "(non-finite factor; a prev-consensus bucket in this "
+                        "region is zero or degenerate)", region,
+                    )
+                    continue
                 w_pre_arr = np.array([weight_dicts_pre[region][mid] for mid in model_ids])
                 updated = w_pre_arr * factors
                 s = updated.sum()
                 if not (s > 0.0 and np.isfinite(s)):
+                    logger.debug(
+                        "fair_value_anchor: region %s bankroll update skipped "
+                        "(factor sum s_R <= 0 or non-finite)", region,
+                    )
                     continue  # 3.3: s_R <= 0 or non-finite -> skip
                 w_upd = _apply_floor(updated / s, floor)
                 new_bankrolls = _weight_dict(w_upd, model_ids)

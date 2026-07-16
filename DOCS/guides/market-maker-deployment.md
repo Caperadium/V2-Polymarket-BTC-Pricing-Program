@@ -71,6 +71,15 @@ round-robin), and the sizing bankroll is statically split as
 `bankroll / max_expiries` per ladder. The existing state db is forward-
 compatible as-is (no schema change).
 
+As of the per-region Beuoy bankroll credibility change (package B2,
+2026-07-15), the state db's `bankrolls` table gains a `region` column. A
+pre-existing db without it is migrated automatically and safely on the next
+start via a guarded `ALTER TABLE ... ADD COLUMN` -- no manual step. On that
+first restart, the `belly` region inherits the ladder's existing (legacy)
+bankroll weights and `wing` resets to 50/50 parity; both regions persist
+independently from then on. See [Market Making](../concepts/market-making.md#45-per-region-credibility-belly-vs-wing)
+for the reasoning.
+
 ## Checking status
 
 ```bash

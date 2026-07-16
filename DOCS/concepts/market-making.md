@@ -262,7 +262,10 @@ which it can earn credibility back.
 
 The pricer's weight is exported as **credibility** in [0, 1]. It is used twice
 downstream: the spread builder widens quotes when credibility is low
-(Section 7, term 4), and it is a first-class monitoring quantity.
+(Section 7, term 4), and it is a first-class monitoring quantity. (Since
+package B2, 2026-07-15, this whole update -- consensus, mark-to-market,
+credibility -- runs independently for two regions rather than once per
+expiry; Section 4.5.)
 
 ### 4.4 Degeneracy and freezing
 
@@ -271,10 +274,12 @@ its sanity bound (per strike it must lie *between* the SANITIZED pricer and
 market ladders -- each raw ladder round-tripped through the bucket transform,
 which repairs non-monotone inputs such as crossed venue mids -- a weighted
 average always does, so a violation means a numeric bug), the anchor falls
-back to a fixed 50/50 blend and **freezes** the bankrolls so garbage ticks
-cannot corrupt the learned weights. The freeze auto-clears after 20
-consecutive clean recomputes. A frozen bankroll is also surfaced in the
-heartbeat and pages the operator (Section 15).
+back to a fixed 50/50 blend and **freezes** the bankrolls (both regions'
+bankrolls together, since package B2 -- a fallback is a whole-ladder event)
+so garbage ticks cannot corrupt the learned weights. The freeze auto-clears
+after 20 consecutive clean recomputes (again, both regions together). A
+frozen bankroll is also surfaced in the heartbeat and pages the operator
+(Section 15).
 
 Why sanitized, not raw (2026-07-14 fix): the consensus is built in bucket
 space from the sanitized ladders, so checking it against the *raw* inputs
@@ -292,6 +297,76 @@ the ladder has a valid mid. On ticks where it cannot recompute, the previous
 fair value is reused -- and its *age* becomes a risk trigger of its own
 (`FAIR_VALUE_STALE`, Section 11), because quoting around a frozen anchor while
 BTC moves is precisely how an MM gets run over.
+
+### 4.5 Per-region credibility (belly vs. wing)
+
+Sections 4.1-4.4 describe *one* scalar credibility per expiry. In practice
+model skill is not uniform across the ladder: a live audit of FV against
+market mid (221k/387k quote snapshots) found the pricer running about +0.8c
+rich in the OTM wings and -2.9c cheap deep ITM, monotone in moneyness, while
+a belly win could still push the pricer's *overall* bankroll weight as high
+as 0.979 (jul-20 ladder) -- one scalar credibility let a belly win buy the
+pricer unchecked authority in exactly the region where it was measurably
+wrong. Package B2 (2026-07-15) splits the single `BankrollState` into two,
+keyed `"belly"`/`"wing"` (`fair_value_anchor.BELLY_REGION`/`WING_REGION`),
+each updated by the identical bankroll mechanics of Section 4.3 but
+restricted to its own region's buckets.
+
+**Region assignment.** Each strike is classified belly or wing from the
+*sanitized market ladder* (the market's own mid, bucket-round-tripped)
+through the same `config.in_belly_band` boundary the spread builder and
+markout report use -- never from the consensus being built (that would be
+self-referential) and never from the pricer (a rich pricer tail must not be
+able to reclassify a strike into the region where it holds more credibility).
+n strikes produce n+1 buckets; the two *tail* buckets (all mass below the
+lowest strike, all mass above the highest) are always `wing`, regardless of
+how the extreme strikes themselves classify -- the open tails are
+definitionally the wings, and on an all-belly-strike ladder they could
+otherwise carry the majority of the mass and pollute belly evidence. Each
+interior bucket takes the region of its left-hand strike.
+
+**Two-phase update, each refresh.** The pre-update per-region weights build
+a ladder-space consensus (below); that consensus becomes buckets and feeds,
+per region, the same Bayes factor as Section 4.3 but summed only over that
+region's own buckets. A region with zero assigned buckets, or whose factor
+sum is non-positive or non-finite, SKIPS its own update entirely -- its
+weights and update count are left unchanged, with no fallback and no freeze
+(tail buckets always belonging to `wing` means only `belly` can ever be
+empty, on an all-wing-strike ladder). Only non-skipped regions renormalize
+and re-floor their weights. The FINAL consensus is then rebuilt with the
+POST-update weights -- that is the tick's fair value.
+
+**Ladder-space consensus.** Each strike's consensus price blends the
+sanitized pricer and market ladders using *that strike's region's* weights,
+then (a) a cummin repair enforcing non-increasing values, THEN (b) a
+pointwise clamp into the sanity band of Section 4.4. Order matters here:
+clamping before repairing can push values back out of band, while repairing
+first and clamping second keeps the result monotone and in-band by
+construction -- so the Section 4.4 sanity check still passes by construction
+and remains a pure numeric safety net.
+
+**Credibility.** `FairValue.credibility_by_region` carries both regions'
+pricer weights; the legacy scalar `FairValue.credibility` becomes a
+strike-count-weighted average of the two, so every existing consumer that
+reads `credibility` keeps working unchanged. The spread builder's term 4
+robust widening (Section 7) and term 7's per-side harness wiring both look
+up the region-appropriate credibility for each strike.
+
+**Resume and seeding.** On resume, a state db already carrying per-region
+bankroll rows loads each directly. A state db carrying only the pre-B2
+legacy (single, unkeyed) row -- the first restart after this deploy --
+seeds `belly` from those legacy bankrolls (its credibility was legitimately
+earned) and resets `wing` to 50/50 parity (the measured wing bias says that
+authority was not legitimately earned; parity is the honest prior). A
+brand-new expiry still starts both regions at 50/50.
+
+This is a mitigation of the measured skew, not a fix for it: Beuoy marks
+bankrolls to the *consensus*, not to realized settlement, so even at wing
+parity the wing consensus still carries roughly half the pricer's own
+richness. The root fix is pricer tail recalibration (out of scope here);
+package B2 only stops one scalar from giving the pricer unchecked authority
+in the region it is worst at, and spread term 7 (Section 7) covers the
+residual at the quote layer.
 
 ---
 
@@ -403,8 +478,8 @@ model-quality charges are added.
 ## 7. The spread builder: charging for everything else
 
 `spread_builder.build_quote_set` takes the proposal and composes the final
-half-spread **additively in probability units** from six terms, then makes the
-result venue-legal. Additive composition is a feature: every fill's spread can
+half-spread **additively in probability units** from seven terms, then makes
+the result venue-legal. Additive composition is a feature: every fill's spread can
 be decomposed after the fact into named charges (`QuoteSet.terms`), so
 calibration can later answer "which charge earns and which just blocks flow?".
 
@@ -416,6 +491,7 @@ calibration can later answer "which charge earns and which just blocks flow?".
 | 4 | Robust widening | Estimator uncertainty + low pricer credibility | applied |
 | 5 | Wing widening | Model tail-quality, outside the belly band | applied |
 | 6 | Belly widening | Model belly bias, inside the belly band | applied |
+| 7 | Markout-fed widening | Measured pick-off on this side, per side | applied |
 
 Terms 1 and 3 are **audit-only** because they are already embedded in the
 proposal's x_bid/x_ask from Section 6 -- the builder reports their price-space
@@ -440,13 +516,40 @@ The applied terms:
       analysis measured the pricer's belly bias at about +4.8 cents at 1-2
       days growing to +8.6 cents at 5-7 days, so the belly charge grows with
       horizon to cover roughly the un-shared half of that bias.
+- **Term 7** (package E, 2026-07-15): side-asymmetric, fed by measured fill
+  markout rather than a constant. For each side independently,
+  `spread_builder.markout_widen(mk_avg, scale, cap) = clamp(-mk_avg, 0,
+  cap) * scale`: a negative average markout (this side is measurably
+  getting picked off) widens that side only, up to a 5-cent cap; a flat or
+  favorable markout adds nothing -- there is deliberately no symmetric
+  "tighten on good markout" branch. `mk_avg` comes from the markout report's
+  per-side breakdown (Section 14.2) at a *60-second* horizon -- shorter than
+  sizing's 600-second `markout_horizon_s` on purpose, since 60s is the
+  cleanest pick-off signal and 600s starts folding in ordinary BTC drift
+  variance -- and is trusted only once that side has `markout_min_n` (20)
+  fills. Because term 7 is piecewise-constant across the ladder (one belly
+  value, one wing value, per side), widening a belly bid while a
+  neighboring wing bid stays put can invert the non-increasing-bid
+  invariant right at the region boundary; the mandatory PAV repair (Section
+  9.1) then pools the violating neighbors to their average. This is
+  accepted, not a bug: a pool average can never exceed its pre-widening
+  value, so every widened quote still moves in the intended direction
+  post-repair, it just may not carry the full local widening amount right
+  at a boundary. The term is self-resetting: the markout report is a
+  rolling 7-day window, so if wider quotes stop the toxic fills entirely,
+  those fills age out, the side's `n` drops back below `markout_min_n`, the
+  term reverts to zero, and quotes re-tighten -- no separate decay
+  machinery needed.
 
-Then mechanics, in strict order: widen both sides symmetrically -> floor the
-half-spread at one tick -> clamp into the venue price band -> quantize to the
-tick grid, *flooring* the bid and *ceiling* the ask so rounding can only ever
-widen -> if quantization still crossed the quotes, push the ask up one tick.
-Finally the risk directive's mode is applied to sizes: BID_ONLY zeroes the
-ask, ASK_ONLY the bid, PULLED both.
+Then mechanics, in strict order: widen each side (terms 2/4/5/6
+symmetrically, term 7 asymmetrically per side -- the shift this can put on
+the quote *center* survives the next step, since the floor step recomputes
+the center from the already-asymmetric prices) -> floor the half-spread at
+one tick -> clamp into the venue price band -> quantize to the tick grid,
+*flooring* the bid and *ceiling* the ask so rounding can only ever widen ->
+if quantization still crossed the quotes, push the ask up one tick. Finally
+the risk directive's mode is applied to sizes: BID_ONLY zeroes the ask,
+ASK_ONLY the bid, PULLED both.
 
 ---
 
@@ -636,7 +739,10 @@ in this order:
   NO cannot push a short position past its cap). Wires the inventory manager's
   live position into sizing itself, closing a prior gap where sizing was
   inventory-blind and only the risk controller's one-sided/pull rules reacted
-  to a breach *after* it happened.
+  to a breach *after* it happened. This q_max is the same S'(x)-based cap of
+  Section 10 and is untouched by the package D breach-metric change (Section
+  11) -- only the risk controller's own breach *trigger* is now risk-based,
+  not this headroom cap.
 - **Depth cap, floored at a minimum restorable size.** Each side's size is
   also bounded by `max(realized_depth, depth_cap_floor_shares)` -- the
   liquidity monitor's realized displayed depth (Section 11.2), never allowed
@@ -742,8 +848,11 @@ Conventions worth knowing:
   cap is largest at p = 0.5 and shrinks toward the extremes. The reasoning:
   near p = 0.99 a position has little left to earn (at most a cent per
   share) but can still lose everything on a late gap through the strike --
-  the worst asymmetry an MM can hold into settlement. Cap breach ratios
-  (|q|/q_max) feed the risk controller (Section 11).
+  the worst asymmetry an MM can hold into settlement. This q_max still
+  bounds the sizing headroom cap (Section 8.2) unchanged. The risk
+  controller's breach *trigger*, however, no longer compares against it
+  directly -- see Section 11 for the risk-based metric that replaced the
+  |q|/q_max ratio (package D, 2026-07-15).
 - `mark(now)` runs every tick so age-weighted holding accrues between fills --
   stale inventory is itself a risk signal.
 
@@ -763,7 +872,7 @@ independent:
 | Vol gate | BTC realized-vol shock or extreme regime (via `core/strategy/vol_gate.py`) | PULLED; "high" regime widens instead (eps_add += edge_add_cents/100) |
 | Near resolution | tte < `near_resolution_pull_hours` (6 h since the 2026-07-11 recal) | PULLED -- endgame binaries are gamma bombs |
 | Gap-through | spot within 0.5% of strike while vol elevated | PULLED |
-| Inventory breach | \|q\| >= q_max | one-sided *away* from the breach (long -> ASK_ONLY, i.e. only offer to sell down) at ANY breach ratio -- never PULLED (2026-07-14 stranded-inventory fix; the ratio > 1.5 "extreme" threshold no longer changes the mode) |
+| Inventory breach | remaining-loss notional L / cap >= 1, where L = q * p_consensus (long) or \|q\| * (1 - p_consensus) (short), cap = inv_loss_cap_frac (10%) x ladder bankroll | one-sided *away* from the breach (long -> ASK_ONLY, i.e. only offer to sell down) at ANY ratio -- never PULLED (2026-07-14 stranded-inventory fix, mode unchanged; metric replaced 2026-07-15 by package D, below) |
 | Feed dead | WebSocket unhealthy | PULLED + mandatory cancel_all |
 | Pricer stale | snapshot age > 300 s / > 600 s | widen / PULLED |
 | Fair value stale | consensus age > 300 s / > 600 s | widen / PULLED |
@@ -791,6 +900,27 @@ DEPTH cap floor (1 share) means the position drains gradually. Feed-dead,
 near-resolution, staleness, vol-shock and manual pulls are deliberately
 unchanged -- those are states where no quote can be trusted, and inventory
 parked by them is surfaced by the heartbeat's stranded metric instead.
+
+Package D (2026-07-15) redefined the breach *metric* itself, leaving the
+mode logic above untouched. The old |q|/q_max ratio inherited q_max's
+wing-shrinking shape (Section 10), so a large wing position could show an
+alarming ratio while carrying almost no real risk: 70k jul-20 at q=14.3
+against q_max=4.57 read as a 3.1x breach while its remaining-loss notional
+was about $0.72. The controller now compares each position's dollar
+mark-to-worst-outcome loss -- `q * p_consensus` if long YES (marks to 0 on a
+NO settlement) or `|q| * (1 - p_consensus)` if short (marks to 1 on a YES
+settlement) -- against `config.inv_loss_cap_frac * bankroll` (10% of the
+loop's sizing bankroll by default; a `cap <= 0` bankroll/frac skips breach
+detection entirely rather than dividing by it). `is_long` still comes from
+the raw signed q, with no hedge adjustment in this phase: rule (c) here and
+rule (f) (the liquidity-degenerate reduce-only rule above) must keep
+deriving their one-sided direction from the same signed quantity, or the
+most-restrictive combination would escalate two opposite one-sided modes to
+PULLED and reopen the 2026-07-14 stranding bug -- a hedge-aware version is
+deferred to a follow-up. Sizing's own inventory headroom cap (Section 8.2)
+is untouched by this change and still uses the old S'(x)-based q_max, a
+separate and deliberately conservative risk decision; only the risk
+controller's breach *trigger* is now risk-based.
 
 Note the graduated pattern that recurs: **widen first, pull at 2x**. Widening
 keeps earning (at a higher charge) through mild degradation; pulling forfeits
@@ -928,6 +1058,19 @@ fills" is distinguishable from "mids missing". This table is the primary
 input to the post-acceptance spread recalibration: per-cell, spreads should
 cover realized adverse selection, and cells that never fill are charging too
 much.
+
+Package E (2026-07-15) added a per-side breakdown for quoting to consume:
+every cell, and every `by_region` rollup, gains an additive `"sides"` key --
+`{"BUY_YES": {n, n_attempted, mk_avg, mk_var}, "BUY_NO": {...}}` -- populated
+in exact lockstep with the aggregate figures (BUY_YES fills are our bid
+side, BUY_NO our ask side; fills are recorded YES-scale on both sides).
+`pnl_report.markout_stats_side` resolves one side's numbers with the same
+fallback order as the aggregate `markout_stats` -- exact cell, then region
+rollup, then `(None, 0)` if both are thin -- and degrades to `(None, 0)`
+rather than raising on a malformed report. This is what feeds spread term 7
+(Section 7): the harness looks up each side's `mk_avg` at a 60-second
+horizon and turns a measurably negative one into extra width on exactly
+that side.
 
 The report is written to `markout_report.json` on a fixed cadence and rendered
 read-only in the monitoring dashboard (`app/pages/mm_monitor.py`).

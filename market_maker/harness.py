@@ -512,7 +512,7 @@ class PaperTradingLoop:
             # review item 4): consensus_p_k is already available here, and
             # term 7's markout_stats_side lookups (below) need it BEFORE the
             # single compute_posted_prices call, not after.
-            region = "belly" if in_belly_band(consensus_p_k, cfg.belly_band) else "wing"
+            region = BELLY_REGION if in_belly_band(consensus_p_k, cfg.belly_band) else WING_REGION
 
             # term 7 (package E): markout-fed widening, resolved per side off
             # the SIDE-SPLIT markout report (BUY_YES -> bid, BUY_NO -> ask) at
@@ -542,7 +542,7 @@ class PaperTradingLoop:
             # market-mid region map (a deliberate, documented basis
             # inconsistency, see fair_value_anchor / spread_builder docs).
             region_credibility = (
-                fv.credibility_by_region[region]
+                fv.credibility_by_region.get(region, fv.credibility)
                 if fv.credibility_by_region is not None else fv.credibility
             )
 
