@@ -126,6 +126,40 @@ def test_no_requote_inside_tolerance(mgr, venue, store):
     assert len(venue.calls) == 2  # unchanged -- no new submit/cancel
 
 
+def test_one_tick_flap_holds_resting_order(mgr, venue, store):
+    # Boundary-flap deadband (2026-07-16): a quantized price flapping by
+    # exactly one tick (0.01) must NOT cancel/repost -- the resting order
+    # keeps its queue position. Desired oscillates 0.40 <-> 0.41; resting
+    # order stays at 0.40 throughout.
+    mgr.apply("mkt-1", _quote(seq=1, bid=0.40, ask=0.45), _risk())
+    n_after_first = len(venue.calls)
+
+    mgr.apply("mkt-1", _quote(seq=2, bid=0.41, ask=0.45), _risk())  # +1 tick
+    mgr.apply("mkt-1", _quote(seq=3, bid=0.40, ask=0.45), _risk())  # back
+    mgr.apply("mkt-1", _quote(seq=4, bid=0.41, ask=0.45), _risk())  # +1 tick again
+    assert len(venue.calls) == n_after_first  # no cancels, no reposts
+
+    live = [o for o in store.get_all_orders() if o.status in ("PENDING", "LIVE")]
+    assert len(live) == 2
+    bid_order = next(o for o in live if o.side == Side.BUY_YES)
+    assert bid_order.price == pytest.approx(0.40)
+
+
+def test_two_tick_move_reposts(mgr, venue, store):
+    # The deadband is exactly one tick wide: a 2-tick move (0.40 -> 0.42)
+    # exceeds requote_price_tol (0.015) and must cancel + repost.
+    mgr.apply("mkt-1", _quote(seq=1, bid=0.40, ask=0.45), _risk())
+    mgr.apply("mkt-1", _quote(seq=2, bid=0.42, ask=0.45), _risk())
+    cancels = [c for c in venue.calls if c[0] == "cancel"]
+    submits = [c for c in venue.calls if c[0] == "submit"]
+    assert len(cancels) == 1  # bid only; ask untouched
+    assert len(submits) == 3  # 2 original + 1 replacement bid
+
+    live = [o for o in store.get_all_orders() if o.status in ("PENDING", "LIVE")]
+    bid_order = next(o for o in live if o.side == Side.BUY_YES)
+    assert bid_order.price == pytest.approx(0.42)
+
+
 def test_requote_outside_tolerance_replaces(mgr, venue, store):
     mgr.apply("mkt-1", _quote(), _risk())
     assert len([c for c in venue.calls if c[0] == "submit"]) == 2

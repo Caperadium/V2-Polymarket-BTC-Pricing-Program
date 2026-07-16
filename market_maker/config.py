@@ -148,7 +148,17 @@ class MMConfig:
     min_ladder_width_for_ladder_machinery: int = 3  # min strikes to enable ladder-level machinery (launch default)
 
     # --- requote tolerances (plan 2.11): no re-quote inside tolerance ---
-    requote_price_tol: float = 0.005  # price units (launch default)
+    # 0.015 = a 1-tick deadband (2026-07-16 boundary-flap fix): quantized
+    # prices only ever move in whole ticks (0.01), so the old 0.005 was dead
+    # for price -- every 1-tick rounding flap (raw price hovering on an exact
+    # tick boundary + sub-tick consensus jitter through spread_builder's
+    # _quantize outward floor/ceil) cancelled+reposted the order each tick,
+    # losing paper-sim queue position at 15s cadence (observed live 2026-07-16
+    # on 64k jul-17: ask 0.80<->0.81 square wave, all spread terms frozen).
+    # With 0.015 a 1-tick flap holds the resting order (queue kept); a
+    # >=2-tick move still reposts, so the resting order lags the desired
+    # price by at most 1 tick, transiently.
+    requote_price_tol: float = 0.015  # price units; keep strictly between 1 and 2 venue ticks
     requote_size_tol: float = 0.10  # fractional size change (launch default)
 
     # --- state-store retention (plan Section 5 / Wave 0 W0.2) ---

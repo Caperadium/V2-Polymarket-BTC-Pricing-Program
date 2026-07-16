@@ -960,9 +960,21 @@ activate later with data.
 
 `order_lifecycle.py` turns the final QuoteSet + directive into venue actions
 with minimal churn: an existing order within the re-quote tolerances (price
-within 0.005, size within 10%) is left alone -- every needless cancel/replace
+within 0.015, size within 10%) is left alone -- every needless cancel/replace
 surrenders queue position, which under the fill simulator's queue-behind rule
-(next section) is the MM's most valuable asset. A side whose size is below
+(next section) is the MM's most valuable asset. The price tolerance is a
+deliberate 1-tick deadband (raised from 0.005, 2026-07-16): quantized prices
+only ever move in whole 0.01 ticks, so any sub-tick tolerance is dead for
+price -- a raw price hovering on an exact tick boundary plus sub-tick
+consensus jitter through `_quantize`'s outward floor/ceil produced a 1-tick
+square wave (observed live: ask 0.80<->0.81 at 15s cadence with every spread
+term frozen), cancelling and reposting the order each tick. With the deadband
+a 1-tick flap holds the resting order and its queue position; a >=2-tick move
+still reposts, bounding the resting order's lag behind the desired price at
+one tick. Trade-off accepted: a resting order may transiently sit 1 tick
+tighter than the desired price, and cross-strike no-arb is only guaranteed
+between DESIRED ladders (PAV repair) -- two resting orders each lagging 1
+tick toward each other could transiently violate it by up to 2 ticks. A side whose size is below
 the venue's minimum order size (`VenueDescriptor.min_size`, threaded in by
 the harness as `min_order_size`, 2026-07-15) is treated as no-quote -- a live
 venue would reject it, so the paper path does not post it either, and a
