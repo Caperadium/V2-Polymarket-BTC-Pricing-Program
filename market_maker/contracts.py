@@ -216,10 +216,18 @@ class FairValue:
     anchor_method: AnchorMethod
     inputs_ts: Tuple[datetime, datetime]  # (pricer snapshot ts, market state ts)
     skew_correction: Optional[Dict[float, float]] = None  # None in build one
+    # Package B2 (2026-07-15), additive: per-region ("belly"/"wing") pricer
+    # credibility, alongside the legacy scalar `credibility` (the strike-
+    # count-weighted average of the two). None for the FIXED_BLEND_FALLBACK
+    # path, where a region split is not meaningful.
+    credibility_by_region: Optional[Dict[str, float]] = None
 
     def __post_init__(self) -> None:
         _require_prob_dict("consensus_p", self.consensus_p)
         _require_unit("credibility", self.credibility)
+        if self.credibility_by_region is not None:
+            for k, v in self.credibility_by_region.items():
+                _require_unit("credibility_by_region[" + repr(k) + "]", v)
 
 
 # ---------------------------------------------------------------------------

@@ -664,7 +664,11 @@ def test_bankroll_auto_unfreezes_after_n_clean_beuoy_ticks(store):
     )
     loop.tick(_moving_books(MARKETS, 0.0))  # warm up so fv is not None
 
-    loop.bankroll_state.frozen = True
+    # bankroll_state is a read-only property (package B2) -- mutate the real
+    # per-region state dict directly, both regions in lockstep (a fallback
+    # freezes both; so does this test's manual freeze-simulation).
+    for state in loop.bankroll_states.values():
+        state.frozen = True
     loop._clean_beuoy_streak = 0
 
     for i in range(unfreeze_n - 1):
@@ -1578,3 +1582,94 @@ def test_markout_widen_belly_only_pav_pooled_bids_stay_within_baseline_bounds(tm
     finally:
         store_control.close()
         store_treatment.close()
+
+
+# ---------------------------------------------------------------------------
+# Package B2 -- per-region bankroll resume/seed policy (plan step 10)
+# ---------------------------------------------------------------------------
+
+
+def test_resume_bankroll_states_fresh_db_both_regions_parity(store):
+    from market_maker.fair_value_anchor import BELLY_REGION, WING_REGION
+    from market_maker.harness import _resume_bankroll_states
+
+    states = _resume_bankroll_states(store, EXPIRY, START)
+    for region in (BELLY_REGION, WING_REGION):
+        assert states[region].bankrolls == {"pricer": 0.5, "market": 0.5}
+        assert states[region].frozen is False
+        assert states[region].update_count == 0
+
+
+def test_resume_bankroll_states_legacy_only_seeds_belly_wing_parity(store):
+    # plan step 10 REQUIRED TEST: legacy-only db -> belly == legacy values,
+    # wing == parity, nothing frozen, no rows lost.
+    from market_maker.contracts import BankrollState
+    from market_maker.fair_value_anchor import BELLY_REGION, WING_REGION
+    from market_maker.harness import _resume_bankroll_states
+
+    legacy = BankrollState(
+        model_ids=["pricer", "market"], bankrolls={"pricer": 0.83, "market": 0.17},
+        last_update=START, update_count=42, frozen=False,
+    )
+    store.append_bankroll_state(EXPIRY, legacy, region="")  # pre-B2 single row
+
+    states = _resume_bankroll_states(store, EXPIRY, START)
+    assert states[BELLY_REGION].bankrolls == legacy.bankrolls
+    assert states[BELLY_REGION].update_count == legacy.update_count
+    assert states[BELLY_REGION].frozen is False
+    assert states[WING_REGION].bankrolls == {"pricer": 0.5, "market": 0.5}
+    assert states[WING_REGION].frozen is False
+    assert states[WING_REGION].update_count == 0
+
+
+def test_resume_bankroll_states_per_region_rows_present_loads_each(store):
+    from market_maker.contracts import BankrollState
+    from market_maker.fair_value_anchor import BELLY_REGION, WING_REGION
+    from market_maker.harness import _resume_bankroll_states
+
+    belly = BankrollState(
+        model_ids=["pricer", "market"], bankrolls={"pricer": 0.7, "market": 0.3},
+        last_update=START, update_count=5, frozen=False,
+    )
+    wing = BankrollState(
+        model_ids=["pricer", "market"], bankrolls={"pricer": 0.35, "market": 0.65},
+        last_update=START, update_count=3, frozen=True,
+    )
+    store.append_bankroll_state(EXPIRY, belly, region=BELLY_REGION)
+    store.append_bankroll_state(EXPIRY, wing, region=WING_REGION)
+
+    states = _resume_bankroll_states(store, EXPIRY, START)
+    assert states[BELLY_REGION].bankrolls == belly.bankrolls
+    assert states[WING_REGION].bankrolls == wing.bankrolls
+    assert states[WING_REGION].frozen is True
+
+
+def test_restart_resumes_per_region_bankrolls_via_harness(tmp_path):
+    """Integration-level check (plan step 10) at the actual harness.restart()
+    call site: a legacy-only bankrolls row (as if written by pre-B2 code)
+    seeds belly from it and wing at parity on the next restart, and nothing
+    is frozen."""
+    from market_maker.contracts import BankrollState
+    from market_maker.fair_value_anchor import BELLY_REGION, WING_REGION
+
+    db_path = str(tmp_path / "resume_b2.db")
+    store1 = MMStateStore(db_path)
+    legacy = BankrollState(
+        model_ids=["pricer", "market"], bankrolls={"pricer": 0.9, "market": 0.1},
+        last_update=START, update_count=7, frozen=False,
+    )
+    store1.append_bankroll_state(EXPIRY, legacy, region="")
+    store1.close()
+
+    store2 = MMStateStore(db_path)
+    try:
+        loop = PaperTradingLoop(
+            store=store2, expiry_key=EXPIRY, markets=MARKETS, engine_fn=_engine(),
+            config=MMConfig(gamma=0.5), clock=SimClock(START), vol_gate_fn=_vol_gate(),
+        )
+        loop.restart()
+        assert loop.bankroll_states[BELLY_REGION].bankrolls == legacy.bankrolls
+        assert loop.bankroll_states[WING_REGION].bankrolls == {"pricer": 0.5, "market": 0.5}
+        assert loop.bankroll_state.frozen is False  # nothing frozen
+    finally:
+        store2.close()

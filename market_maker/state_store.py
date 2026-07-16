@@ -338,6 +338,12 @@ class MMStateStore:
                 """
             )
             self._conn.execute(
+                # Package B2 (2026-07-15): per-region bankrolls. `region` is
+                # included in the CREATE for fresh DBs; existing DBs (the VPS
+                # mm_paper_state.db) are migrated just below via a guarded
+                # ALTER TABLE, run AFTER this CREATE (so a fresh DB already
+                # has the column before the PRAGMA probes it -- round-2
+                # review item 5 ordering).
                 """
                 CREATE TABLE IF NOT EXISTS bankrolls (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -346,12 +352,30 @@ class MMStateStore:
                     bankrolls TEXT NOT NULL,
                     last_update TEXT NOT NULL,
                     update_count INTEGER NOT NULL,
-                    frozen INTEGER NOT NULL
+                    frozen INTEGER NOT NULL,
+                    region TEXT NOT NULL DEFAULT ''
                 )
                 """
             )
+            # Guarded migration (plan B2 step 9, review item 2 BLOCKER
+            # resolution): the first ALTER-TABLE precedent in this module.
+            # NOT NULL + DEFAULT '' backfills legacy rows with '' (never
+            # NULL) so the legacy read path (region='') matches exactly.
+            bankroll_cols = {
+                row["name"] for row in self._conn.execute("PRAGMA table_info(bankrolls)")
+            }
+            if "region" not in bankroll_cols:
+                self._conn.execute(
+                    "ALTER TABLE bankrolls ADD COLUMN region TEXT NOT NULL DEFAULT ''"
+                )
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_bankrolls_expiry ON bankrolls(expiry_key)"
+            )
+            # Composite index for per-region lookups (append_bankroll_state /
+            # get_latest_bankroll_state / get_bankroll_history all filter on
+            # both columns once region is passed).
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_bankrolls_expiry_region ON bankrolls(expiry_key, region)"
             )
             self._conn.execute(
                 """
@@ -988,16 +1012,19 @@ class MMStateStore:
     # bankrolls (append-only versions per expiry)
     # ------------------------------------------------------------------
 
-    def append_bankroll_state(self, expiry_key: str, state: BankrollState) -> int:
+    def append_bankroll_state(self, expiry_key: str, state: BankrollState, region: str = "") -> int:
+        """`region` (package B2, additive): '' preserves the legacy single-
+        scalar-bankroll row shape; callers migrating to per-region bankrolls
+        pass "belly"/"wing" (fair_value_anchor.BELLY_REGION/WING_REGION)."""
         with self._conn:
             cur = self._conn.execute(
                 """
-                INSERT INTO bankrolls (expiry_key, model_ids, bankrolls, last_update, update_count, frozen)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO bankrolls (expiry_key, model_ids, bankrolls, last_update, update_count, frozen, region)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     expiry_key, _to_json(state.model_ids), _to_json(state.bankrolls),
-                    _dt_to_iso(state.last_update), state.update_count, int(state.frozen),
+                    _dt_to_iso(state.last_update), state.update_count, int(state.frozen), region,
                 ),
             )
             return int(cur.lastrowid)
@@ -1011,16 +1038,17 @@ class MMStateStore:
             frozen=bool(row["frozen"]),
         )
 
-    def get_latest_bankroll_state(self, expiry_key: str) -> Optional[BankrollState]:
+    def get_latest_bankroll_state(self, expiry_key: str, region: str = "") -> Optional[BankrollState]:
         row = self._conn.execute(
-            "SELECT * FROM bankrolls WHERE expiry_key = ? ORDER BY id DESC LIMIT 1",
-            (expiry_key,),
+            "SELECT * FROM bankrolls WHERE expiry_key = ? AND region = ? ORDER BY id DESC LIMIT 1",
+            (expiry_key, region),
         ).fetchone()
         return None if row is None else self._bankroll_from_row(row)
 
-    def get_bankroll_history(self, expiry_key: str) -> List[BankrollState]:
+    def get_bankroll_history(self, expiry_key: str, region: str = "") -> List[BankrollState]:
         rows = self._conn.execute(
-            "SELECT * FROM bankrolls WHERE expiry_key = ? ORDER BY id ASC", (expiry_key,)
+            "SELECT * FROM bankrolls WHERE expiry_key = ? AND region = ? ORDER BY id ASC",
+            (expiry_key, region),
         ).fetchall()
         return [self._bankroll_from_row(r) for r in rows]
 

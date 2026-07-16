@@ -402,8 +402,12 @@ def test_per_expiry_beuoy_bankroll_rows(store):
     orch.startup(NOW0, [("ev-a", EXPIRY_A, LADDER_A), ("ev-b", EXPIRY_B, LADDER_B)],
                  db_existed=False)
     _ticks(orch, 3)
-    assert store.get_latest_bankroll_state(EXPIRY_A) is not None
-    assert store.get_latest_bankroll_state(EXPIRY_B) is not None
+    # Package B2: bankroll rows are per-region ("belly"/"wing"); the legacy
+    # region='' row is never written by the harness anymore.
+    assert store.get_latest_bankroll_state(EXPIRY_A, region="belly") is not None
+    assert store.get_latest_bankroll_state(EXPIRY_A, region="wing") is not None
+    assert store.get_latest_bankroll_state(EXPIRY_B, region="belly") is not None
+    assert store.get_latest_bankroll_state(EXPIRY_B, region="wing") is not None
 
 
 def test_past_instant_skipped_slot_still_settles(store):

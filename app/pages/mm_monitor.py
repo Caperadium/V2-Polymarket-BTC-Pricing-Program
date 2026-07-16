@@ -80,6 +80,17 @@ JOIN (SELECT market_id, MAX(id) AS mid FROM liquidity_windows GROUP BY market_id
 ON l.id = x.mid
 """
 SETTLEMENTS_SQL = "SELECT * FROM settlements"
+# Package B2 (2026-07-15): one row per (expiry_key, region) -- region is
+# "belly"/"wing" for the current harness; a legacy region='' row can still
+# exist from before the migration but is not surfaced here (superseded).
+BANKROLLS_LATEST_SQL = """
+SELECT b.* FROM bankrolls b
+JOIN (
+    SELECT expiry_key, region, MAX(id) AS mid FROM bankrolls
+    WHERE region IN ('belly', 'wing') GROUP BY expiry_key, region
+) x ON b.id = x.mid
+ORDER BY b.expiry_key, b.region
+"""
 
 st.set_page_config(page_title="MM Monitor", layout="wide")
 
@@ -617,6 +628,36 @@ def render_risk_panel(db_path: Optional[Path]) -> None:
         st.dataframe(settle_df, use_container_width=True, hide_index=True)
 
 
+def render_bankrolls(db_path: Optional[Path]) -> None:
+    """Beuoy bankroll-credibility panel, one row per (expiry_key, region)
+    (package B2, 2026-07-15): the anchor tracks two independent bankrolls
+    per expiry ("belly"/"wing") instead of one scalar, so the market can
+    regain wing weight where the pricer is measurably rich in the tails.
+    Read-only; the harness is the sole writer (`append_bankroll_state`)."""
+    df, err = load_db_table(db_path, BANKROLLS_LATEST_SQL)
+    if err:
+        st.info(err)
+        return
+    if df is None or df.empty:
+        st.info("no per-region bankrolls rows yet")
+        return
+    out = df.copy()
+
+    def _pricer_share(s: Any) -> float:
+        try:
+            d = json.loads(s)
+            return float(d.get("pricer", float("nan")))
+        except (TypeError, ValueError):
+            return float("nan")
+
+    out["pricer_credibility"] = out["bankrolls"].apply(_pricer_share)
+    out["frozen"] = out["frozen"].astype(bool)
+    st.dataframe(
+        out[["expiry_key", "region", "pricer_credibility", "update_count", "frozen", "last_update"]],
+        use_container_width=True, hide_index=True,
+    )
+
+
 def render_markout(out_dir: Optional[Path]) -> None:
     """Read-only render of <out_dir>/markout_report.json (mm_suitability_
     alignment_plan.md Change C5) -- per-region/tte-bucket/horizon markout
@@ -762,6 +803,9 @@ def main() -> None:
 
     st.header("Risk")
     render_risk_panel(db_path)
+
+    st.header("Bankroll credibility (Beuoy, per region)")
+    render_bankrolls(db_path)
 
     st.header("Quotes / Latency")
     render_quotes_latency(out_dir)

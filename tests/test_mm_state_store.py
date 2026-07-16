@@ -339,6 +339,88 @@ def test_bankrolls_round_trip_and_append_only_versions(store):
     assert history == [b1, b2]
 
 
+def test_bankrolls_per_region_round_trip(store):
+    # Package B2: region is an additive arg, default '' preserves the legacy
+    # single-scalar shape (test above); "belly"/"wing" rows are independent
+    # append-only streams keyed on (expiry_key, region).
+    belly = BankrollState(
+        model_ids=["pricer", "market"], bankrolls={"pricer": 0.7, "market": 0.3},
+        last_update=NOW, update_count=1, frozen=False,
+    )
+    wing = BankrollState(
+        model_ids=["pricer", "market"], bankrolls={"pricer": 0.4, "market": 0.6},
+        last_update=NOW, update_count=1, frozen=False,
+    )
+    store.append_bankroll_state("2026-07-20", belly, region="belly")
+    store.append_bankroll_state("2026-07-20", wing, region="wing")
+
+    assert store.get_latest_bankroll_state("2026-07-20", region="belly") == belly
+    assert store.get_latest_bankroll_state("2026-07-20", region="wing") == wing
+    # The legacy region='' stream is untouched by per-region writes.
+    assert store.get_latest_bankroll_state("2026-07-20") is None
+
+    assert store.get_bankroll_history("2026-07-20", region="belly") == [belly]
+    assert store.get_bankroll_history("2026-07-20", region="wing") == [wing]
+
+
+def test_bankrolls_migration_adds_region_column_to_pre_migration_db(tmp_path):
+    # Guarded migration (plan B2 step 9, review item 2 BLOCKER resolution):
+    # a pre-existing DB written before the region column existed must gain
+    # it on the next MMStateStore open, WITHOUT losing the legacy row (which
+    # must remain readable at region='').
+    import sqlite3
+
+    db_path = str(tmp_path / "pre_migration.db")
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE bankrolls (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                expiry_key TEXT NOT NULL,
+                model_ids TEXT NOT NULL,
+                bankrolls TEXT NOT NULL,
+                last_update TEXT NOT NULL,
+                update_count INTEGER NOT NULL,
+                frozen INTEGER NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO bankrolls (expiry_key, model_ids, bankrolls, last_update, update_count, frozen) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                "2026-07-20", '["pricer", "market"]', '{"pricer": 0.5, "market": 0.5}',
+                NOW.isoformat(), 3, 0,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    store = MMStateStore(db_path)
+    try:
+        cols = {row["name"] for row in store._conn.execute("PRAGMA table_info(bankrolls)")}
+        assert "region" in cols
+
+        legacy = store.get_latest_bankroll_state("2026-07-20")  # region='' default
+        assert legacy is not None
+        assert legacy.bankrolls == {"pricer": 0.5, "market": 0.5}
+        assert legacy.update_count == 3
+
+        # Per-region round-trip still works after the migration.
+        belly = BankrollState(
+            model_ids=["pricer", "market"], bankrolls={"pricer": 0.65, "market": 0.35},
+            last_update=NOW, update_count=1, frozen=False,
+        )
+        store.append_bankroll_state("2026-07-20", belly, region="belly")
+        assert store.get_latest_bankroll_state("2026-07-20", region="belly") == belly
+        # The legacy row is unaffected by the new per-region write.
+        assert store.get_latest_bankroll_state("2026-07-20") == legacy
+    finally:
+        store.close()
+
+
 # ---------------------------------------------------------------------------
 # risk_journal
 # ---------------------------------------------------------------------------

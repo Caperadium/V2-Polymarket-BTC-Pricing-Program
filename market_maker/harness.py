@@ -72,8 +72,11 @@ from market_maker.contracts import (
     VenueDescriptor,
 )
 from market_maker.fair_value_anchor import (
+    BELLY_REGION,
     MARKET_MODEL_ID,
     PRICER_MODEL_ID,
+    REGIONS,
+    WING_REGION,
     compute_fair_value,
 )
 from market_maker.inventory_manager import InventoryManager
@@ -146,6 +149,36 @@ def _initial_bankroll_state(now: datetime) -> BankrollState:
         update_count=0,
         frozen=False,
     )
+
+
+def _resume_bankroll_states(
+    store: MMStateStore, expiry_key: str, now: datetime,
+) -> Dict[str, BankrollState]:
+    """Resume/seed policy (package B2 plan step 10): per-region rows present
+    -> load each; ONLY a legacy (region='') row present -- this deploy's
+    first restart -- belly INHERITS the legacy bankrolls (continuity: belly
+    credibility was legitimately earned), wing RESETS to 0.5/0.5 (the
+    measured wing bias says wing authority was NOT legitimately earned;
+    parity is the honest prior) -- USER-CONFIRMED DECISION at review.
+    Neither present -> fresh 0.5/0.5 both regions (matches
+    _initial_bankroll_state, the __init__ default)."""
+    belly = store.get_latest_bankroll_state(expiry_key, region=BELLY_REGION)
+    wing = store.get_latest_bankroll_state(expiry_key, region=WING_REGION)
+    if belly is not None or wing is not None:
+        return {
+            BELLY_REGION: belly if belly is not None else _initial_bankroll_state(now),
+            WING_REGION: wing if wing is not None else _initial_bankroll_state(now),
+        }
+    legacy = store.get_latest_bankroll_state(expiry_key, region="")
+    if legacy is not None:
+        return {
+            BELLY_REGION: legacy,
+            WING_REGION: _initial_bankroll_state(now),
+        }
+    return {
+        BELLY_REGION: _initial_bankroll_state(now),
+        WING_REGION: _initial_bankroll_state(now),
+    }
 
 
 def _market_mid(ms) -> Optional[float]:
@@ -250,8 +283,14 @@ class PaperTradingLoop:
             m: LiquidityMonitor(self.config, tick_size=tick) for m, _ in self.markets
         }
 
-        # threaded fair-value state
-        self.bankroll_state = _initial_bankroll_state(self.clock.now())
+        # threaded fair-value state (package B2, 2026-07-15): TWO independent
+        # Beuoy bankroll states, keyed BELLY_REGION/WING_REGION -- this is
+        # the real state; `self.bankroll_state` (singular) below is a
+        # read-only synthesized legacy view.
+        self.bankroll_states: Dict[str, BankrollState] = {
+            BELLY_REGION: _initial_bankroll_state(self.clock.now()),
+            WING_REGION: _initial_bankroll_state(self.clock.now()),
+        }
         self.prev_forecasts: Optional[Dict[str, np.ndarray]] = None
         self.prev_consensus: Optional[np.ndarray] = None
         self._x_hist: Dict[str, List[float]] = {m: [] for m, _ in self.markets}
@@ -298,6 +337,37 @@ class PaperTradingLoop:
         self.checked_ladders: List[Tuple[List[float], List[QuoteSet]]] = []
         self.all_checked_quote_sets: List[QuoteSet] = []
         self.snapshot_failed: bool = False
+
+    # -- legacy read-only view (package B2) --------------------------------
+
+    @property
+    def bankroll_state(self) -> BankrollState:
+        """Read-only legacy single-scalar view synthesized from the two
+        region states (package B2, 2026-07-15): frozen = OR over regions
+        (either region degenerate freezes the legacy view); bankrolls =
+        unweighted mean per model across belly/wing; model_ids/last_update/
+        update_count taken from belly (an arbitrary but consistent single-
+        region pick -- belly and wing update in lockstep on freeze/unfreeze
+        events, so these rarely diverge in practice). External readers
+        (paper_runner.py's heartbeat, historical tests) keep working
+        unchanged. Read-only BY DESIGN: assigning `loop.bankroll_state = ...`
+        or mutating an attribute on the returned (freshly-built) object is a
+        no-op on the real state -- internal code must operate on
+        `self.bankroll_states` instead."""
+        belly = self.bankroll_states[BELLY_REGION]
+        wing = self.bankroll_states[WING_REGION]
+        model_ids = list(belly.model_ids)
+        bankrolls = {
+            mid: 0.5 * (float(belly.bankrolls.get(mid, 0.0)) + float(wing.bankrolls.get(mid, 0.0)))
+            for mid in model_ids
+        }
+        return BankrollState(
+            model_ids=model_ids,
+            bankrolls=bankrolls,
+            last_update=belly.last_update,
+            update_count=belly.update_count,
+            frozen=bool(belly.frozen or wing.frozen),
+        )
 
     # -- helpers ----------------------------------------------------------
 
@@ -464,10 +534,22 @@ class PaperTradingLoop:
             markout_widen_bid = markout_widen(mk_avg_bid_side, cfg.markout_widen_scale, cfg.markout_widen_cap)
             markout_widen_ask = markout_widen(mk_avg_ask_side, cfg.markout_widen_scale, cfg.markout_widen_cap)
 
+            # Package B2 (2026-07-15): region-appropriate credibility into
+            # compute_posted_prices ONLY (build_quote_set's credibility arg
+            # is moot when posted= is threaded, plan review item 13). Region
+            # basis is the SAME `region` variable computed just above from
+            # consensus_p_k (round-2 review item 2) -- NOT the anchor's
+            # market-mid region map (a deliberate, documented basis
+            # inconsistency, see fair_value_anchor / spread_builder docs).
+            region_credibility = (
+                fv.credibility_by_region[region]
+                if fv.credibility_by_region is not None else fv.credibility
+            )
+
             posted = compute_posted_prices(
                 prop, directives[m], self.venue_descriptor, cfg,
                 sigma2=float(snap.sigma2[k]), confidence_tier=snap.confidence_tier,
-                credibility=fv.credibility, consensus_p=consensus_p_k, tte_days=tte,
+                credibility=region_credibility, consensus_p=consensus_p_k, tte_days=tte,
                 markout_widen_bid=markout_widen_bid, markout_widen_ask=markout_widen_ask,
             )
             posted_by_market[m] = posted
@@ -676,15 +758,18 @@ class PaperTradingLoop:
         self._fv_recomputed_this_tick = len(mids) == len(self.markets)
         if self._fv_recomputed_this_tick:
             result = compute_fair_value(
-                snap, mids, self.bankroll_state, self.config, market_ts=now,
+                snap, mids, self.bankroll_states, self.config, market_ts=now,
                 prev_forecasts=self.prev_forecasts, prev_consensus=self.prev_consensus, ts=now,
             )
-            self.bankroll_state = result.bankroll_state
+            self.bankroll_states = result.bankroll_states
             self.prev_forecasts = result.forecasts
             self.prev_consensus = result.consensus_bucket
             self.last_fair_value = result.fair_value
             self._fv_recomputed_ts = now
-            self.store.append_bankroll_state(self.expiry_key, self.bankroll_state)
+            for region in REGIONS:
+                self.store.append_bankroll_state(
+                    self.expiry_key, self.bankroll_states[region], region=region,
+                )
 
             # W1.3: bankroll auto-unfreeze streak. Resets to 0 on any
             # recomputed tick whose anchor is non-BEUOY (fallback fired);
@@ -695,14 +780,21 @@ class PaperTradingLoop:
             else:
                 self._clean_beuoy_streak = 0
 
+            # bankroll_state (property, OR over regions): unfreeze streak
+            # clears BOTH region states in lockstep (plan step 8 -- a
+            # fallback is a whole-ladder event, so its recovery is too).
             if (self.bankroll_state.frozen
                     and self._clean_beuoy_streak >= self.config.bankroll_unfreeze_clean_ticks):
-                self.bankroll_state.frozen = False
+                for region in REGIONS:
+                    self.bankroll_states[region].frozen = False
                 logger.warning(
                     "bankroll auto-unfrozen after %d consecutive clean BEUOY ticks (expiry %s)",
                     self._clean_beuoy_streak, self.expiry_key,
                 )
-                self.store.append_bankroll_state(self.expiry_key, self.bankroll_state)
+                for region in REGIONS:
+                    self.store.append_bankroll_state(
+                        self.expiry_key, self.bankroll_states[region], region=region,
+                    )
         fv = self.last_fair_value
         if fv is None:
             return  # nothing quotable yet
@@ -1007,9 +1099,7 @@ class PaperTradingLoop:
                 self.inv.apply_fill(f)
                 replayed += 1
 
-        loaded = self.store.get_latest_bankroll_state(self.expiry_key)
-        if loaded is not None:
-            self.bankroll_state = loaded
+        self.bankroll_states = _resume_bankroll_states(self.store, self.expiry_key, now)
         return replayed
 
     def restart(self, now: Optional[datetime] = None):
@@ -1029,7 +1119,5 @@ class PaperTradingLoop:
 
         recon = self.lifecycle.restart_reconcile()
 
-        loaded = self.store.get_latest_bankroll_state(self.expiry_key)
-        if loaded is not None:
-            self.bankroll_state = loaded
+        self.bankroll_states = _resume_bankroll_states(self.store, self.expiry_key, now)
         return recon
