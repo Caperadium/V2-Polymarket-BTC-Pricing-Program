@@ -61,7 +61,8 @@ Estimated from variance dynamics around detected jump events (shared helper `_es
 
 ### Literature Fallback
 
-When too few jumps detected (< 10), reverts to Teng (2025) reference values:
+When too few jumps detected (< 10, on the FULL slice), reverts to Teng (2025)
+reference values:
 
 ```python
 JumpCalibrationResult(
@@ -70,6 +71,31 @@ JumpCalibrationResult(
 )
 ```
 
+### Trailing-Window eta_up (Package C, 2026-07-17)
+
+`calibrate_jumps(..., window_hours=JUMP_CAL_WINDOW_HOURS)` (default 8760 =
+12 months of hourly bars) era-conditions ONLY the up-jump mean size:
+
+- The windowed up-jump sample is a **mask-slice** of the single full-slice
+  detection (`jump_mask[-window_hours:]`) -- never a fresh detection on the
+  short slice, whose Lee-Mykland critical value (scales with n) would admit
+  smaller jumps and bias eta_up high even in a stationary era.
+- Blend in mean space with credibility weight
+  `w = min(1, n_window_up_jumps / JUMP_CAL_WINDOW_TARGET_UP_JUMPS)`
+  (target 6, evidence-set): `mean_up = w*mean(up_win) + (1-w)*(1/eta_up_full)`,
+  `eta_up = 1/mean_up`.
+- **lam, p_crash, eta_down and all SVCJ params are full-slice pinned.**
+  Windowing them was measured (10-snapshot leak-free MC verification,
+  `temp/package_c_verification.md`) to cheapen the already-fair lower tail
+  by 1-2c and break the near-ATM belly; windowing the up-jump intensity
+  additionally leaks a whole-curve drift shift through the jump-drift
+  compensator. Structural limit on record: the up-side mispricing changes
+  sign across strikes (rich at x>=5%, cheap at x=2-3%), so only a
+  shape-change (eta_up) is admissible -- and its honest era signal is
+  ~0.1-0.2c of tail-probability at 1-7d.
+- `window_hours=None` bypasses windowing entirely (byte-identical legacy
+  output, golden-pinned in tests); `window_hours <= 0` raises ValueError.
+
 ## JumpCalibrationResult
 
 ```python
@@ -77,18 +103,30 @@ JumpCalibrationResult(
 class JumpCalibrationResult:
     lam: float              # Jump intensity (jumps per year)
     p_crash: float           # Probability jump is downward
-    eta_up: float            # Positive jump size decay (1/mean)
+    eta_up: float            # Positive jump size decay (1/mean); the only
+                             # windowed parameter (see above)
     eta_down: float          # Negative jump size decay (1/mean)
     mu_v: float              # Mean volatility jump size (hourly variance units)
     rho_J: float             # Return-vol jump Pearson correlation (diagnostics only)
     lam_v: float             # Vol jump intensity (defaults to lam)
     rho_j_slope: float = 0.0 # OLS return-per-variance-jump slope used by SVCJ
                              # return-jump adjustment (sanity-capped; 0.0 = off)
-    n_jumps_detected: int    # Number of jumps detected
-    n_obs: int               # Total observations
+    n_jumps_detected: int    # Number of jumps detected (FULL slice)
+    n_obs: int               # Total observations (FULL slice)
     jump_threshold: float    # Detection threshold value
     fit_converged: bool      # Whether MLE converged
+    calibration_window_hours: Optional[int] = None  # None = not windowed
+    window_weight: float = 1.0   # credibility w applied to the UP side
+    n_window_jumps: int = 0      # mask-slice UP-jump count in the window
 ```
+
+The `DATA/jump_calibration.csv` cache written by
+`btc_pricing_engine.load_calibrated_jumps` is schema-versioned
+(`JUMP_CAL_SCHEMA_VERSION`, exact match required) and additionally checks
+the cached `calibration_window_hours` against the current constant, so a
+deploy or a window retune forces recalibration automatically; reads are
+NaN-safe and self-healing (torn/corrupt cache = stale + rewrite), writes
+are atomic (tmp + os.replace).
 
 ## Usage
 

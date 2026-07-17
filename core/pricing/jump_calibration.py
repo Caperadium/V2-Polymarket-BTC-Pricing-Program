@@ -29,6 +29,25 @@ from scipy.stats import expon, gamma
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# Trailing-window (era-conditioned) jump calibration constants
+# (Package C, work package W1 -- see temp/mm_package_c_plan.md section
+# 2.2-REV5, eta_up-only mask-slice windowing)
+# ---------------------------------------------------------------------------
+
+# Trailing window (hours) used to era-condition the Kou UP-JUMP mean size
+# (eta_up) only. 8760 = 12 months of hourly bars. lam, p_crash, eta_down and
+# the SVCJ vol-jump leg are NEVER windowed (always full-slice -- see
+# calibrate_jumps; plan section 2.2-REV5, replacing the REV5-SUPERSEDED
+# all-params blend).
+JUMP_CAL_WINDOW_HOURS = 8760
+
+# Credibility target: at this many in-window UP jumps (mask-slice count),
+# the windowed eta_up leg is fully trusted (blend weight w = 1.0). Below it,
+# eta_up is shrunk linearly (in mean-size space) toward the full-slice
+# estimate.
+JUMP_CAL_WINDOW_TARGET_UP_JUMPS = 6
+
+# ---------------------------------------------------------------------------
 # Dataclass
 # ---------------------------------------------------------------------------
 
@@ -59,6 +78,16 @@ class JumpCalibrationResult:
     jump_threshold: float = 0.0
     detection_method: str = "MAD"
     fit_converged: bool = True
+
+    # Trailing-window calibration diagnostics (Package C / W1, plan section
+    # 2.2-REV5). Additive, default-neutral so old construction sites keep
+    # working unchanged. These describe the UP SIDE ONLY (eta_up-only
+    # mask-slice windowing) -- lam, p_crash, eta_down and SVCJ are always
+    # full-slice, regardless of window_hours.
+    # None / 1.0 / 0 = "not windowed" (matches the window_hours=None path).
+    calibration_window_hours: Optional[int] = None
+    window_weight: float = 1.0  # up-side blend weight w
+    n_window_jumps: int = 0     # mask-slice in-window UP-jump count
 
     # Literature reference values (Teng 2025)
     TENG_RHO_J: float = field(default=-0.08, repr=False)
@@ -353,12 +382,99 @@ def _estimate_vol_jump_params(
     return mu_v, rho_J_corr, rho_j_slope, n_events_used
 
 
+# ---------------------------------------------------------------------------
+# Trailing-window eta_up blend (Package C / W1 -- era-conditioned jump
+# calibration, plan section 2.2-REV5)
+# ---------------------------------------------------------------------------
+
+def _blend_windowed_eta_up(
+    returns: np.ndarray,
+    jump_mask: np.ndarray,
+    window_hours: int,
+    eta_up_full: float,
+) -> Tuple[float, int, float]:
+    """
+    Blend a trailing-window UP-JUMP mean size into the full-slice eta_up
+    (temp/mm_package_c_plan.md section 2.2-REV5 item 2). This REPLACES the
+    REV5-SUPERSEDED all-params blend (_blend_windowed_kou, which windowed
+    eta_up, eta_down, lam AND p_crash and ran a SECOND, fresh detection pass
+    on the windowed slice) -- that design FAILED W3 acceptance.
+
+    MASK-SLICE, not fresh detection: the windowed up-jump sample is read off
+    the FULL-SLICE jump mask restricted to the trailing window
+    (`jump_mask[-window_hours:]`), not a new bipower/MAD detection call on
+    the windowed slice alone. A fresh detection on an 8760-bar slice uses a
+    systematically LOWER Lee-Mykland critical value C_n (C_n scales with
+    sample size n), which biases windowed jump sizes small / eta_up high
+    even in a stationary era (code-review angle-C finding; confirmed by
+    measurement: fresh-detection windowed eta_up ~40.3-43 vs mask-slice
+    ~35.6-40.9). Sharing one detection pass (and therefore one C_n) between
+    the full-slice and windowed legs removes that bias -- both legs are
+    reading the SAME set of flagged jump bars, just over different spans.
+
+    Only eta_up is windowed here. lam, p_crash, eta_down (and SVCJ) stay
+    full-slice-pinned in the caller -- NOT because they are hard to window
+    mechanically, but because the W3 measurement showed windowing them was
+    actively harmful: the lam cut is shape-blind and moved the already-cheap
+    belly and down cells; eta_down windowing thinned a down tail with NO
+    measured richness (the up-heavy 2024-25 windows produced windowed
+    p_crash 0.375-0.50, a thin-sample artifact, not a real down-side signal).
+    The up-jump FREQUENCY era signal (windowed up-intensity 5-9/yr vs full
+    ~11.5/yr) is real but unusable under the belly guard: up-jump mass at
+    x=2% is the same order as at x=5%, and intensity cuts are proportional
+    across x, so any lam_up cut large enough to matter at 5% moves the 2%
+    belly by more than the guard allows. eta_up is the only lever that
+    separates tail from belly (exp(-eta_up*x) decays faster in x, so a given
+    eta_up increase cuts x=5% far more than x=2%).
+
+    Args:
+        returns: FULL array of log returns (the same array jump_mask
+            indexes) -- NOT pre-sliced; the trailing window is taken inside
+            this function via returns[-window_hours:].
+        jump_mask: FULL-SLICE boolean jump mask (from the single detection
+            pass already run on `returns` in calibrate_jumps), aligned to
+            `returns`.
+        window_hours: Trailing window length in bars. May be >= len(returns)
+            (numpy slicing then yields the whole array -- no special-casing
+            needed, matches the window_hours >= len(returns) test).
+        eta_up_full: Full-slice Kou eta_up (PRE-CLIP, i.e. exactly what
+            fit_kou_params returned for the full slice).
+
+    Returns:
+        (eta_up, n_window_up, window_weight). eta_up is PRE-CLIP -- the
+        caller applies the existing [5,200] clip AFTER this blend, at the
+        same place it always has.
+    """
+    wmask = jump_mask[-window_hours:]
+    wret = returns[-window_hours:]
+    jr_win = wret[wmask]
+    up_win = jr_win[jr_win > 0]
+    n_window_up = int(len(up_win))
+
+    mean_full_up = 1.0 / eta_up_full
+
+    if n_window_up == 0:
+        # Guard: never take the mean of an empty array. A genuinely empty
+        # in-window up-sample degrades to the full-slice value exactly.
+        window_weight = 0.0
+        mean_up_blend = mean_full_up
+    else:
+        window_weight = min(1.0, n_window_up / JUMP_CAL_WINDOW_TARGET_UP_JUMPS)
+        mean_win_up = float(np.mean(up_win))
+        mean_up_blend = window_weight * mean_win_up + (1.0 - window_weight) * mean_full_up
+
+    eta_up_blend = 1.0 / mean_up_blend
+
+    return eta_up_blend, n_window_up, window_weight
+
+
 def calibrate_jumps(
     hourly_csv: str = "DATA/btc_hourly.csv",
     returns: Optional[np.ndarray] = None,
     detection_method: str = "bipower",
     mad_multiplier: float = 3.0,
     hours_per_year: int = 365 * 24,
+    window_hours: Optional[int] = JUMP_CAL_WINDOW_HOURS,
 ) -> JumpCalibrationResult:
     """
     Calibrate all jump parameters from BTC hourly returns.
@@ -370,10 +486,40 @@ def calibrate_jumps(
             FIX 2/M4) or "MAD".
         mad_multiplier: Threshold multiplier for MAD detection.
         hours_per_year: Scaling factor for annualisation.
+        window_hours: Trailing-window (era-conditioned) shrinkage of the Kou
+            UP-JUMP mean size (eta_up) ONLY (Package C / W1, plan section
+            2.2-REV5 -- REPLACES the REV5-SUPERSEDED all-params design).
+            Default JUMP_CAL_WINDOW_HOURS (8760 = 12 months of hourly bars):
+            the up-jump sample is read off a MASK-SLICE of the (single,
+            already-run) full-slice jump detection restricted to
+            returns[-window_hours:], and credibility-blended with the
+            full-slice eta_up (weight w = min(1, n_window_jumps /
+            JUMP_CAL_WINDOW_TARGET_UP_JUMPS)), so calm eras get a thinner
+            up-tail and wild eras get a fatter one, the same way the
+            diffusion (GARCH/FIGARCH) already conditions on the current vol
+            state. lam, p_crash, eta_down and the SVCJ vol-jump leg (mu_v,
+            rho_J, rho_j_slope) are ALWAYS full-slice, never windowed (W3
+            measurement showed windowing them moved the belly and down
+            cells the wrong way -- see _blend_windowed_eta_up docstring).
+            window_hours=None BYPASSES windowing entirely and reproduces
+            the pre-W1 full-slice-only behavior byte-identically (this is
+            the regression pin -- see tests/test_jump_calibration_window.py).
 
     Returns:
         JumpCalibrationResult with all estimated parameters.
     """
+    # F7: validate window_hours BEFORE any use. A non-positive window_hours
+    # is not a valid "no windowing" sentinel (that's window_hours=None) --
+    # 0 would slice `returns[-0:]`, which numpy/Python interpret as the
+    # WHOLE array (silently equivalent to no windowing at all, not "empty
+    # window" as the value might suggest), and a negative value slices from
+    # the front of the array (silently wrong window semantics). Reject both
+    # explicitly rather than let either produce a quietly-wrong result.
+    if window_hours is not None and window_hours <= 0:
+        raise ValueError(
+            f"window_hours must be None or a positive integer, got {window_hours}"
+        )
+
     # Load returns
     if returns is None:
         df = pd.read_csv(hourly_csv)
@@ -416,11 +562,38 @@ def calibrate_jumps(
     lam = (n_jumps / n_obs) * hours_per_year
 
     # --- SVCJ Vol Jump Calibration (FIX 3 / M2: shared helper) ---
+    # PINNED to the full slice ALWAYS, regardless of window_hours (Package C /
+    # W1, plan section 2.2-REV5 item 2): windowed SVCJ estimates at typical
+    # window jump counts are unstable / sign-flipping.
     mu_v, rho_J, rho_j_slope, n_vol_events = _estimate_vol_jump_params(
         returns, jump_mask, jump_returns, window=24, sigma_local=sigma_local,
     )
 
-    # Handle extremes for eta parameters
+    # --- Trailing-window (era-conditioned) eta_up-only blend (Package C /
+    # W1, plan section 2.2-REV5) ---
+    # window_hours=None SHORT-CIRCUITS to the legacy single-pass path below,
+    # BEFORE any windowed blending runs -- this is the byte-identical
+    # regression pin (a w=1.0 blend of identical legs is not guaranteed
+    # float-identical to the unblended value). lam, p_crash, eta_down are
+    # NEVER touched here -- they keep the full-slice values computed above.
+    calibration_window_hours: Optional[int] = None
+    window_weight = 1.0
+    n_window_jumps = 0
+
+    if window_hours is not None:
+        eta_up, n_window_jumps, window_weight = _blend_windowed_eta_up(
+            returns=returns,
+            jump_mask=jump_mask,
+            window_hours=window_hours,
+            eta_up_full=eta_up,
+        )
+        calibration_window_hours = window_hours
+        logger.info(
+            "Windowed eta_up blend: window_hours=%s, n_window_up_jumps=%d, w=%.3f",
+            window_hours, n_window_jumps, window_weight,
+        )
+
+    # Handle extremes for eta parameters (post-blend, same clip as legacy)
     eta_up = np.clip(eta_up, 5.0, 200.0)
     eta_down = np.clip(eta_down, 5.0, 200.0)
     lam = np.clip(lam, 5.0, 100.0)
@@ -437,6 +610,9 @@ def calibrate_jumps(
         mu_v=mu_v, rho_J=rho_J, lam_v=lam, rho_j_slope=rho_j_slope,
         n_jumps_detected=n_jumps, n_obs=n_obs,
         jump_threshold=jump_threshold, fit_converged=True,
+        calibration_window_hours=calibration_window_hours,
+        window_weight=window_weight,
+        n_window_jumps=n_window_jumps,
     )
 
 

@@ -36,6 +36,7 @@ Usage:
 """
 
 import logging
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -1557,6 +1558,40 @@ def calculate_probabilities(
 # JUMP CALIBRATION CACHE — Phase 0.5
 # ==============================================================================
 
+# Package C / W2 (temp/mm_package_c_plan.md section 2.3): cache schema version
+# for DATA/jump_calibration.csv. version 2 = Package C trailing-window
+# calibration (jump_calibration.calibrate_jumps now era-conditions the Kou
+# leg on a trailing window by default). Bumping this forces a one-time
+# recalibration on deploy so the 30d CSV cache cannot keep serving stale
+# pre-window params for up to 30 days after the fix lands.
+JUMP_CAL_SCHEMA_VERSION = 2
+
+
+def _cache_opt_int(value, default: Optional[int]) -> Optional[int]:
+    """NaN/None-safe int parse for an optional jump-calibration cache cell
+    (Package C review F2). Returns `default` when `value` is missing, NaN,
+    or unparseable -- a corrupt or blank cell on an optional cache column
+    must never raise."""
+    try:
+        if pd.isna(value):
+            return default
+        return int(value)
+    except Exception:
+        return default
+
+
+def _cache_opt_float(value, default: Optional[float]) -> Optional[float]:
+    """NaN/None-safe float parse for an optional jump-calibration cache
+    cell (Package C review F2). Returns `default` when `value` is missing,
+    NaN, or unparseable."""
+    try:
+        if pd.isna(value):
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
 def load_calibrated_jumps(
     hourly_csv: str = "DATA/btc_hourly.csv",
     cache_path: str = "DATA/jump_calibration.csv",
@@ -1578,24 +1613,77 @@ def load_calibrated_jumps(
     Returns:
         Dict with keys matching JumpCalibrationResult dataclass fields:
         lam, p_crash, eta_up, eta_down, mu_v, rho_J, rho_j_slope, lam_v,
-        n_jumps_detected, fit_converged, calibration_date.
+        n_jumps_detected, fit_converged, calibration_date. Also carries the
+        Package C / W2 windowed-calibration diagnostics
+        (calibration_window_hours, window_weight, n_window_jumps) and
+        schema_version -- both the cache-hit and the freshly-calibrated
+        (cache-miss) dict carry schema_version (symmetric dict shape,
+        Package C review F6).
     """
-    from core.pricing.jump_calibration import calibrate_jumps, JumpCalibrationResult
+    from core.pricing.jump_calibration import (
+        calibrate_jumps,
+        JumpCalibrationResult,
+        JUMP_CAL_WINDOW_HOURS,
+    )
 
     cache_file = Path(cache_path)
     use_cache = False
+    cache_row = None
+    schema_version: Optional[int] = None
+    cached_window_hours: Optional[int] = None
 
     if not force_recalibrate and cache_file.exists():
         cache_age = datetime.now(timezone.utc) - datetime.fromtimestamp(
             cache_file.stat().st_mtime, tz=timezone.utc
         )
         if cache_age.days < max_cache_age_days:
-            use_cache = True
-            logger.info(f"Loading cached jump calibration ({cache_age.days}d old)")
+            # Package C review F1: any failure reading/parsing the cache
+            # (zero-byte EmptyDataError, header-only IndexError, malformed
+            # CSV, ...) is caught here and treated as a STALE cache -- the
+            # function falls through to recalibration below, which rewrites
+            # the file. This makes a corrupted cache self-healing instead of
+            # crashing on every call for up to max_cache_age_days.
+            try:
+                cached_df = pd.read_csv(cache_path)
+                cache_row = cached_df.iloc[-1]  # Most recent row
+                schema_version = _cache_opt_int(cache_row.get("schema_version"), None)
+                cached_window_hours = _cache_opt_int(
+                    cache_row.get("calibration_window_hours"), None
+                )
+                # F4: EXACT schema match required -- a cache written by an
+                # OLDER *or NEWER* schema version is stale (a newer version
+                # may carry a shape this code doesn't know how to read;
+                # rollback safety).
+                # F5: the cached calibration_window_hours must also match
+                # the CURRENT JUMP_CAL_WINDOW_HOURS constant exactly
+                # (missing/NaN counts as a mismatch) -- retuning the window
+                # constant must force recalibration without needing a
+                # cross-module schema bump to invalidate old caches.
+                if (
+                    schema_version == JUMP_CAL_SCHEMA_VERSION
+                    and cached_window_hours == JUMP_CAL_WINDOW_HOURS
+                ):
+                    use_cache = True
+                    logger.info(f"Loading cached jump calibration ({cache_age.days}d old)")
+                else:
+                    logger.info(
+                        "Cached jump calibration stale (schema_version=%s, "
+                        "calibration_window_hours=%s; require schema_version"
+                        "==%d, calibration_window_hours==%d); recalibrating",
+                        schema_version, cached_window_hours,
+                        JUMP_CAL_SCHEMA_VERSION, JUMP_CAL_WINDOW_HOURS,
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to read cached jump calibration at %s (%s); "
+                    "treating cache as stale and recalibrating",
+                    cache_path, exc,
+                )
+                cache_row = None
+                use_cache = False
 
     if use_cache:
-        cached = pd.read_csv(cache_path)
-        row = cached.iloc[-1]  # Most recent row
+        row = cache_row  # already read above; no second CSV read
         calibrated = {
             "lam": float(row["lam"]),
             "p_crash": float(row["p_crash"]),
@@ -1610,6 +1698,20 @@ def load_calibrated_jumps(
             "n_jumps_detected": int(row.get("n_jumps_detected", 0)),
             "fit_converged": bool(int(row.get("fit_converged", 1))),
             "calibration_date": str(row.get("calibration_date", "unknown")),
+            # Package C / W2 READ path: windowed-calibration diagnostics.
+            # NaN-safe (F2) via _cache_opt_float/_cache_opt_int -- a corrupt
+            # or blank cell on these optional columns falls back to its
+            # documented default instead of raising. calibration_window_hours
+            # was already parsed (and exact-matched against
+            # JUMP_CAL_WINDOW_HOURS) above, so it is reused here rather than
+            # re-parsed a second time (F2: removes the old duplicated parse).
+            "calibration_window_hours": cached_window_hours,
+            "window_weight": _cache_opt_float(row.get("window_weight"), 1.0),
+            "n_window_jumps": _cache_opt_int(row.get("n_window_jumps"), 0),
+            # F6: symmetric with the cache-miss dict below -- schema_version
+            # was already parsed (and exact-matched) above, so it is reused
+            # here rather than re-parsed.
+            "schema_version": schema_version,
         }
     else:
         logger.info("Calibrating jump parameters from %s ...", hourly_csv)
@@ -1634,9 +1736,23 @@ def load_calibrated_jumps(
             "n_jumps_detected": result.n_jumps_detected,
             "fit_converged": result.fit_converged,
             "calibration_date": datetime.now(timezone.utc).isoformat(),
+            # Package C / W2 WRITE path: cache schema version + windowed-
+            # calibration diagnostics, persisted so the read path above can
+            # validate freshness and report window engagement
+            # (temp/mm_package_c_plan.md section 2.3).
+            "schema_version": JUMP_CAL_SCHEMA_VERSION,
+            "calibration_window_hours": result.calibration_window_hours,
+            "window_weight": result.window_weight,
+            "n_window_jumps": result.n_window_jumps,
         }
-        # Cache to CSV
-        pd.DataFrame([calibrated]).to_csv(cache_file, index=False)
+        # Cache to CSV atomically (F3): write to a same-directory .tmp
+        # sibling then os.replace -- os.replace is atomic on both POSIX and
+        # Windows when source/dest share a filesystem, so a concurrent
+        # reader of cache_path never observes a torn/partial file mid-write
+        # (same idiom as core/data/data_fetcher.py's _write_csv_atomic).
+        tmp_cache_path = cache_file.with_name(cache_file.name + ".tmp")
+        pd.DataFrame([calibrated]).to_csv(tmp_cache_path, index=False)
+        os.replace(tmp_cache_path, cache_file)
         logger.info(f"Cached jump calibration to {cache_file}")
 
     # Compare against hardcoded defaults, warn if >20% delta
