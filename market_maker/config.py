@@ -49,8 +49,10 @@ class MMConfig:
     # market-hours on the VPS state db: k=18.21, A=3.58/market-hour, implied
     # arrival half-spread ~0.01c ATM). Caveats: only ~3 days of prints
     # (recording began 2026-07-11), lumpy histogram head near the touch;
-    # REFIT planned ~2026-07-21 once a full weekly volume cycle is recorded.
-    k_arrival: float = 18.2  # kappa, arrival decay (fitted 2026-07-14; refit ~2026-07-21)
+    # -> 18.3 (2026-07-21 weekly refit, first full volume cycle: 5639 joined
+    # prints / 3065 market-hours, k=18.33, A=0.75/market-hour, implied arrival
+    # half-spread ~0.007c ATM -- fit stable vs 18.2, term stays negligible).
+    k_arrival: float = 18.3  # kappa, arrival decay (fitted 2026-07-21; weekly refit cadence)
     arrival_scale_A: float = 1.0  # arrival scale A (launch default, pending calibration)
     sigma_b_floor: float = 0.05  # belief log-odds vol floor (launch default)
     sigma_b_cap: float = 5.0  # belief log-odds vol cap (launch default)
