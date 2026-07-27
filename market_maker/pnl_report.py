@@ -114,13 +114,29 @@ PER_MARKET_SNAPSHOT_EVERY_N_TICKS = 20
 # window width.
 MARKOUT_WINDOW_S = 600.0
 
-# Markout report lookback (F3): bounds both how far back markout_report ever
-# looks for fills AND how far back mid_log rows are retained (state_store.
-# prune_mid_log, called by the runner with this same constant) -- the report
-# is a rolling Stage-B measurement, not a full-history archive; snapshot the
-# state-db before this window rolls off if full-history analysis is needed.
-# 7 days comfortably covers the 72h VPS acceptance test with margin.
-MARKOUT_LOOKBACK_S = 7 * 86400.0
+# Markout report lookback (F3; Fix 2a 2026-07-26 DECOUPLED from mid_log
+# retention): how far back markout_report looks for fills. As of Fix 2a this
+# is NO LONGER the same bound as mid_log retention -- per-fill markouts are
+# persisted durably (state_store.fill_markouts) as they resolve, so a fill's
+# markout survives after its raw mids are pruned. The report therefore
+# remembers a cell's measurement for 28d (killing the weekly re-arm cycle
+# where a measured-toxic cell's rolling window rolled off, reverted to the
+# optimistic structural prior, and re-bled at full size) while mid_log itself
+# is still pruned to the shorter MID_LOG_RETENTION_S below (disk cost
+# unchanged). A fill older than MID_LOG_RETENTION_S whose markout was never
+# persisted is permanently unresolvable and is excluded from n_attempted (see
+# markout_report's n_attempted semantics). Snapshot the state-db before this
+# window rolls off if full-history analysis is needed.
+MARKOUT_LOOKBACK_S = 28 * 86400.0
+
+# mid_log retention (Fix 2a): how far back raw per-tick mids are kept
+# (state_store.prune_mid_log, called by the runner with this constant).
+# Deliberately shorter than MARKOUT_LOOKBACK_S -- persisted per-fill markouts
+# (fill_markouts) carry a fill's measurement past this window, so mids that
+# old are never read again. Also the boundary that gates n_attempted: a miss
+# on a fill older than this can never resolve (its mids are gone), so it must
+# not inflate n_attempted.
+MID_LOG_RETENTION_S = 7 * 86400.0
 
 _TTE_BUCKETS: Tuple[Tuple[float, str], ...] = (
     (1.0, "0-1d"),
@@ -373,16 +389,36 @@ def markout_report(
     horizons: Sequence[float] = (60.0, 600.0, 3600.0),
     *,
     now: Optional[datetime] = None,
+    persisted: Optional[Dict[Tuple[int, float], float]] = None,
+    persist_cb: Optional[Callable[[List[Tuple[int, float, float]]], None]] = None,
 ) -> Dict[str, object]:
     """Per-region, per-TTE-bucket, per-horizon markout report for Stage-B
     paper fills (plan Change C: measure whether the belly's model bias --
     +4.8c at 1-2d growing to +8.6c at 5-7d, temp/suitability.md -- bleeds
     through the Beuoy anchor blend before touching spread terms).
 
-    Pure function -- no store access. `mid_lookup(market_id, ts, ts_max)`
-    mirrors `MMStateStore.mid_at_or_after`'s signature exactly (the runner
-    passes the bound method directly); the runner owns all store reads, per
-    this module's existing "runner owns the store" rule.
+    No direct store access; all store interaction is via injected callables
+    (`mid_lookup`, `persist_cb`). `mid_lookup(market_id, ts, ts_max)` mirrors
+    `MMStateStore.mid_at_or_after`'s signature exactly (the runner passes the
+    bound method directly); the runner owns all store reads/writes, per this
+    module's existing "runner owns the store" rule.
+
+    Persisted markouts (Fix 2a): `persisted` is a `{(fill_id, horizon_s): mk}`
+    map of markouts already resolved on an earlier report (state_store.
+    get_fill_markouts). A (fill, horizon) whose key is present short-circuits
+    the mid lookup and uses the stored mk (counting toward n and n_attempted
+    exactly like a live hit) -- this is what lets a fill stay measured for
+    MARKOUT_LOOKBACK_S (28d) after its raw mids are pruned at
+    MID_LOG_RETENTION_S (7d). On a fresh live-mid hit the `(fill_id,
+    horizon_s, mk)` tuple is collected and handed to `persist_cb` once at the
+    end (never per-row). Fills with `id=None` (hand-built or off-store
+    pseudo-fills) are never persisted and never looked up in `persisted`,
+    degrading to the recompute-every-call behavior. The persisted map is
+    keyed `(fill_id, float(horizon_s))` and does NOT capture the disjoint-
+    window upper bound `hi_s`; safe only because the production horizon set is
+    fixed at (60, 600, 3600) -- a changed horizon set could reuse a stored
+    markout under a different window width. Both params default to inert, so a
+    caller that omits them gets a byte-identical report.
 
     Price-scale ground truth (binding, see plan "Price-scale ground truth"):
     the fill's stored `price` is ALREADY YES-scale for both sides (the
@@ -393,14 +429,14 @@ def markout_report(
     A BUY_NO fill at 0.60 against a flat YES mid of 0.60 must therefore
     markout to ~0 at every horizon -- that is the mandatory regression gate.
 
-    Lookback (F3): fills with `ts < now - MARKOUT_LOOKBACK_S` are skipped
-    entirely -- not even counted as "attempted" -- since mid_log rows that
-    old may already be pruned (`state_store.prune_mid_log`, called by the
-    runner with this same constant) and recomputing over unbounded history
-    is the problem this bound exists to fix. `now` defaults to the max fill
-    timestamp in `fills` (None if `fills` is empty) when not given; the
-    runner always passes its own tick `now` explicitly so the report's window
-    and the store's prune bound share one anchor (see paper_runner.py).
+    Lookback (F3; Fix 2a): fills with `ts < now - MARKOUT_LOOKBACK_S` (28d)
+    are skipped entirely -- not even counted as "attempted". `now` defaults to
+    the max fill timestamp in `fills` (None if `fills` is empty) when not
+    given; the runner always passes its own tick `now` explicitly. As of Fix
+    2a the report lookback (28d) and the mid_log prune bound
+    (MID_LOG_RETENTION_S, 7d) are DELIBERATELY different: persisted per-fill
+    markouts carry a cell's measurement across the gap, so the report can
+    remember 28d while mids are kept only 7d.
 
     For each remaining fill (SETTLEMENT-tagged pseudo-fills excluded -- they
     are not a quoting decision to markout) and each horizon `h` in `horizons`
@@ -415,12 +451,24 @@ def markout_report(
         EXCLUSIVE (state_store.mid_at_or_after's `ts < ts_max`, F1), so the
         windows `[h, hi_s)` are disjoint by construction for any ascending
         `horizons`.
-      - every (region, tte_bucket, horizon) combination touched by an
-        eligible fill is counted in `n_attempted`, whether or not the lookup
-        found a mid (F2): a cell is emitted with `n=0` when every lookup for
-        it missed, so the report distinguishes "no attempts" (no cell at all)
-        from "attempted but no mid data" (n=0, n_attempted>0) from "some/all
-        hits" (n>0).
+      - n_attempted semantics (Fix 2a): a (region, tte_bucket, horizon)
+        touched by an eligible fill is counted in `n_attempted` iff the fill
+        DID resolve at that horizon (persisted markout or a live mid hit --
+        also counted in `n`) OR the miss can still resolve later (fill young
+        enough that its mids can exist, `fill.ts >= now - MID_LOG_RETENTION_S`).
+        A miss on an OLDER fill (mids already pruned, permanently
+        unresolvable) is counted in NEITHER `n` NOR `n_attempted` -- otherwise
+        phantom attempts would push `n_attempted >= markout_min_n` while `n`
+        stays below it, switching OFF both the W4 exploration gate and the
+        unmeasured-cell size multiplier on cells that are not actually
+        measured (worst exactly in the post-deploy window, when every
+        pre-deploy fill is 7-28d old). Invariant: `n_attempted` = "fills that
+        did, or still can, yield a measurement." Cell emission is unchanged
+        (F2): a cell all of whose fills are old-misses is still emitted with
+        `n=0, n_attempted=0`, so the report still distinguishes "no attempts"
+        (no cell) from "attempted but no mid data yet" (n=0, n_attempted>0)
+        from "some/all hits" (n>0). The same gating applies to every
+        n_attempted in the report (cells, sides, by_region, by_expiry).
       - region: "belly" if `mid_at_fill` is inside `belly_band`
         (`config.in_belly_band`, F7) else "wing"; "unknown" if
         `fill.mid_at_fill` is None (a plain `Fill`, e.g. hand-built in tests,
@@ -484,6 +532,16 @@ def markout_report(
     if now is None:
         now = max((f.ts for f in eligible), default=None)
     cutoff = (now - timedelta(seconds=MARKOUT_LOOKBACK_S)) if now is not None else None
+    # Fix 2a: the n_attempted young/old boundary (see docstring). A miss on a
+    # fill older than this can never resolve (its mids are pruned), so it must
+    # not count as an attempt. None (no `now`) -> treat every fill as young,
+    # reproducing the pre-Fix-2a "always count the attempt" behavior.
+    mid_retention_cutoff = (
+        (now - timedelta(seconds=MID_LOG_RETENTION_S)) if now is not None else None
+    )
+    # Newly-resolved live-mid markouts collected for one persist_cb call at the
+    # end (Fix 2a); id=None fills contribute nothing here.
+    newly: List[Tuple[int, float, float]] = []
 
     cells: Dict[Tuple[str, str, float], List[float]] = {}
     attempted: Dict[Tuple[str, str, float], int] = {}
@@ -536,6 +594,13 @@ def markout_report(
         # docstring "Maker rebates" section) -- constant across horizons
         # since it depends only on the fill's own price, not the lookup.
         reb_share = rebate_for_fill(f.price, 1.0) if f.liquidity is LiquiditySource.MAKER else 0.0
+        # Fix 2a: a miss on a fill this old is permanently unresolvable (mids
+        # pruned) and must NOT count as an attempt (n_attempted semantics).
+        fill_is_young = (mid_retention_cutoff is None) or (f.ts >= mid_retention_cutoff)
+        # getattr: a plain Fill (hand-built in tests) has no `id` field, same
+        # None-degrade path as the mid_at_fill getattr above -- never persists,
+        # never resolves from `persisted`.
+        fill_id = getattr(f, "id", None)
 
         for idx, h in enumerate(sorted_horizons):
             if idx + 1 < len(sorted_horizons):
@@ -544,30 +609,66 @@ def markout_report(
                 hi_s = h + MARKOUT_WINDOW_S
 
             key = (region, tte_bucket, float(h))
-            attempted[key] = attempted.get(key, 0) + 1
+            ekey = (fill_expiry, float(h))
+            # Ensure the cell/attempted containers exist for EVERY eligible
+            # (fill, horizon) so an all-miss cell is still emitted with n=0,
+            # n_attempted=0 (F2 emission structure); the counter INCREMENTS
+            # happen AFTER resolution below (Fix 2a n_attempted semantics).
             vals = cells.setdefault(key, [])
+            attempted.setdefault(key, 0)
             rebs = reb_cells.setdefault(key, [])
             side_att_key = side_attempted.setdefault(key, {})
-            side_att_key[f.side] = side_att_key.get(f.side, 0) + 1
-            side_vals = side_cells.setdefault(key, {}).setdefault(f.side, [])
-
-            ekey = (fill_expiry, float(h))
-            expiry_attempted[ekey] = expiry_attempted.get(ekey, 0) + 1
             evals = expiry_cells.setdefault(ekey, [])
+            expiry_attempted.setdefault(ekey, 0)
             erebs = reb_expiry_cells.setdefault(ekey, [])
 
-            mid_h = mid_lookup(f.market_id, f.ts + timedelta(seconds=h), f.ts + timedelta(seconds=hi_s))
-            if mid_h is None:
-                continue
-            mk = sign * (mid_h - f.price)
-            vals.append(mk)
-            evals.append(mk)
-            side_vals.append(mk)
-            # n-matched with vals/evals: appended ONLY on the same mid-lookup
-            # HIT branch, so rebate_avg averages over exactly the same fills
-            # as mk_avg.
-            rebs.append(reb_share)
-            erebs.append(reb_share)
+            # Resolution: persisted markout first (survives mid_log pruning),
+            # else the live mid_log lookup. `hkey` is keyed (fill_id,
+            # float(h)) only -- it does NOT capture hi_s, safe only because
+            # the production horizon set is fixed (see docstring). id=None
+            # fills never persist and never resolve from `persisted`.
+            hkey = (fill_id, float(h))
+            mk: Optional[float] = None
+            if fill_id is not None and persisted is not None and hkey in persisted:
+                mk = persisted[hkey]
+            elif fill_is_young:
+                # Live lookup only while the fill's mids can still exist: a
+                # miss on an older fill is a guaranteed miss forever (mids
+                # pruned), so skipping the query saves hundreds of pointless
+                # mid_log probes per report cycle without changing the report
+                # (mk stays None -> the old-miss neither-counter branch).
+                mid_h = mid_lookup(
+                    f.market_id, f.ts + timedelta(seconds=h), f.ts + timedelta(seconds=hi_s)
+                )
+                if mid_h is not None:
+                    mk = sign * (mid_h - f.price)
+                    if fill_id is not None:
+                        newly.append((fill_id, float(h), mk))
+
+            if mk is not None:
+                # Hit (persisted or live): counts in n AND n_attempted. rebs/
+                # erebs are appended in lockstep with vals/evals so rebate_avg
+                # averages over exactly the same fills as mk_avg.
+                vals.append(mk)
+                evals.append(mk)
+                side_cells.setdefault(key, {}).setdefault(f.side, []).append(mk)
+                rebs.append(reb_share)
+                erebs.append(reb_share)
+                attempted[key] += 1
+                expiry_attempted[ekey] += 1
+                side_att_key[f.side] = side_att_key.get(f.side, 0) + 1
+            elif fill_is_young:
+                # Miss but mids can still exist later -> n_attempted only (n
+                # unchanged). Same gating for side/expiry attempted counters.
+                attempted[key] += 1
+                expiry_attempted[ekey] += 1
+                side_att_key[f.side] = side_att_key.get(f.side, 0) + 1
+            # else: old miss -> counted in NEITHER counter (Fix 2a).
+
+    # Fix 2a: persist every newly-resolved live-mid markout once (never
+    # per-row). INSERT OR IGNORE on the store side makes a re-resolve a no-op.
+    if persist_cb is not None and newly:
+        persist_cb(newly)
 
     cell_list: List[Dict[str, object]] = []
     for key in sorted(cells.keys()):

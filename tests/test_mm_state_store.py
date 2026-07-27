@@ -17,6 +17,7 @@ from market_maker.contracts import (
     LiquidityRegime,
     LiquiditySource,
     LiquidityState,
+    PaperFill,
     QuoteMode,
     QuoteSet,
     RiskDirective,
@@ -169,6 +170,81 @@ def test_fills_append_only_multiple_rows_preserved(store):
     got = store.get_fills("mkt-1")
     assert len(got) == 3
     assert [f.order_id for f in got] == ["coid-0", "coid-1", "coid-2"]
+
+
+def test_fill_id_populated_by_get_fills_and_none_safe(store):
+    # Fix 2a: get_fills stamps each PaperFill.id with the fills rowid (the key
+    # for the persisted markout cache); a hand-built fill carries id=None.
+    fill = Fill(
+        ts=NOW, market_id="mkt-1", order_id="coid-1", side=Side.BUY_YES,
+        price=0.45, size=10.0, liquidity=LiquiditySource.MAKER, venue_ts=NOW,
+    )
+    row_id = store.append_fill(fill)
+    got = store.get_fills("mkt-1")
+    assert len(got) == 1
+    assert got[0].id == row_id
+    hand_built = PaperFill(
+        ts=NOW, market_id="m", order_id="o", side=Side.BUY_YES,
+        price=0.5, size=1.0, liquidity=LiquiditySource.MAKER, venue_ts=NOW,
+    )
+    assert hand_built.id is None
+
+
+# ---------------------------------------------------------------------------
+# fill_markouts (Fix 2a: durable per-fill markout cache)
+# ---------------------------------------------------------------------------
+
+
+def test_fill_markouts_round_trip(store):
+    n = store.append_fill_markouts([(1, 60.0, -0.05), (1, 600.0, -0.08), (2, 60.0, 0.01)])
+    assert n == 3
+    assert store.get_fill_markouts() == {(1, 60.0): -0.05, (1, 600.0): -0.08, (2, 60.0): 0.01}
+    # empty list is a no-op
+    assert store.append_fill_markouts([]) == 0
+
+
+def test_fill_markouts_insert_or_ignore_idempotent(store):
+    assert store.append_fill_markouts([(1, 60.0, -0.05)]) == 1
+    # re-appending the same (fill_id, horizon_s) is ignored -- the stored
+    # value is NOT overwritten and no new row is written.
+    assert store.append_fill_markouts([(1, 60.0, 0.99)]) == 0
+    assert store.get_fill_markouts() == {(1, 60.0): -0.05}
+
+
+def test_fill_markouts_prune_joins_fills_ts(store):
+    old_fill = Fill(
+        ts=NOW - timedelta(days=40), market_id="m1", order_id="o-old", side=Side.BUY_YES,
+        price=0.5, size=1.0, liquidity=LiquiditySource.MAKER, venue_ts=NOW - timedelta(days=40),
+    )
+    recent_fill = Fill(
+        ts=NOW - timedelta(days=1), market_id="m1", order_id="o-new", side=Side.BUY_YES,
+        price=0.5, size=1.0, liquidity=LiquiditySource.MAKER, venue_ts=NOW - timedelta(days=1),
+    )
+    old_id = store.append_fill(old_fill)
+    new_id = store.append_fill(recent_fill)
+    store.append_fill_markouts([(old_id, 60.0, -0.1), (new_id, 60.0, 0.02)])
+    # Prune rows whose fill.ts < cutoff (28d ago); only the 40d-old fill's
+    # markout goes.
+    deleted = store.prune_fill_markouts(NOW - timedelta(days=28))
+    assert deleted == 1
+    got = store.get_fill_markouts()
+    assert (old_id, 60.0) not in got
+    assert got == {(new_id, 60.0): 0.02}
+
+
+def test_fill_markouts_migration_on_pre_existing_db(tmp_path):
+    # Fresh db already has the table (the round-trip above proves it). A
+    # pre-2a db without the table gains it on reopen (CREATE TABLE IF NOT
+    # EXISTS in _init_schema, same pattern as the bankrolls region migration).
+    db_path = str(tmp_path / "mm.db")
+    s = MMStateStore(db_path)
+    s._conn.execute("DROP TABLE fill_markouts")
+    s._conn.commit()
+    s.close()
+    s2 = MMStateStore(db_path)
+    s2.append_fill_markouts([(1, 60.0, -0.05)])
+    assert s2.get_fill_markouts() == {(1, 60.0): -0.05}
+    s2.close()
 
 
 # ---------------------------------------------------------------------------

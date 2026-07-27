@@ -30,9 +30,19 @@ with the MOST RESTRICTIVE mode, summed eps_add, min kelly_mult, any cancel_all:
       older than 2x `fv_max_age_s` -> PULLED. `fair_value_age_s=None`
       (default) is inert -- callers that do not thread it (e.g. Stage-A) see
       no behavior change.
-  Note: rules (c) and (f) both derive their one-sided direction from the SAME
-  underlying signed inventory q, so when both fire on one market they agree
-  and _more_restrictive does not escalate them to PULLED.
+  (h) ladder mid-velocity pull (Fix 3, 2026-07-26) -- a fast ladder-wide mid
+      move (`mid_move_p` > `mid_move_pull_p`, prob units over the harness's
+      trailing `mid_move_window_s`) signals a live BTC burst the 30-min-stale
+      vol-gate CSV cannot see: resting quotes get picked off ~10c through the
+      mid. With non-dust `inventory_q` -> the reduce-only side (ASK_ONLY if
+      long else BID_ONLY, so the unwind path survives the burst), else ->
+      PULLED. The 60s hysteresis latch supplies burst-continuation protection
+      (the pull holds through the trend leg). `mid_move_p=None` (default) or
+      `mid_move_pull_p <= 0` is inert -- direct callers/tests and Stage-A see
+      no behavior change.
+  Note: rules (c), (f) and (h) all derive their one-sided direction from the
+  SAME underlying signed inventory q, so when they co-fire on one market they
+  agree and _more_restrictive does not escalate them to PULLED.
   manual override -> PULLED (MANUAL trigger).
 
 Any transition INTO a restrictive mode latches for latch_seconds (default 60s);
@@ -153,16 +163,21 @@ class RiskController:
                  strike: Optional[float] = None,
                  manual_override: bool = False,
                  vol_gate_result: Optional[object] = None,
-                 fair_value_age_s: Optional[float] = None) -> RiskDirective:
+                 fair_value_age_s: Optional[float] = None,
+                 mid_move_p: Optional[float] = None) -> RiskDirective:
         """Produce the RiskDirective for one market at one tick.
 
         inventory_q: signed per-market position (q > 0 = long/excess YES,
-        q < 0 = short/excess NO); None = unknown. Consumed only by rule (f):
-        a DEGENERATE liquidity regime with a nonzero (non-dust) inventory_q
-        quotes the reduce-only side instead of pulling entirely. Default
-        None preserves the pre-2026-07-14 PULLED-on-degenerate behavior for
-        callers that do not thread it (e.g. Stage-A shadow_runner, which is
-        fill-free by construction).
+        q < 0 = short/excess NO); None = unknown. Consumed by rules (f) and
+        (h): a DEGENERATE liquidity regime, or a fast ladder mid move, with a
+        nonzero (non-dust) inventory_q quotes the reduce-only side instead of
+        pulling entirely. Default None preserves the pre-2026-07-14
+        PULLED-on-degenerate behavior for callers that do not thread it (e.g.
+        Stage-A shadow_runner, which is fill-free by construction).
+
+        mid_move_p: ladder-wide |mid move| over the harness's trailing
+        mid_move_window_s (prob units), the rule (h) signal. None (default)
+        is inert -- direct callers/tests that do not thread it see no change.
         """
         vg = vol_gate_result
         if vg is None and self._vol_gate_fn is not None:
@@ -255,6 +270,25 @@ class RiskController:
             elif fair_value_age_s > fv_max_age:
                 eps_add += self._pricer_stale_eps_add
                 triggers.append(RiskTrigger.FAIR_VALUE_STALE)
+
+        # (h) ladder mid-velocity pull (Fix 3, 2026-07-26). A fast ladder-wide
+        # mid move signals a live BTC burst the 30-min-stale vol-gate CSV
+        # cannot see; resting quotes get picked off ~10c through the mid.
+        # Reduce-only when positioned (a flat pull would remove the unwind
+        # path exactly when unwinding matters most -- the stranded-inventory
+        # lesson), else PULLED. Same signed-q basis as rules (c)/(f), so a
+        # co-fire agrees on the one-sided direction and never escalates to
+        # PULLED via the opposite-one-sided rule. The 60s hysteresis latch
+        # carries the pull through the burst's trend leg. mid_move_p=None
+        # (default) or mid_move_pull_p <= 0 is inert.
+        if (self._cfg.mid_move_pull_p > 0.0 and mid_move_p is not None
+                and mid_move_p > self._cfg.mid_move_pull_p):
+            if inventory_q is not None and abs(inventory_q) > _INV_DUST:
+                side_mode = QuoteMode.ASK_ONLY if inventory_q > 0 else QuoteMode.BID_ONLY
+                req_mode = _more_restrictive(req_mode, side_mode)
+            else:
+                req_mode = _more_restrictive(req_mode, QuoteMode.PULLED)
+            triggers.append(RiskTrigger.MID_VELOCITY)
 
         # manual override
         if manual_override:

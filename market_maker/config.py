@@ -180,11 +180,33 @@ class MMConfig:
     bankroll_floor: float = 0.02
     risk_latch_seconds: float = 60.0
 
+    # --- ladder mid-velocity pull (Fix 3, risk rule h, 2026-07-26) ---
+    # 2026-07-26 VPS diagnosis: all the fill bleed lands INSIDE multi-minute
+    # BTC bursts -- fills land ~10c THROUGH the resting mid (stale-quote
+    # pick-off), and the vol gate is blind to a live burst because its
+    # DATA/btc_intraday_1m.csv only refreshes every 30 min (mm-datafetch.timer).
+    # The ladder's OWN mids are visible live, per tick, in the harness; rule
+    # (h) (risk_controller) pulls -- or reduce-only when positioned -- when the
+    # ladder-wide mid moves more than mid_move_pull_p over the trailing
+    # mid_move_window_s. Detection is one tick late by construction (cannot
+    # stop the FIRST fill of a burst); it kills the repeated
+    # re-quote-into-the-trend fills.
+    mid_move_pull_p: float = 0.04  # prob units; ladder-wide mid move over the window that fires rule (h); <= 0 disables
+    mid_move_window_s: float = 120.0  # trailing window for the ladder mid-velocity measurement
+
     # --- markout-based sizing (wave 2 W8) ---
     markout_min_n: int = 20  # min fills in a resolved cell to trust measured markout over the prior
     markout_horizon_s: float = 600.0  # sizing lookup horizon (middle of the 60/600/3600 report horizons)
     markout_prior_var: float = (2 * 0.0085) ** 2  # uninformed sigma2_edge prior, ~2 AS-buffers wide
     depth_cap_floor_shares: float = 1.0  # depth cap never zeroes size below this (venue min order size)
+    # Unmeasured-cell size multiplier (Fix 2b, 2026-07-26). A sizing cell with
+    # fewer than markout_min_n resolved attempts quotes at this fraction of
+    # its full size (reduce side exempt), floored back to depth_cap_floor_
+    # shares so it can still fill and become measured. 1.0 disables. Diagnosis:
+    # an unmeasured cell's m_prior (~+half-spread) is positive, so both the
+    # Kelly path and the presence floor ran full size, paying ~20 cap-sized
+    # losses of "tuition" per cell before the m-clamp could turn it off.
+    unmeasured_size_mult: float = 0.33
 
     # --- markout-fed spread widening (package E, spread term 7, 2026-07-15) ---
     # Quoting's counterpart to the markout-based sizing haircut above: widen
@@ -192,7 +214,11 @@ class MMConfig:
     # (spread_builder.markout_widen), instead of only assuming eps_base
     # covers adverse selection. See spread_builder module docstring term 7.
     markout_widen_scale: float = 1.0  # 0 disables the whole term
-    markout_widen_cap: float = 0.05  # hard cap per side, prob units (5c)
+    markout_widen_cap: float = 0.12  # hard cap per side, prob units (12c)
+    # 2026-07-26 VPS measurement: measured 60s side markouts ran -9 to -16c
+    # while the prior 5c cap bound everywhere and the bot bled -5c/share over
+    # 283 fills; 12c covers most of the toxicity distribution while staying
+    # bounded (was 0.05).
     # 60s: the cleanest pick-off signal (measured -4.2c/-3.9c belly/wing at
     # 60s, VPS evidence 2026-07-15) -- deliberately DIFFERENT from sizing's
     # 600s markout_horizon_s above, which measures net edge for Kelly, not

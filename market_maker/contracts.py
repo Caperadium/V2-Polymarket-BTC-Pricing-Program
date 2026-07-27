@@ -62,6 +62,12 @@ class RiskTrigger(Enum):
     # written by the same-or-older code, so adding a member here cannot
     # break reads of an existing db.
     FAIR_VALUE_STALE = "FAIR_VALUE_STALE"
+    # Fix 3 (2026-07-26): write-only additive member, same rationale as
+    # FAIR_VALUE_STALE above -- the only deserializer (state_store.
+    # get_risk_journal -> RiskTrigger(t)) reads values written by the
+    # same-or-older code, so a new member cannot break reads of an existing
+    # db. Emitted by risk rule (h), the ladder mid-velocity pull.
+    MID_VELOCITY = "MID_VELOCITY"
 
 
 class LiquidityRegime(Enum):
@@ -438,6 +444,12 @@ class PaperFill(Fill):
     mid_p1m: Optional[float] = None  # NaN/None until elapsed
     mid_p10m: Optional[float] = None
     mid_p1h: Optional[float] = None
+    # Fix 2a (2026-07-26): the fills-table rowid, populated by
+    # state_store._fill_from_row on read. The key for the persisted
+    # per-fill markout cache (pnl_report.fill_markouts). None for hand-built
+    # or off-store pseudo-fills, which never persist and never resolve from
+    # the persisted map (id-None guard in pnl_report.markout_report).
+    id: Optional[int] = None
 
 
 # ---------------------------------------------------------------------------

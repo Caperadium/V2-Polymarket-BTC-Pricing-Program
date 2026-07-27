@@ -520,9 +520,11 @@ The applied terms:
   markout rather than a constant. For each side independently,
   `spread_builder.markout_widen(mk_avg, scale, cap) = clamp(-mk_avg, 0,
   cap) * scale`: a negative average markout (this side is measurably
-  getting picked off) widens that side only, up to a 5-cent cap; a flat or
-  favorable markout adds nothing -- there is deliberately no symmetric
-  "tighten on good markout" branch. `mk_avg` comes from the markout report's
+  getting picked off) widens that side only, up to a 12-cent cap
+  (`markout_widen_cap` 0.05 -> 0.12, 2026-07-26: measured 60s side markouts
+  ran -9 to -16c while the 5c cap bound everywhere and the bot bled
+  -5c/share over 283 fills); a flat or favorable markout adds nothing --
+  there is deliberately no symmetric "tighten on good markout" branch. `mk_avg` comes from the markout report's
   per-side breakdown (Section 14.2) at a *60-second* horizon -- shorter than
   sizing's 600-second `markout_horizon_s` on purpose, since 60s is the
   cleanest pick-off signal and 600s starts folding in ordinary BTC drift
@@ -536,10 +538,13 @@ The applied terms:
   value, so every widened quote still moves in the intended direction
   post-repair, it just may not carry the full local widening amount right
   at a boundary. The term is self-resetting: the markout report is a
-  rolling 7-day window, so if wider quotes stop the toxic fills entirely,
-  those fills age out, the side's `n` drops back below `markout_min_n`, the
-  term reverts to zero, and quotes re-tighten -- no separate decay
-  machinery needed.
+  rolling 28-day window (7d until 2026-07-26 -- the shorter window let a
+  measured-toxic verdict expire weekly and full-size quoting resume on the
+  same cell, see Section 14.2's persistence note), so if wider quotes stop
+  the toxic fills entirely, those fills age out, the side's `n` drops back
+  below `markout_min_n`, the term reverts to zero, and quotes re-tighten --
+  no separate decay machinery needed, just a month-scale decay instead of a
+  week-scale one.
 
 Then mechanics, in strict order: widen each side (terms 2/4/5/6
 symmetrically, term 7 asymmetrically per side -- the shift this can put on
@@ -717,6 +722,22 @@ in this order:
   perpetually-resting floor quote bleeding to a genuinely toxic counterparty
   forever, which the wave-1 unconditional floor could not distinguish from
   ordinary cold-start presence.
+- **Unmeasured-cell multiplier (2026-07-26).** The gate above has a gap the
+  live bleed exposed: an UNMEASURED cell's `m_gate` is the structural prior
+  (posted-edge minus eps_base), which is roughly +half-spread -- positive --
+  so both the floor and the Kelly path ran at full size until the cell
+  accumulated `markout_min_n` fills, i.e. each cell paid ~20 cap-sized
+  losses of tuition before a toxic verdict could act. Now every leg whose
+  cell has `mk_n_attempted < markout_min_n` is scaled by
+  `unmeasured_size_mult` (0.33; 1.0 disables), EXCEPT the reduce-side leg
+  of a positioned market (unwinding must never slow). The scaled size is
+  floored back up to `depth_cap_floor_shares` (1 share, a proxy for the
+  venue minimum order size) when the pre-scale size was at or above it --
+  otherwise the venue-minimum rule would silently no-quote the side, no
+  fills would accumulate, and the cell could never become measured (a
+  learning deadlock). Fill COUNT -- the learning signal -- accrues at
+  nearly the same rate; tuition per fill drops ~3x (less on thin legs
+  floored back to 1 share).
 - **Reduce-side exemption, ungated.** Cash-EV Kelly has a blind spot: when
   inventory skew exceeds the effective spread, the unload side's Kelly
   fraction (and therefore its floor, if gated) can go to exactly zero --
@@ -750,8 +771,9 @@ in this order:
   used to permanently zero our size on that side; the depth cap's job is
   impact control (don't rest more than the book ever shows near the touch),
   not presence control, so it now floors at a venue-minimum restorable size
-  (default 1 share) instead. Runs after the presence floor, reduce-side
-  exemption, and inventory cap, so it remains a hard minimum over all three.
+  (default 1 share) instead. Runs after the presence floor, unmeasured-cell
+  multiplier, reduce-side exemption, and inventory cap, so it remains a hard
+  minimum over all of them.
 
 Finally, the **bucket worst-case cap** is the joint-ladder control: all
 strikes in one expiry settle off the *same* terminal BTC spot, so a YES leg
@@ -877,6 +899,7 @@ independent:
 | Pricer stale | snapshot age > 300 s / > 600 s | widen / PULLED |
 | Fair value stale | consensus age > 300 s / > 600 s | widen / PULLED |
 | Liquidity degenerate | book effectively empty | PULLED when flat; reduce-only side (away from the position) when holding inventory (2026-07-14 fix) |
+| Mid velocity (rule h, 2026-07-26) | any strike's two-sided mid moved > `mid_move_pull_p` (4c) within `mid_move_window_s` (120 s), ladder-wide max | PULLED when flat; reduce-only side (away from the position) when holding inventory |
 | Manual override | operator stop, stale BTC data, unresolved resume discrepancy | PULLED |
 
 Multiple triggers combine to the **most restrictive** mode; two *opposite*
@@ -900,6 +923,26 @@ DEPTH cap floor (1 share) means the position drains gradually. Feed-dead,
 near-resolution, staleness, vol-shock and manual pulls are deliberately
 unchanged -- those are states where no quote can be trusted, and inventory
 parked by them is surfaced by the heartbeat's stranded metric instead.
+
+The mid-velocity rule (h) exists because the vol gate cannot see a live
+burst: it reads `DATA/btc_intraday_1m.csv`, refreshed only every 30 minutes
+by the datafetch timer, while the 2026-07-26 fill autopsy showed ALL of the
+bleed landing inside multi-minute BTC bursts -- resting quotes were swept
+~10c through the mid before any defense reacted (15 s tick, 300 s reprice,
+1-tick requote deadband). The ladder's own mids ARE visible live, per tick,
+in the harness: it keeps a small per-market history of two-sided mids
+(single-sided fallback mids are excluded -- a book flickering between one-
+and two-sided would fake large moves, and the max-over-markets aggregation
+would let one noisy strike pull the whole ladder), computes the largest
+absolute move within the window across the ladder, and threads it into
+`evaluate`. One strike's real move protects every strike -- informed flow
+hits the moving strike first and its neighbors next. Detection is one tick
+late by construction, so the FIRST fill of a burst still lands; the 60 s
+hysteresis latch then holds the pull through the trend continuation, which
+is where the repeated cap-sized losses actually occurred. Like rules (c)
+and (f), a positioned market quotes reduce-only instead of pulling (same
+signed-q basis, so co-fires agree), preserving the unwind path exactly when
+unwinding matters most.
 
 Package D (2026-07-15) redefined the breach *metric* itself, leaving the
 mode logic above untouched. The old |q|/q_max ratio inherited q_max's
@@ -1064,9 +1107,26 @@ negative markout at all horizons is an MM slowly bleeding to informed flow.
 The report cross-tabulates markout by book region (belly / wing -- directly
 testing whether the pricer's known belly bias leaks through the consensus
 anchor into realized fill quality) and time-to-expiry bucket (0-1 d / 1-2 d /
-2-4 d / 4 d+), over a rolling 7-day window from the durable per-tick mid log.
+2-4 d / 4 d+), over a rolling 28-day window (`MARKOUT_LOOKBACK_S`, 7d ->
+28d 2026-07-26). Since 2026-07-26 each fill's markout is computed ONCE and
+persisted to the state store's `fill_markouts` table
+(`(fill_id, horizon_s) -> mk`, INSERT OR IGNORE, pruned past the lookback);
+the per-tick `mid_log` itself is still pruned to 7 days
+(`MID_LOG_RETENTION_S` -- disk cost unchanged), and fills older than that
+resolve from the persisted table. Before this split, lookback and mid
+retention were the same 7-day constant, so a measured-toxic cell's verdict
+EXPIRED weekly: `mk_n` dropped below `markout_min_n`, sizing reverted to
+the optimistic structural prior, and full-size quoting resumed on a cell
+already known to be toxic (the observed weekly re-arm bleed cycle).
 Each cell reports both successful lookups `n` and `n_attempted`, so "no
-fills" is distinguishable from "mids missing". This table is the primary
+fills" is distinguishable from "mids missing" -- with one semantics rule
+(2026-07-26): a fill/horizon that resolved (live or persisted) counts in
+both; an unresolved fill still young enough that its mids can exist
+(within `MID_LOG_RETENTION_S`) counts in `n_attempted` only; an unresolved
+fill older than that is permanently unresolvable and counts in NEITHER --
+otherwise phantom attempts would mark never-measured cells as "attempted
+enough", switching off both the sizing exploration gate and the
+unmeasured-cell multiplier on cells with no actual measurements. This table is the primary
 input to the post-acceptance spread recalibration: per-cell, spreads should
 cover realized adverse selection, and cells that never fill are charging too
 much.

@@ -151,13 +151,16 @@ def test_baker_mchale_monotone_and_sigma0():
 
 
 def test_sigma2_zero_still_capped_by_fractional_c():
-    # Cold-start (no markout fields) -> m_prior = (p_hat - bid_price) - eps_base.
-    # sigma2_edge falls back to config.markout_prior_var regardless of the
-    # snapshot's sigma2_ladder (wave 2: per-strike/ladder MC-SE is dropped
-    # from leg shrinkage) -- set markout_prior_var=0.0 here so k_shrink=1 and
-    # the c<=0.5 ceiling is isolated as the binding control, matching the
-    # original (wave 1) intent of this test.
-    c = ContractSizingInput("m0", p_hat=0.6, bid_price=0.5, ask_price=0.55)
+    # m_prior = (p_hat - bid_price) - eps_base. sigma2_edge falls back to
+    # config.markout_prior_var regardless of the snapshot's sigma2_ladder
+    # (wave 2: per-strike/ladder MC-SE is dropped from leg shrinkage) -- set
+    # markout_prior_var=0.0 here so k_shrink=1 and the c<=0.5 ceiling is
+    # isolated as the binding control, matching the original (wave 1) intent.
+    # Fix 2b: set mk_n_attempted at markout_min_n so the unmeasured-cell size
+    # multiplier is OFF (the fractional-c cap, not the throttle, is this
+    # test's point); mk_avg stays None so the edge is still the structural
+    # m_prior path.
+    c = ContractSizingInput("m0", p_hat=0.6, bid_price=0.5, ask_price=0.55, mk_n_attempted=20)
     dec, _ = size_ladder(
         [c], _snap(0.0), bankroll=1000.0, ts=TS,
         config=MMConfig(presence_frac=0.0, markout_prior_var=0.0),
@@ -294,14 +297,20 @@ def test_concentrated_book_scaled_to_bucket_cap():
 def test_post_floor_bucket_recheck_rescales_floored_sizes():
     # All legs at zero directional edge (p_hat==bid_price==ask_price) -> Kelly
     # f*=0 everywhere, so EVERY leg's size comes purely from the presence
-    # floor (cold-start -> exploration carve-out -> gate stays ON). A
-    # large-enough presence_frac makes the floor itself breach the
+    # floor. A large-enough presence_frac makes the floor itself breach the
     # worst-case bucket cap; the recheck must catch a purely-floor-driven
-    # breach (not just a Kelly-driven one) and rescale every leg.
+    # breach (not just a Kelly-driven one) and rescale every leg. Fix 2b: use
+    # a MEASURED fixture (mk_avg=0.0, mk_n/mk_n_attempted>=min_n) so the
+    # unmeasured-cell multiplier is OFF -- the floor gate stays ON via
+    # m_gate==0.0 (>=0), the floor runs at full size, and the bucket recheck
+    # is the sole cutter (which is what this test exercises).
     strikes = [98000.0, 100000.0, 102000.0]
     snap = _snap(0.0, strikes=strikes)
     cs = [
-        ContractSizingInput("m%d" % i, p_hat=0.5, bid_price=0.5, ask_price=0.5, strike=k)
+        ContractSizingInput(
+            "m%d" % i, p_hat=0.5, bid_price=0.5, ask_price=0.5, strike=k,
+            mk_avg=0.0, mk_var=0.0, mk_n=25, mk_n_attempted=25,
+        )
         for i, k in enumerate(strikes)
     ]
     dec, audit = size_ladder(
@@ -321,9 +330,13 @@ def test_post_floor_bucket_recheck_rescales_floored_sizes():
 
 def test_ruin_cap_binds_no_strikes_fallback():
     # No strike info on any leg -> the conservative sum-cap fallback (old
-    # ruin-stage semantics, applied in share space) is exercised.
+    # ruin-stage semantics, applied in share space) is exercised. Fix 2b: set
+    # mk_n_attempted at markout_min_n so the unmeasured-cell multiplier is OFF
+    # (it would otherwise throttle sizes below the RUIN threshold before the
+    # sum-cap runs, hiding the binding this test checks); mk_avg stays None so
+    # sizing is still the pre-2b m_prior path.
     cs = [
-        ContractSizingInput("m%d" % i, p_hat=0.9, bid_price=0.5, ask_price=0.5)
+        ContractSizingInput("m%d" % i, p_hat=0.9, bid_price=0.5, ask_price=0.5, mk_n_attempted=20)
         for i in range(5)
     ]
     dec, _ = size_ladder(cs, _snap(0.0), bankroll=1000.0, ts=TS, config=MMConfig(presence_frac=0.0))
@@ -393,16 +406,19 @@ def test_negative_edge_zero_both_sides():
 
 def test_negative_edge_default_config_gets_tapered_floor():
     # With the default (presence_frac=0.005, ON), the same negative-edge
-    # contract gets nonzero, floor-sized quotes on both sides instead of 0.
-    # Cold-start (no markout fields at all -> mk_n_attempted=0 <
-    # markout_min_n) is the exploration carve-out -- the W4 gate stays ON
-    # regardless of the (negative) m_gate sign, so the floor behaves exactly
-    # as wave 1's unconditional floor.
+    # contract gets nonzero floor-sized quotes on both sides instead of 0.
+    # Cold-start (no markout fields -> mk_n_attempted=0 < markout_min_n) is the
+    # exploration carve-out -- the W4 gate stays ON regardless of the
+    # (negative) m_gate sign, so the presence floor still applies. Fix 2b: the
+    # cell is unmeasured, so the unmeasured-cell multiplier throttles the
+    # floor by config.unmeasured_size_mult (pre-mult 9.09 shares/side >=
+    # depth_cap_floor_shares, so no floor-back; the accumulate side is
+    # scaled, and with no inventory neither leg is reduce-side exempt).
     c = ContractSizingInput("m0", p_hat=0.5, bid_price=0.55, ask_price=0.45)
     cfg = MMConfig()
     dec, _ = size_ladder([c], _snap(0.0), bankroll=1000.0, ts=TS, config=cfg)
-    expected_bid = cfg.presence_frac * 1000.0 / 0.55
-    expected_ask = cfg.presence_frac * 1000.0 / 0.55  # NO price_per_share = 1-ask_price = 0.55
+    expected_bid = cfg.presence_frac * 1000.0 / 0.55 * cfg.unmeasured_size_mult
+    expected_ask = cfg.presence_frac * 1000.0 / 0.55 * cfg.unmeasured_size_mult  # NO price_per_share = 1-ask_price = 0.55
     assert abs(dec["m0"].bid_size - expected_bid) < 1e-9
     assert abs(dec["m0"].ask_size - expected_ask) < 1e-9
     assert dec["m0"].bid_size > 0.0
@@ -487,7 +503,12 @@ def test_posted_edge_prior_path_all_fields_default():
     k_expected = baker_mchale(f_expected, b_expected, cfg.markout_prior_var)
     assert abs(dec["m0"].f_kelly - f_expected) < 1e-12
     assert abs(dec["m0"].k_shrink - k_expected) < 1e-12  # unmeasured -> markout_prior_var
-    assert abs(dec["m0"].bid_size - f_expected * k_expected * 0.5 * 1000.0 / 0.5) < 1e-6
+    # Fix 2b: f_kelly/k_shrink (fraction space) are unchanged, but the
+    # unmeasured cell's SHARE size is throttled by unmeasured_size_mult
+    # (pre-mult Kelly shares >> depth_cap_floor_shares, so no floor-back).
+    assert abs(
+        dec["m0"].bid_size - f_expected * k_expected * 0.5 * 1000.0 / 0.5 * cfg.unmeasured_size_mult
+    ) < 1e-6
 
 
 def test_markout_haircut_monotonicity():
@@ -566,7 +587,10 @@ def test_max_add_fields_zero_when_inventory_not_passed():
 def test_presence_floor_nonzero_at_zero_edge():
     # p_hat == posted bid == posted ask (1-ask=0.5): structural edge is 0 on
     # both legs; the floor is still nonzero (cold-start -> exploration
-    # carve-out -> gate ON).
+    # carve-out -> gate ON). Fix 2b: the cell is unmeasured, so the floor size
+    # is throttled by config.unmeasured_size_mult (pre-mult 10 shares/side >=
+    # depth_cap_floor_shares -> no floor-back; no inventory -> no reduce-side
+    # exemption).
     c = ContractSizingInput("m0", p_hat=0.5, bid_price=0.5, ask_price=0.5, strike=100000.0)
     cfg = MMConfig(presence_frac=0.005)
     dec, audit = size_ladder(
@@ -574,7 +598,7 @@ def test_presence_floor_nonzero_at_zero_edge():
         per_expiry_cap_frac=0.9, bankroll_util_cap=0.9,
     )
     d = dec["m0"]
-    expected = cfg.presence_frac * 1000.0 / 0.5
+    expected = cfg.presence_frac * 1000.0 / 0.5 * cfg.unmeasured_size_mult
     assert abs(d.bid_size - expected) < 1e-9
     assert abs(d.ask_size - expected) < 1e-9
     assert d.bid_size > 0.0 and d.ask_size > 0.0
@@ -630,10 +654,16 @@ def test_presence_floor_never_overrides_bucket_cap():
     # test_post_floor_bucket_recheck_rescales_floored_sizes for the
     # hand-verified numbers). Here just confirm the floor value ITSELF
     # (pre-bucket-cap) exceeds the final size, proving the cap dominates.
+    # Fix 2b: MEASURED fixture (mk_avg=0.0, mk_n/mk_n_attempted>=min_n) so the
+    # unmeasured-cell multiplier is OFF and the bucket cap -- not the throttle
+    # -- is what cuts the floor.
     strikes = [98000.0, 100000.0, 102000.0]
     snap = _snap(0.0, strikes=strikes)
     cs = [
-        ContractSizingInput("m%d" % i, p_hat=0.5, bid_price=0.5, ask_price=0.5, strike=k)
+        ContractSizingInput(
+            "m%d" % i, p_hat=0.5, bid_price=0.5, ask_price=0.5, strike=k,
+            mk_avg=0.0, mk_var=0.0, mk_n=25, mk_n_attempted=25,
+        )
         for i, k in enumerate(strikes)
     ]
     cfg = MMConfig(presence_frac=0.05, fractional_kelly_c=1.0)
@@ -757,3 +787,150 @@ def test_reduce_side_exemption_caps_still_dominate():
     )
     assert dec["m0"].ask_size == 2.0
     assert SizingCap.DEPTH in dec["m0"].caps_applied
+
+
+# --- Fix 2b: unmeasured-cell size multiplier ------------------------------
+
+
+def test_unmeasured_leg_scaled_by_multiplier():
+    # Cold-start (unmeasured) cell: the accumulate-side share size is the full
+    # Kelly size * config.unmeasured_size_mult (pre-mult shares well above
+    # depth_cap_floor_shares, so no floor-back). presence_frac=0 isolates the
+    # Kelly path. Compared against the same config with the multiplier off.
+    cfg = MMConfig(presence_frac=0.0, markout_min_n=20)
+    c = ContractSizingInput("m0", p_hat=0.9, bid_price=0.5, ask_price=0.5)
+    dec_mult, audit = size_ladder(
+        [c], _snap(0.0), bankroll=1000.0, ts=TS, config=cfg,
+        per_expiry_cap_frac=0.9, bankroll_util_cap=10.0,
+    )
+    dec_full, _ = size_ladder(
+        [c], _snap(0.0), bankroll=1000.0, ts=TS,
+        config=MMConfig(presence_frac=0.0, markout_min_n=20, unmeasured_size_mult=1.0),
+        per_expiry_cap_frac=0.9, bankroll_util_cap=10.0,
+    )
+    assert dec_full["m0"].bid_size > cfg.depth_cap_floor_shares  # floor-back inert
+    assert abs(dec_mult["m0"].bid_size - dec_full["m0"].bid_size * cfg.unmeasured_size_mult) < 1e-9
+    stage = next(s for s in audit["stages"] if s["stage"] == "unmeasured_mult")
+    assert any(e["market_id"] == "m0" and e["is_yes"] for e in stage["legs"])
+
+
+def test_measured_leg_not_scaled_by_multiplier():
+    # A trusted-measured cell (mk_n_attempted >= markout_min_n) is exempt: its
+    # size is identical with the multiplier on or off, and the stage records
+    # nothing.
+    cfg = MMConfig(presence_frac=0.0, markout_min_n=20)
+    c = ContractSizingInput(
+        "m0", p_hat=0.9, bid_price=0.5, ask_price=0.5,
+        mk_avg=0.05, mk_var=0.0004, mk_n=25, mk_n_attempted=25,
+    )
+    dec_mult, audit = size_ladder(
+        [c], _snap(0.0), bankroll=1000.0, ts=TS, config=cfg,
+        per_expiry_cap_frac=0.9, bankroll_util_cap=10.0,
+    )
+    dec_off, _ = size_ladder(
+        [c], _snap(0.0), bankroll=1000.0, ts=TS,
+        config=MMConfig(presence_frac=0.0, markout_min_n=20, unmeasured_size_mult=1.0),
+        per_expiry_cap_frac=0.9, bankroll_util_cap=10.0,
+    )
+    assert dec_mult["m0"].bid_size == dec_off["m0"].bid_size
+    assert dec_mult["m0"].bid_size > 0.0
+    stage = next(s for s in audit["stages"] if s["stage"] == "unmeasured_mult")
+    assert stage["legs"] == []
+
+
+def test_unmeasured_multiplier_floors_back_to_venue_min():
+    # pre-mult >= depth_cap_floor_shares but pre-mult*mult < it -> floored
+    # back UP to depth_cap_floor_shares so the throttled side stays quotable
+    # (and can still accumulate the fills that will measure it).
+    cfg = MMConfig(presence_frac=0.0025, markout_min_n=20, unmeasured_size_mult=0.1)
+    c = ContractSizingInput("m0", p_hat=0.5, bid_price=0.5, ask_price=0.5, strike=100000.0)
+    dec, _ = size_ladder(
+        [c], _snap(0.0), bankroll=1000.0, ts=TS, config=cfg,
+        per_expiry_cap_frac=0.9, bankroll_util_cap=0.9,
+    )
+    # presence floor = 0.0025*1000/0.5 = 5.0 shares (Kelly 0); 5*0.1 = 0.5 <
+    # 1.0 -> floored back to depth_cap_floor_shares (1.0).
+    assert abs(dec["m0"].bid_size - cfg.depth_cap_floor_shares) < 1e-9
+
+
+def test_unmeasured_multiplier_no_resurrect_below_floor():
+    # pre-mult shares already BELOW depth_cap_floor_shares -> pure multiply,
+    # NOT floored back up (a below-min leg is never resurrected).
+    cfg = MMConfig(presence_frac=0.00025, markout_min_n=20, unmeasured_size_mult=0.5)
+    c = ContractSizingInput("m0", p_hat=0.5, bid_price=0.5, ask_price=0.5, strike=100000.0)
+    dec, _ = size_ladder(
+        [c], _snap(0.0), bankroll=1000.0, ts=TS, config=cfg,
+        per_expiry_cap_frac=0.9, bankroll_util_cap=0.9,
+    )
+    # presence floor = 0.00025*1000/0.5 = 0.5 shares (< 1.0); 0.5*0.5 = 0.25,
+    # no floor-back.
+    assert abs(dec["m0"].bid_size - 0.25) < 1e-9
+
+
+def test_unmeasured_multiplier_exempts_reduce_side_long():
+    # q>0 (net long YES) -> the ask/NO leg is the reduce side and is EXEMPT
+    # from the unmeasured multiplier; the accumulate (bid/YES) side IS
+    # throttled. Zero directional edge -> both sides' size is the presence
+    # floor (ask taper 1.0, bid taper 0.95).
+    cfg = MMConfig(presence_frac=0.02, markout_min_n=20)
+    c = ContractSizingInput("m0", p_hat=0.5, bid_price=0.5, ask_price=0.5, strike=100000.0)
+    inv = _inv({"m0": (5.0, 100.0)})  # q=5>0, ample headroom both sides
+    dec, audit = size_ladder(
+        [c], _snap(0.0), bankroll=1000.0, ts=TS, config=cfg,
+        per_expiry_cap_frac=0.9, bankroll_util_cap=0.9, inventory=inv,
+    )
+    stage = next(s for s in audit["stages"] if s["stage"] == "unmeasured_mult")
+    assert any(e["is_yes"] for e in stage["legs"])          # bid/YES throttled
+    assert not any(not e["is_yes"] for e in stage["legs"])  # ask/NO (reduce) exempt
+    assert abs(dec["m0"].ask_size - 40.0) < 1e-9  # reduce side at full presence floor
+    assert abs(dec["m0"].bid_size - 38.0 * cfg.unmeasured_size_mult) < 1e-9  # 0.95 taper * throttle
+
+
+def test_unmeasured_multiplier_exempts_reduce_side_short():
+    # q<0 (short YES / net long NO) -> the bid/YES leg is the reduce side and
+    # is EXEMPT; the accumulate (ask/NO) side IS throttled.
+    cfg = MMConfig(presence_frac=0.02, markout_min_n=20)
+    c = ContractSizingInput("m0", p_hat=0.5, bid_price=0.5, ask_price=0.5, strike=100000.0)
+    inv = _inv({"m0": (-5.0, 100.0)})  # q=-5<0
+    dec, audit = size_ladder(
+        [c], _snap(0.0), bankroll=1000.0, ts=TS, config=cfg,
+        per_expiry_cap_frac=0.9, bankroll_util_cap=0.9, inventory=inv,
+    )
+    stage = next(s for s in audit["stages"] if s["stage"] == "unmeasured_mult")
+    assert any(not e["is_yes"] for e in stage["legs"])  # ask/NO throttled
+    assert not any(e["is_yes"] for e in stage["legs"])  # bid/YES (reduce) exempt
+    assert abs(dec["m0"].bid_size - 40.0) < 1e-9  # reduce side at full presence floor
+    assert abs(dec["m0"].ask_size - 38.0 * cfg.unmeasured_size_mult) < 1e-9
+
+
+def test_unmeasured_multiplier_caps_still_dominate():
+    # A multiplied-then-floored unmeasured leg is still clipped by a firmer
+    # cap (depth here): the multiplier runs BEFORE the caps, so a binding
+    # depth cap wins.
+    cfg = MMConfig(presence_frac=0.0, markout_min_n=20)
+    c = ContractSizingInput("m0", p_hat=0.9, bid_price=0.5, ask_price=0.5)
+    liq = {"m0": _liq("m0", 3.0, 3.0)}
+    dec, _ = size_ladder(
+        [c], _snap(0.0), bankroll=1000.0, ts=TS, config=cfg, liquidity=liq,
+        per_expiry_cap_frac=0.9, bankroll_util_cap=0.9,
+    )
+    # Kelly bid ~ big; *0.33 still >> 3.0 realized depth -> depth clips to 3.0.
+    assert dec["m0"].bid_size == 3.0
+    assert SizingCap.DEPTH in dec["m0"].caps_applied
+
+
+def test_unmeasured_multiplier_disabled_byte_identical():
+    # unmeasured_size_mult=1.0 disables the throttle -> an unmeasured
+    # cold-start leg keeps the full presence-floor size (pre-2b behavior), and
+    # the stage records nothing.
+    cfg = MMConfig(presence_frac=0.005, unmeasured_size_mult=1.0)
+    c = ContractSizingInput("m0", p_hat=0.5, bid_price=0.5, ask_price=0.5, strike=100000.0)
+    dec, audit = size_ladder(
+        [c], _snap(0.0), bankroll=1000.0, ts=TS, config=cfg,
+        per_expiry_cap_frac=0.9, bankroll_util_cap=0.9,
+    )
+    expected = cfg.presence_frac * 1000.0 / 0.5  # full, un-throttled floor
+    assert abs(dec["m0"].bid_size - expected) < 1e-9
+    assert abs(dec["m0"].ask_size - expected) < 1e-9
+    stage = next(s for s in audit["stages"] if s["stage"] == "unmeasured_mult")
+    assert stage["legs"] == []

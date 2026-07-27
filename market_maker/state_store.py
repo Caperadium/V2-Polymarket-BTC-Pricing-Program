@@ -268,6 +268,31 @@ class MMStateStore:
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_fills_market_id ON fills(market_id)"
             )
+            # Fix 2a (2026-07-26): prune_fill_markouts subqueries fills by ts
+            # every report cycle; every other ts-pruned table here has a ts
+            # index for exactly this pattern (fills itself is never pruned, so
+            # the scan would otherwise grow without bound).
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_fills_ts ON fills(ts)"
+            )
+            # Fix 2a (2026-07-26): durable per-fill markout cache keyed on the
+            # fills rowid + horizon. pnl_report.markout_report persists each
+            # newly-resolved (fill, horizon) markout here so a fill's markout
+            # survives after its mid_log rows are pruned (mid_log retention
+            # decouples from the report lookback -- see pnl_report
+            # MID_LOG_RETENTION_S / MARKOUT_LOOKBACK_S). CREATE TABLE IF NOT
+            # EXISTS runs automatically against the VPS db on first start,
+            # same pattern as the bankrolls region migration.
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS fill_markouts (
+                    fill_id INTEGER NOT NULL,
+                    horizon_s REAL NOT NULL,
+                    mk REAL NOT NULL,
+                    PRIMARY KEY (fill_id, horizon_s)
+                )
+                """
+            )
             self._conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS quotes (
@@ -697,6 +722,7 @@ class MMStateStore:
             mid_p1m=row["mid_p1m"],
             mid_p10m=row["mid_p10m"],
             mid_p1h=row["mid_p1h"],
+            id=row["id"],
         )
 
     def get_fills(self, market_id: Optional[str] = None) -> List[PaperFill]:
@@ -818,6 +844,54 @@ class MMStateStore:
                 ),
             )
             return int(cur.lastrowid)
+
+    # ------------------------------------------------------------------
+    # fill_markouts (Fix 2a: durable per-fill markout cache; backs the
+    # decoupling of markout_report's 28d lookback from mid_log's 7d
+    # retention -- pnl_report.markout_report reads the persisted map on the
+    # persisted-short-circuit branch and writes newly-resolved markouts back
+    # via the injected persist_cb)
+    # ------------------------------------------------------------------
+
+    def append_fill_markouts(self, rows: List[Tuple[int, float, float]]) -> int:
+        """Persist newly-resolved `(fill_id, horizon_s, mk)` markouts. INSERT
+        OR IGNORE on the (fill_id, horizon_s) primary key so re-resolving an
+        already-stored markout is a no-op (idempotent). Returns the number of
+        rows written; no-op on an empty list."""
+        if not rows:
+            return 0
+        with self._conn:
+            cur = self._conn.executemany(
+                "INSERT OR IGNORE INTO fill_markouts (fill_id, horizon_s, mk) VALUES (?, ?, ?)",
+                [(int(fid), float(h), float(mk)) for (fid, h, mk) in rows],
+            )
+        return cur.rowcount
+
+    def get_fill_markouts(self) -> Dict[Tuple[int, float], float]:
+        """All persisted markouts as a `{(fill_id, horizon_s): mk}` map -- the
+        `persisted` argument to pnl_report.markout_report. Keys mirror the
+        map's `(fill_id, float(horizon_s))` shape exactly."""
+        rows = self._conn.execute(
+            "SELECT fill_id, horizon_s, mk FROM fill_markouts"
+        ).fetchall()
+        return {(int(r["fill_id"]), float(r["horizon_s"])): r["mk"] for r in rows}
+
+    def prune_fill_markouts(self, cutoff_ts: datetime) -> int:
+        """Delete markout rows whose fill's `ts` is strictly older than
+        `cutoff_ts` (Fix 2a -- markouts for fills past the report lookback are
+        never read again, so the table stays bounded like every other rolling
+        table in this module). Joins fill_id back to `fills.ts`; rows whose
+        fill_id no longer resolves to a fills row (never expected) are left
+        untouched. Returns the number of rows deleted."""
+        with self._conn:
+            cur = self._conn.execute(
+                """
+                DELETE FROM fill_markouts
+                WHERE fill_id IN (SELECT id FROM fills WHERE ts < ?)
+                """,
+                (_dt_to_iso(cutoff_ts),),
+            )
+        return cur.rowcount
 
     # ------------------------------------------------------------------
     # quotes (append-only history)

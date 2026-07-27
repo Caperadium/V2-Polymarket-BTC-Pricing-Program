@@ -70,7 +70,28 @@ NO bet at our ask -- the capital actually at risk per share if filled):
      leg's size, never lowers one respected by a firmer cap below. Records an
      audit "presence_floor" stage; does NOT add a SizingCap member (the floor
      is not a cap).
-  5b. Reduce-side exemption (wave 2 W3): the f*>=0 floor above (and the Kelly
+  5b. Unmeasured-cell size multiplier (Fix 2b, 2026-07-26): for every leg
+     whose market's mk_n_attempted < config.markout_min_n (the sizing cell is
+     not yet trusted-measured), leg_shares *= config.unmeasured_size_mult,
+     then the result is floored back up to config.depth_cap_floor_shares IF
+     the pre-mult shares were already >= that floor (a leg below the floor
+     pre-mult keeps shares*mult -- never resurrected). EXCEPT the reduce-side
+     leg of a positioned market (q>0 -> ask/NO exempt; q<0 -> bid/YES exempt,
+     same side-derivation as Stage 5c) -- shedding inventory is never
+     throttled (Stage 5c's reduce floor is only presence-sized, so a
+     multiplied reduce leg would unwind ~3x slower). depth_cap_floor_shares
+     (1.0) is used as a proxy for VenueDescriptor.min_size (1.0), which sizing
+     cannot see: without the floor-back, order_lifecycle would silently
+     no-quote the throttled side, no fills would accumulate, and the cell
+     could never become measured (learning deadlock); if the venue min ever
+     diverges, this floor-back must follow it. Rationale: an unmeasured cell
+     paid ~20 cap-sized losses of "tuition" at full size before the m-clamp
+     could engage (m_prior ~ +half-spread is positive, so both Kelly and the
+     floor ran full size); this cuts tuition per fill ~3x while fill COUNT
+     (the learning signal) is nearly unchanged. Records an audit
+     "unmeasured_mult" stage; not a cap. mult=1.0 disables (sizes
+     byte-identical to pre-2b).
+  5c. Reduce-side exemption (wave 2 W3): the f*>=0 floor above (and the Kelly
      edge itself) can zero the inventory-UNLOAD side exactly when skew
      exceeds the effective spread -- cash-EV Kelly cannot see the
      risk-relief utility of shedding inventory. Fix, UNGATED, applied at the
@@ -434,7 +455,43 @@ def size_ladder(
             )
     audit["stages"].append({"stage": "presence_floor", "legs": presence_info})
 
-    # Stage 5b: reduce-side exemption (wave 2 W3), UNGATED -- shedding
+    # Stage 5b: unmeasured-cell size multiplier (Fix 2b). A cell not yet
+    # trusted-measured (mk_n_attempted < markout_min_n) quotes at
+    # config.unmeasured_size_mult of full size so exploration tuition drops
+    # ~3x, EXCEPT its reduce side (a multiplied reduce leg would unwind ~3x
+    # slower -- Stage 5c's reduce floor is only presence-sized). Runs BEFORE
+    # the reduce-side exemption and all caps (6/7/8), which still dominate.
+    # depth_cap_floor_shares (1.0) is a proxy for VenueDescriptor.min_size
+    # (1.0), which sizing cannot see: a leg already >= that floor pre-mult is
+    # floored back up to it so the side is not silently no-quoted (learning
+    # deadlock); a leg below the floor pre-mult keeps shares*mult (never
+    # resurrect). mult=1.0 disables (sizes byte-identical to pre-2b).
+    unmeasured_info: List[Dict[str, Any]] = []
+    mult = config.unmeasured_size_mult
+    if mult != 1.0:
+        for lg in legs:
+            n_attempted = mk_n_attempted_by_market.get(lg.market_id, 0)
+            if n_attempted >= config.markout_min_n:
+                continue  # trusted-measured cell -- full size
+            cinv = inv_by_market.get(lg.market_id)
+            if cinv is not None and cinv.q != 0.0:
+                # q > 0 (net long YES): ask/NO leg is the reduce side.
+                # q < 0 (net long NO / short YES): bid/YES leg is the reduce side.
+                is_reduce_side = (not lg.is_yes) if cinv.q > 0.0 else lg.is_yes
+                if is_reduce_side:
+                    continue  # reduce side exempt (unwinds at full size; see 5c)
+            pre = lg.shares
+            scaled = pre * mult
+            if pre >= config.depth_cap_floor_shares:
+                scaled = max(scaled, config.depth_cap_floor_shares)
+            lg.shares = scaled
+            if scaled != pre:
+                unmeasured_info.append(
+                    {"market_id": lg.market_id, "is_yes": lg.is_yes, "pre": pre, "post": scaled}
+                )
+    audit["stages"].append({"stage": "unmeasured_mult", "legs": unmeasured_info})
+
+    # Stage 5c: reduce-side exemption (wave 2 W3), UNGATED -- shedding
     # inventory is utility-positive via a risk-relief term cash-EV Kelly
     # ignores, so this floor applies regardless of the W4 gate above. Applied
     # in share space at the same pipeline position as the presence floor

@@ -24,6 +24,7 @@ from market_maker.inventory_manager import InventoryManager
 from market_maker.pnl_report import (
     MARKOUT_LOOKBACK_S,
     MARKOUT_WINDOW_S,
+    MID_LOG_RETENTION_S,
     cash_by_market,
     compute_pnl_rows,
     fill_cash,
@@ -606,6 +607,133 @@ def test_markout_now_excludes_fills_older_than_lookback():
     assert report["lookback_s"] == MARKOUT_LOOKBACK_S
 
 
+# ---------------------------------------------------------------------------
+# Fix 2a: persisted per-fill markouts + decoupled retention n_attempted
+# ---------------------------------------------------------------------------
+
+
+def _paper_fill_id(market_id, side, price, size, mid_at_fill, fid, ts=NOW,
+                   liquidity=LiquiditySource.MAKER):
+    return PaperFill(
+        ts=ts, market_id=market_id, order_id="o-%s" % fid, side=side, price=price,
+        size=size, liquidity=liquidity, venue_ts=ts, mid_at_fill=mid_at_fill, id=fid,
+    )
+
+
+def test_markout_persisted_short_circuit_uses_stored_mk_no_lookup():
+    # Fix 2a: a (fill, horizon) whose key is in `persisted` uses the stored mk
+    # and does NOT call mid_lookup, yet counts toward n and n_attempted
+    # exactly like a live hit.
+    fill = _paper_fill_id("m1", Side.BUY_YES, 0.50, 5.0, 0.50, fid=7)
+    registry = {"m1": (FAR_EXPIRY, 100000.0)}
+    calls = []
+
+    def _lookup(market_id, ts_min, ts_max):
+        calls.append(market_id)
+        return None
+
+    report = markout_report(
+        [fill], _lookup, registry, BELLY_BAND, horizons=(60.0,), now=NOW,
+        persisted={(7, 60.0): 0.03},
+    )
+    assert calls == []  # short-circuited; no live lookup
+    cell = report["cells"][0]
+    assert cell["n"] == 1
+    assert cell["n_attempted"] == 1
+    assert abs(cell["mk_avg"] - 0.03) < 1e-12
+
+
+def test_markout_persist_cb_receives_only_newly_resolved_live_tuples():
+    # A live-mid hit on an id'd fill is handed to persist_cb as
+    # (id, horizon_s, mk); a persisted hit is NOT re-persisted; an id=None
+    # fill contributes nothing even when its mid hits.
+    fill_live = _paper_fill_id("m1", Side.BUY_YES, 0.50, 1.0, 0.50, fid=11)
+    fill_persisted = _paper_fill_id("m1", Side.BUY_YES, 0.50, 1.0, 0.50, fid=12)
+    fill_noid = _paper_fill("m1", Side.BUY_YES, 0.50, 1.0, mid_at_fill=0.50)  # id=None
+    registry = {"m1": (FAR_EXPIRY, 100000.0)}
+    mid_rows = {"m1": [(NOW + timedelta(seconds=60), 0.55)]}
+    captured = []
+    report = markout_report(
+        [fill_live, fill_persisted, fill_noid], _mid_lookup_from_rows(mid_rows),
+        registry, BELLY_BAND, horizons=(60.0,), now=NOW,
+        persisted={(12, 60.0): -0.01}, persist_cb=captured.extend,
+    )
+    # All three share one cell (belly / same tte / 60s): n_attempted == 3.
+    assert report["cells"][0]["n_attempted"] == 3
+    assert report["cells"][0]["n"] == 3
+    # Only fill_live's fresh live-mid hit is newly persisted.
+    assert len(captured) == 1
+    assert captured[0][0] == 11
+    assert captured[0][1] == 60.0
+    assert captured[0][2] == pytest.approx(0.05)
+
+
+def test_markout_report_persist_params_inert_for_idless_fills():
+    # An id=None fill (hand-built / legacy) never consults `persisted` and
+    # never feeds `persist_cb`, so the report is byte-identical (minus the
+    # wall-clock generated_ts) whether the params are omitted or supplied.
+    fill = _paper_fill("m1", Side.BUY_YES, 0.50, 5.0, mid_at_fill=0.50)  # id=None
+    registry = {"m1": (FAR_EXPIRY, 100000.0)}
+    mid_rows = {"m1": [(fill.ts + timedelta(seconds=60), 0.55)]}
+    lookup = _mid_lookup_from_rows(mid_rows)
+    captured = []
+    r_plain = markout_report([fill], lookup, registry, BELLY_BAND, horizons=(60.0,), now=NOW)
+    r_wired = markout_report(
+        [fill], lookup, registry, BELLY_BAND, horizons=(60.0,), now=NOW,
+        persisted={(999, 60.0): 0.5}, persist_cb=captured.extend,
+    )
+    assert captured == []  # id=None -> nothing persisted
+    r_plain.pop("generated_ts")
+    r_wired.pop("generated_ts")
+    assert r_plain == r_wired
+
+
+def test_markout_window_roll_old_fill_measured_via_persisted():
+    # A fill older than MID_LOG_RETENTION_S (its mids pruned -> live lookup
+    # MISSES) but within MARKOUT_LOOKBACK_S stays MEASURED via the persisted
+    # map -- the whole point of Fix 2a (28d memory on 7d mids).
+    old_ts = NOW - timedelta(seconds=MID_LOG_RETENTION_S + 86400.0)  # ~8d old
+    fill = _paper_fill_id("m1", Side.BUY_YES, 0.50, 1.0, 0.50, fid=5, ts=old_ts)
+    registry = {"m1": (FAR_EXPIRY, 100000.0)}
+
+    def _lookup(market_id, ts_min, ts_max):
+        return None  # mids pruned
+
+    report = markout_report(
+        [fill], _lookup, registry, BELLY_BAND, horizons=(60.0,), now=NOW,
+        persisted={(5, 60.0): -0.04},
+    )
+    cell = report["cells"][0]
+    assert cell["n"] == 1  # measured despite pruned mids
+    assert cell["n_attempted"] == 1
+    assert abs(cell["mk_avg"] - (-0.04)) < 1e-12
+
+
+def test_markout_n_attempted_old_miss_neither_young_miss_attempted_only():
+    # Fix 2a n_attempted semantics: an OLD (> MID_LOG_RETENTION_S) unresolved
+    # fill with no persisted markout counts in NEITHER n nor n_attempted (its
+    # mids are gone -- a phantom attempt would falsely trip the measured
+    # thresholds); a YOUNG unresolved fill still counts in n_attempted only.
+    # Both cells are still EMITTED (n=0) -- emission structure unchanged.
+    old_ts = NOW - timedelta(seconds=MID_LOG_RETENTION_S + 86400.0)  # ~8d old
+    old_miss = _paper_fill_id("m1", Side.BUY_YES, 0.50, 1.0, 0.90, fid=1, ts=old_ts)  # wing
+    young_ts = NOW - timedelta(seconds=3600.0)  # 1h old, within retention
+    young_miss = _paper_fill_id("m1", Side.BUY_YES, 0.50, 1.0, 0.50, fid=2, ts=young_ts)  # belly
+    registry = {"m1": (FAR_EXPIRY, 100000.0)}
+
+    def _lookup(market_id, ts_min, ts_max):
+        return None  # both miss (no mids, no persisted)
+
+    report = markout_report(
+        [old_miss, young_miss], _lookup, registry, BELLY_BAND, horizons=(60.0,), now=NOW,
+    )
+    by_region = {c["region"]: c for c in report["cells"]}
+    assert by_region["wing"]["n"] == 0
+    assert by_region["wing"]["n_attempted"] == 0   # old miss -> NEITHER counter
+    assert by_region["belly"]["n"] == 0
+    assert by_region["belly"]["n_attempted"] == 1  # young miss -> attempted only
+
+
 def test_markout_region_and_tte_bucketing():
     # belly (mid_at_fill inside [0.2, 0.8]), wing (outside), and unknown
     # (mid_at_fill None -- a plain Fill, not a PaperFill) all classify
@@ -628,12 +756,10 @@ def test_markout_region_and_tte_bucketing():
         "m-far", Side.BUY_YES, 0.50, 1.0, mid_at_fill=0.50,
         ts=settle - timedelta(days=6),  # tte 6d -> "4d+"
     )
-    # ts chosen within the F3 default lookback (MARKOUT_LOOKBACK_S, 7 days) of
-    # the other fills above (whose ts cluster within [settle-6d, settle-12h])
-    # -- default `now` (max fill ts, since this test passes no `now=`) would
-    # otherwise exclude a fill as far back as NOW (~14 days before `settle`),
-    # and the actual tte value is irrelevant here since the missing registry
-    # entry forces tte_bucket="unknown" regardless.
+    # ts chosen within the F3 default lookback (MARKOUT_LOOKBACK_S, 28 days as
+    # of Fix 2a) of the other fills above (whose ts cluster within
+    # [settle-6d, settle-12h]); the actual tte value is irrelevant here since
+    # the missing registry entry forces tte_bucket="unknown" regardless.
     unknown_registry_fill = _paper_fill(
         "m-not-registered", Side.BUY_YES, 0.50, 1.0, mid_at_fill=0.50, ts=settle - timedelta(days=5),
     )

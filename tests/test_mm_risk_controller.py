@@ -56,14 +56,14 @@ def _rc(latch=0.0):
 
 def _eval(rc, now=T0, *, tte=5.0, age=0.0, vg=None, breaches=None,
           liq=LiquidityRegime.NORMAL, feed=True, spot=None, strike=None,
-          manual=False, fv_age=None, inventory_q=None):
+          manual=False, fv_age=None, inventory_q=None, mid_move_p=None):
     return rc.evaluate(
         "m1", now, tte_days=tte, pricer_snapshot=_snap(now, age, tte),
         inventory_breaches=breaches, inventory_q=inventory_q,
         liquidity_regime=liq, feed_healthy=feed,
         spot=spot, strike=strike, manual_override=manual,
         vol_gate_result=vg if vg is not None else StubVG(),
-        fair_value_age_s=fv_age,
+        fair_value_age_s=fv_age, mid_move_p=mid_move_p,
     )
 
 
@@ -277,6 +277,87 @@ def test_g_fair_value_stale_under_threshold_inert():
     d = _eval(_rc(), fv_age=cfg.fv_max_age_s - 1.0)
     assert d.mode == QuoteMode.TWO_SIDED
     assert RiskTrigger.FAIR_VALUE_STALE not in d.triggers
+
+
+# ---------------------------------------------------------------------------
+# (h) ladder mid-velocity pull (Fix 3, 2026-07-26). mid_move_p > mid_move_pull_p
+# pulls flat, reduce-only when positioned; None / knob<=0 / sub-threshold inert.
+# ---------------------------------------------------------------------------
+
+
+def test_h_mid_velocity_inert_when_none():
+    # Default mid_move_p=None must not affect behavior at all.
+    d = _eval(_rc())
+    assert d.mode == QuoteMode.TWO_SIDED
+    assert RiskTrigger.MID_VELOCITY not in d.triggers
+
+
+def test_h_mid_velocity_inert_below_threshold():
+    # Move under the 0.04 default knob -> inert.
+    d = _eval(_rc(), mid_move_p=0.02)
+    assert d.mode == QuoteMode.TWO_SIDED
+    assert RiskTrigger.MID_VELOCITY not in d.triggers
+
+
+def test_h_mid_velocity_inert_when_knob_disabled():
+    # mid_move_pull_p <= 0 disables the rule even for a large move.
+    rc = RiskController(MMConfig(mid_move_pull_p=0.0), latch_seconds=0.0)
+    d = _eval(rc, mid_move_p=0.5)
+    assert d.mode == QuoteMode.TWO_SIDED
+    assert RiskTrigger.MID_VELOCITY not in d.triggers
+
+
+def test_h_mid_velocity_pull_flat_inventory_none():
+    # inventory_q default None (unknown) -> full PULLED.
+    d = _eval(_rc(), mid_move_p=0.10)
+    assert d.mode == QuoteMode.PULLED
+    assert RiskTrigger.MID_VELOCITY in d.triggers
+
+
+def test_h_mid_velocity_pull_flat_inventory_zero():
+    # inventory_q=0.0 (flat, not None) is still "no real inventory" -- dust
+    # threshold, not None-ness, gates the reduce-only branch (mirrors rule f).
+    d = _eval(_rc(), mid_move_p=0.10, inventory_q=0.0)
+    assert d.mode == QuoteMode.PULLED
+    assert RiskTrigger.MID_VELOCITY in d.triggers
+
+
+def test_h_mid_velocity_reduce_only_long():
+    # Long (q>0) -> ASK_ONLY so the unwind path survives the burst.
+    d = _eval(_rc(), mid_move_p=0.10, inventory_q=5.0)
+    assert d.mode == QuoteMode.ASK_ONLY
+    assert RiskTrigger.MID_VELOCITY in d.triggers
+
+
+def test_h_mid_velocity_reduce_only_short():
+    # Short (q<0) -> BID_ONLY.
+    d = _eval(_rc(), mid_move_p=0.10, inventory_q=-5.0)
+    assert d.mode == QuoteMode.BID_ONLY
+    assert RiskTrigger.MID_VELOCITY in d.triggers
+
+
+def test_h_mid_velocity_latches_through_burst():
+    # The pull holds through the 60s latch after the instantaneous move drops
+    # back under threshold (burst-continuation protection).
+    rc = _rc(latch=60.0)
+    d0 = _eval(rc, now=T0, mid_move_p=0.10)  # flat inventory -> PULLED
+    assert d0.mode == QuoteMode.PULLED
+    d1 = _eval(rc, now=T0 + timedelta(seconds=10), mid_move_p=0.0)  # move cleared, latched
+    assert d1.mode == QuoteMode.PULLED
+    d2 = _eval(rc, now=T0 + timedelta(seconds=61), mid_move_p=0.0)  # latch expired -> release
+    assert d2.mode == QuoteMode.TWO_SIDED
+
+
+def test_h_cofire_with_breach_same_sign_no_escalation():
+    # Long breach (c) -> ASK_ONLY and mid-velocity (h) with the SAME long
+    # inventory_q -> ASK_ONLY. Agreeing sides must not escalate to PULLED via
+    # _more_restrictive's opposite-sides rule (same signed-q basis as c/f).
+    d = _eval(_rc(), breaches=[InvBreach("m1", is_long=True, ratio=1.2)],
+              inventory_q=3.0, mid_move_p=0.10)
+    assert d.mode == QuoteMode.ASK_ONLY
+    assert d.mode != QuoteMode.PULLED
+    assert RiskTrigger.INV_CAP in d.triggers
+    assert RiskTrigger.MID_VELOCITY in d.triggers
 
 
 def test_manual_override_pulls():

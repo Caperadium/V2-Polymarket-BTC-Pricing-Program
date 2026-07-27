@@ -115,6 +115,7 @@ from market_maker.multi_runner import (
 )
 from market_maker.pnl_report import (
     MARKOUT_LOOKBACK_S,
+    MID_LOG_RETENTION_S,
     PER_MARKET_SNAPSHOT_EVERY_N_TICKS,
     compute_pnl_rows,
     markout_report,
@@ -576,6 +577,8 @@ def run(argv: Optional[List[str]] = None) -> int:
                     _seed_fills, store.mid_at_or_after,
                     store.get_market_registry(), MMConfig().belly_band,
                     now=datetime.now(timezone.utc),
+                    persisted=store.get_fill_markouts(),
+                    persist_cb=store.append_fill_markouts,
                 )
         except Exception:
             logger.warning("markout report seed failed; starting on the m_prior sizing path", exc_info=True)
@@ -938,13 +941,20 @@ def run(argv: Optional[List[str]] = None) -> int:
                                 fills_all, store.mid_at_or_after,
                                 store.get_market_registry(), orch.config.belly_band,
                                 now=now,
+                                persisted=store.get_fill_markouts(),
+                                persist_cb=store.append_fill_markouts,
                             )
                             _write_json_atomic(out_dir / "markout_report.json", report_json)
                             # wave 2 W7: keep the shared sizing-provider holder
                             # current -- every slot's loop reads this same
                             # dict via markout_provider=lambda: holder["report"].
                             _markout_holder["report"] = report_json
-                            store.prune_mid_log(now - timedelta(seconds=MARKOUT_LOOKBACK_S))
+                            # Fix 2a: mid_log prunes to the shorter retention
+                            # (persisted per-fill markouts carry the 28d
+                            # measurement across the gap); the persisted-markout
+                            # table prunes to the report lookback.
+                            store.prune_mid_log(now - timedelta(seconds=MID_LOG_RETENTION_S))
+                            store.prune_fill_markouts(now - timedelta(seconds=MARKOUT_LOOKBACK_S))
                     except Exception:
                         logger.warning("markout report failed at tick %d", tick_n, exc_info=True)
 

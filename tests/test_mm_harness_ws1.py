@@ -26,6 +26,7 @@ from market_maker.contracts import (
     InventoryState,
     LiquidityRegime,
     QuoteMode,
+    RiskTrigger,
     SettlementEvent,
     SettlementOutcome,
     Side,
@@ -1416,16 +1417,16 @@ def _p_of_strike(k, s0=S0, scale=2000.0):
 def test_markout_widen_belly_only_no_spurious_noarb_at_realistic_strike_spacing(tmp_path):
     """No-arb PAV repair interaction, NORMAL-geometry safety check (package
     E, plan-pinned "No-arb PAV repair interaction" section): belly-only
-    negative BUY_YES markout at the LAUNCH DEFAULT markout_widen_cap (0.05)
+    negative BUY_YES markout at the DEFAULT markout_widen_cap (0.12)
     over a realistic Polymarket-like strike ladder (2000-3000 wide strikes,
     matching typical BTC daily granularity) does not introduce ANY no-arb
     violation at all -- the natural adjacent-strike bid gaps at this
-    spacing (multiples of ten cents) comfortably exceed the 5c cap, so PAV
-    is never even invoked (repair_count stays 0). Confirms term 7 is safe in
+    spacing (belly boundary gaps ~19-23c) comfortably exceed the 12c cap, so
+    PAV is never even invoked (repair_count stays 0). Confirms term 7 is safe in
     the intended/normal operating regime; invariants (ii)/(iii) (every
     belly bid strictly below baseline, no wing bid above baseline) hold
     trivially since nothing gets pooled."""
-    cfg = MMConfig(gamma=0.5, k_arrival=1.0)  # DEFAULT markout_widen_cap=0.05
+    cfg = MMConfig(gamma=0.5, k_arrival=1.0)  # DEFAULT markout_widen_cap=0.12
     # S0=100000, scale=2000 (default _engine()): 95k/105k land outside the
     # default belly_band (0.2, 0.8) -> wing; 98k/100k/102k -> belly.
     markets = [
@@ -1492,8 +1493,8 @@ def test_markout_widen_belly_only_no_spurious_noarb_at_realistic_strike_spacing(
 
 def test_markout_widen_belly_only_pav_pooled_bids_stay_within_baseline_bounds(tmp_path):
     """No-arb PAV repair interaction, adversarial/tight-strike case: belly-
-    only negative BUY_YES markout at the LAUNCH DEFAULT markout_widen_cap
-    (0.05) with strikes tight enough (500 apart, straddling the belly/wing
+    only negative BUY_YES markout at the DEFAULT markout_widen_cap
+    (0.12) with strikes tight enough (500 apart, straddling the belly/wing
     boundary) that the natural adjacent-strike bid gap is smaller than the
     cap -- a genuine PAV violation-and-repair is exercised (repair_count
     increments). Post-repair:
@@ -1522,7 +1523,7 @@ def test_markout_widen_belly_only_pav_pooled_bids_stay_within_baseline_bounds(tm
     this same default cap) -- flagged here as a characterization, not
     asserted as fixed; see the implementation report for the recommended
     follow-up."""
-    cfg = MMConfig(gamma=0.5, k_arrival=1.0)  # DEFAULT markout_widen_cap=0.05
+    cfg = MMConfig(gamma=0.5, k_arrival=1.0)  # DEFAULT markout_widen_cap=0.12
     # Tight strikes straddling the p=0.2 belly/wing boundary (S0=100000,
     # scale=2000): 102000/102500 -> belly (p~0.269/0.223); 103000/103500 ->
     # wing (p~0.182/0.148).
@@ -1673,3 +1674,73 @@ def test_restart_resumes_per_region_bankrolls_via_harness(tmp_path):
         assert loop.bankroll_state.frozen is False  # nothing frozen
     finally:
         store2.close()
+
+
+# ---------------------------------------------------------------------------
+# Fix 3 (2026-07-26): ladder mid-velocity pull (risk rule h). The harness
+# maintains a two-sided-only per-market mid history and threads the
+# ladder-wide max move into every risk.evaluate call.
+# ---------------------------------------------------------------------------
+
+
+def test_mid_velocity_history_only_appends_two_sided_books(store):
+    """A one-sided book tick appends NOTHING to _mid_hist (phantom-move guard,
+    _two_sided_mid): _market_mid would fall back to the lone touch, but the
+    velocity history must not. A concurrently two-sided market keeps growing."""
+    market_id, other = MARKETS[0][0], MARKETS[1][0]
+    loop = PaperTradingLoop(
+        store=store, expiry_key=EXPIRY, markets=MARKETS, engine_fn=_engine(),
+        config=MMConfig(gamma=0.5, k_arrival=1.0), clock=SimClock(START), vol_gate_fn=_vol_gate(),
+    )
+    # Two-sided books: each market appends exactly one point.
+    loop.tick({m: _snapshot_msg(0.5) for m, _k in MARKETS})
+    assert len(loop._mid_hist[market_id]) == 1
+    assert len(loop._mid_hist[other]) == 1
+
+    # One-sided book for market_id (bid present, ask empty) appends nothing;
+    # other stays two-sided and grows to two points.
+    loop.tick({
+        market_id: [{"type": "snapshot", "bids": [(0.5, 100.0)], "asks": []}],
+        other: _snapshot_msg(0.5),
+    })
+    assert len(loop._mid_hist[market_id]) == 1  # unchanged -- one-sided skipped
+    assert len(loop._mid_hist[other]) == 2
+
+
+def test_ladder_mid_velocity_fires_rule_h_on_moved_mid(store):
+    """Drive two ticks with one strike's mid jumping past the threshold within
+    the window: the ladder-WIDE max move fires rule (h) on BOTH markets (flat
+    inventory -> PULLED). Tick 1 (one point per market) has no computable move
+    and stays TWO_SIDED."""
+    market_id, other = MARKETS[0][0], MARKETS[1][0]
+    loop = PaperTradingLoop(
+        store=store, expiry_key=EXPIRY, markets=MARKETS, engine_fn=_engine(),
+        config=MMConfig(gamma=0.5, k_arrival=1.0, mid_move_pull_p=0.04, mid_move_window_s=120.0),
+        clock=SimClock(START), vol_gate_fn=_vol_gate(),
+    )
+    # Tick 1: seed mids at 0.50 -- only one usable point per market, no move.
+    loop.tick({m: _snapshot_msg(0.5) for m, _k in MARKETS})
+    for m, d in loop.last_directives.items():
+        assert d.mode == QuoteMode.TWO_SIDED, m
+        assert RiskTrigger.MID_VELOCITY not in d.triggers, m
+
+    # Tick 2: market_id jumps 0.50 -> 0.62 (0.12 > 0.04) within the 120s
+    # window; other stays flat. The ladder-wide max protects the whole ladder.
+    loop.tick({market_id: _snapshot_msg(0.62), other: _snapshot_msg(0.5)})
+    for m in (market_id, other):
+        d = loop.last_directives[m]
+        assert RiskTrigger.MID_VELOCITY in d.triggers, m
+        assert d.mode == QuoteMode.PULLED, m
+
+
+def test_flat_mid_sequence_never_fires_rule_h(store):
+    """A flat-mid sequence (no ladder-wide move) never fires rule (h)."""
+    loop = PaperTradingLoop(
+        store=store, expiry_key=EXPIRY, markets=MARKETS, engine_fn=_engine(),
+        config=MMConfig(gamma=0.5, k_arrival=1.0), clock=SimClock(START), vol_gate_fn=_vol_gate(),
+    )
+    for _ in range(4):
+        loop.tick({m: _snapshot_msg(0.5) for m, _k in MARKETS})
+    for m, d in loop.last_directives.items():
+        assert d.mode == QuoteMode.TWO_SIDED, m
+        assert RiskTrigger.MID_VELOCITY not in d.triggers, m

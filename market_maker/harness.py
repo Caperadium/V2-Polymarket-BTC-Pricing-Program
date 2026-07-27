@@ -50,6 +50,8 @@ last_quote_sets, last_proposals, last_fills, checked_ladders, ...).
 from __future__ import annotations
 
 import logging
+import math
+from collections import deque
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -192,6 +194,22 @@ def _market_mid(ms) -> Optional[float]:
     return None
 
 
+def _two_sided_mid(ms) -> Optional[float]:
+    """The midpoint, but ONLY when the book is genuinely two-sided (both touch
+    prices present AND finite). Unlike _market_mid, never falls back to a
+    single-sided quote (Fix 3, 2026-07-26): a market flickering between one-
+    and two-sided books would inject large phantom "moves" into the
+    mid-velocity history feeding risk rule (h), and that rule aggregates
+    max-over-markets, so one noisy strike would pull the whole ladder."""
+    b, a = ms.best_bid, ms.best_ask
+    if b is None or a is None:
+        return None
+    b, a = float(b), float(a)
+    if math.isnan(b) or math.isnan(a):
+        return None
+    return 0.5 * (b + a)
+
+
 class PaperTradingLoop:
     """One-expiry-ladder paper-trading loop over scripted feeds."""
 
@@ -294,6 +312,10 @@ class PaperTradingLoop:
         self.prev_forecasts: Optional[Dict[str, np.ndarray]] = None
         self.prev_consensus: Optional[np.ndarray] = None
         self._x_hist: Dict[str, List[float]] = {m: [] for m, _ in self.markets}
+        # Fix 3 (2026-07-26): per-market trailing (ts, mid) history for the
+        # ladder mid-velocity pull (risk rule h). Bounded by the
+        # mid_move_window_s left-drop in tick(), so no maxlen is needed.
+        self._mid_hist: Dict[str, deque] = {m: deque() for m, _ in self.markets}
         self._seq: Dict[str, int] = {m: 0 for m, _ in self.markets}
 
         # W1.2: last successful consensus recompute time + per-tick recompute
@@ -700,6 +722,8 @@ class PaperTradingLoop:
         market_states = {}
         mids: Dict[float, float] = {}
         mids_by_market: Dict[str, float] = {}
+        # Fix 3: trailing-window cutoff for the per-market mid-velocity history.
+        mid_cutoff = now - timedelta(seconds=float(self.config.mid_move_window_s))
         for m, k in self.markets:
             self._apply_messages(m, messages_by_market.get(m, []), now)
             ms = self.books[m].emit(m, self.expiry_key, k)
@@ -711,6 +735,29 @@ class PaperTradingLoop:
             if mm is not None:
                 mids[k] = mm
                 mids_by_market[m] = mm
+            # Fix 3 (2026-07-26): append this tick's mid to the velocity
+            # history ONLY on a genuinely two-sided book (phantom-move guard,
+            # see _two_sided_mid), then drop points older than the trailing
+            # window from the left. Runs on warmup ticks too.
+            hist = self._mid_hist[m]
+            two_sided_mid = _two_sided_mid(ms)
+            if two_sided_mid is not None:
+                hist.append((now, two_sided_mid))
+            while hist and hist[0][0] < mid_cutoff:
+                hist.popleft()
+
+        # Fix 3 (2026-07-26): ladder-wide mid velocity for risk rule (h) -- max
+        # over markets of |newest - oldest| in-window mid (markets with < 2
+        # usable points skipped); None if nothing computable. Ladder-WIDE
+        # because informed flow hits one strike first and its neighbors next,
+        # so one strike's real move protects the whole ladder.
+        ladder_mid_move: Optional[float] = None
+        for m, _k in self.markets:
+            hist = self._mid_hist[m]
+            if len(hist) >= 2:
+                move = abs(hist[-1][1] - hist[0][1])
+                if ladder_mid_move is None or move > ladder_mid_move:
+                    ladder_mid_move = move
 
         # C2 (mm_suitability_alignment_plan.md Change C): durably log this
         # tick's per-market mids for the markout report BEFORE the
@@ -828,6 +875,7 @@ class PaperTradingLoop:
                 spot=snap.s0, strike=k, manual_override=manual_override,
                 vol_gate_result=vol_gate_result,
                 fair_value_age_s=fair_value_age_s,
+                mid_move_p=ladder_mid_move,
             )
             directives[m] = directive
             self.store.append_risk_directive(directive)
