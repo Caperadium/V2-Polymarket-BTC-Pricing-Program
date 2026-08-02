@@ -51,8 +51,13 @@ class MMConfig:
     # (recording began 2026-07-11), lumpy histogram head near the touch;
     # -> 18.3 (2026-07-21 weekly refit, first full volume cycle: 5639 joined
     # prints / 3065 market-hours, k=18.33, A=0.75/market-hour, implied arrival
-    # half-spread ~0.007c ATM -- fit stable vs 18.2, term stays negligible).
-    k_arrival: float = 18.3  # kappa, arrival decay (fitted 2026-07-21; weekly refit cadence)
+    # half-spread ~0.007c ATM -- fit stable vs 18.2, term stays negligible);
+    # -> 12.8 (2026-08-01 weekly refit #2: 6974 joined prints / 2023
+    # market-hours, k=12.75, A=1.05/market-hour, implied arrival half-spread
+    # ~0.015c ATM. 30% drop vs 18.3 but stable across sub-windows (5d=11.6,
+    # 3d=12.3, both excluding the 2026-07-26 burst weekend) -- genuine flow
+    # regime shift, not a burst artifact; term stays negligible).
+    k_arrival: float = 12.8  # kappa, arrival decay (fitted 2026-08-01; weekly refit cadence)
     arrival_scale_A: float = 1.0  # arrival scale A (launch default, pending calibration)
     sigma_b_floor: float = 0.05  # belief log-odds vol floor (launch default)
     sigma_b_cap: float = 5.0  # belief log-odds vol cap (launch default)
