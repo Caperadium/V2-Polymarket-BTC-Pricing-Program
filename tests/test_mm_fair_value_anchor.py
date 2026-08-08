@@ -10,6 +10,7 @@ ladder-space repair-then-clamp ordering).
 """
 from __future__ import annotations
 
+import logging
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -94,6 +95,11 @@ def _mids(strikes, p_list):
 
 
 CFG = MMConfig()
+# Legacy (pre-Fix-1) behavior: negative pin disables the wing pricer weight
+# pin, restoring the wing region's own Bayes updates. Tests whose PURPOSE is
+# the legacy wing Bayes dynamics (region attribution, floor, skip rules, ...)
+# run with this config; tests of the production path use CFG (pin = 0.5).
+LEGACY_CFG = MMConfig(wing_pricer_weight_pin=-1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -113,9 +119,14 @@ def test_hand_computed_consensus_unequal_bankrolls():
     assert cp[1.0] == pytest.approx(0.87, abs=1e-9)
     assert cp[2.0] == pytest.approx(0.57, abs=1e-9)
     assert cp[3.0] == pytest.approx(0.27, abs=1e-9)
+    # All three market mids (0.8, 0.5, 0.2) classify belly (in_belly_band is
+    # inclusive), so the scalar credibility is the belly weight and the
+    # per-strike consensus above is untouched by the wing pin. The wing
+    # region's reported credibility IS the pin (Fix 1, default 0.5), not the
+    # stored 0.7 -- wing owns no strikes here, only the two tail buckets.
     assert res.fair_value.credibility == pytest.approx(0.7, abs=1e-9)
     assert res.fair_value.credibility_by_region[BELLY_REGION] == pytest.approx(0.7, abs=1e-9)
-    assert res.fair_value.credibility_by_region[WING_REGION] == pytest.approx(0.7, abs=1e-9)
+    assert res.fair_value.credibility_by_region[WING_REGION] == pytest.approx(0.5, abs=1e-9)
     assert res.fair_value.anchor_method == AnchorMethod.BEUOY
 
 
@@ -198,6 +209,9 @@ def test_invariant4_credibility_weights_nonneg_sum_to_one_per_region():
 # ---------------------------------------------------------------------------
 
 def test_invariant5_monotone_credibility_gain():
+    # LEGACY_CFG: this invariant is about the Bayes credibility dynamics in
+    # BOTH regions; the default-on wing pin (Fix 1) freezes wing at 0.5 by
+    # design, so the legacy config keeps the test exercising what it names.
     strikes = [1.0, 2.0, 3.0]
     pricer = np.array([0.8, 0.5, 0.2])
     market0 = np.array([0.55, 0.5, 0.45])
@@ -213,7 +227,7 @@ def test_invariant5_monotone_credibility_gain():
             _snapshot(strikes, pricer),
             _mids(strikes, market_t),
             states,
-            CFG,
+            LEGACY_CFG,
             prev_forecasts=prev_fc,
             prev_consensus=prev_cons,
         )
@@ -419,6 +433,8 @@ def test_frozen_state_recovers_beuoy_on_crossed_mids():
 # ---------------------------------------------------------------------------
 
 def test_bankroll_floor_holds():
+    # LEGACY_CFG: the floor property is only exercised when wing actually
+    # Bayes-updates; the pin (Fix 1) would hold wing at 0.5/0.5 vacuously.
     strikes = [1.0, 2.0, 3.0]
     pricer = np.array([0.8, 0.5, 0.2])
     market0 = np.array([0.55, 0.5, 0.45])
@@ -433,7 +449,7 @@ def test_bankroll_floor_holds():
             _snapshot(strikes, pricer),
             _mids(strikes, market_t),
             states,
-            CFG,
+            LEGACY_CFG,
             prev_forecasts=prev_fc,
             prev_consensus=prev_cons,
         )
@@ -457,6 +473,9 @@ def test_bankroll_floor_holds():
 # ---------------------------------------------------------------------------
 
 def test_two_phase_unanimity_weights_unchanged_both_regions():
+    # LEGACY_CFG: the property "unanimity -> Bayes leaves weights unchanged"
+    # requires the wing Bayes update to actually run; the pin (Fix 1) would
+    # overwrite the seeded 0.6/0.4 wing weights with 0.5/0.5 on tick one.
     strikes = [1.0, 2.0, 3.0, 4.0, 5.0]
     p = [0.9, 0.6, 0.5, 0.4, 0.1]  # spans both belly (0.6/0.5/0.4) and wing (0.9/0.1)
     states = {BELLY_REGION: _bankrolls(0.3, 0.7), WING_REGION: _bankrolls(0.6, 0.4)}
@@ -465,7 +484,7 @@ def test_two_phase_unanimity_weights_unchanged_both_regions():
     for _ in range(4):
         before = {r: dict(states[r].bankrolls) for r in (BELLY_REGION, WING_REGION)}
         res = compute_fair_value(
-            _snapshot(strikes, p), _mids(strikes, p), states, CFG,
+            _snapshot(strikes, p), _mids(strikes, p), states, LEGACY_CFG,
             prev_forecasts=prev_fc, prev_consensus=prev_cons,
         )
         for region in (BELLY_REGION, WING_REGION):
@@ -510,8 +529,10 @@ def test_region_attribution_pricer_wrong_only_in_wings():
         market_t = market0.copy()
         market_t[0] = pricer[0] + frac * (0.86 - pricer[0])   # 0.97 -> 0.86 (stays > pricer[1]=0.85)
         market_t[6] = pricer[6] + frac * (0.14 - pricer[6])   # 0.03 -> 0.14 (stays < pricer[5]=0.15)
+        # LEGACY_CFG: region attribution IS the wing Bayes update the pin
+        # (Fix 1) deliberately disables.
         res = compute_fair_value(
-            _snapshot(strikes, pricer), _mids(strikes, market_t), states, CFG,
+            _snapshot(strikes, pricer), _mids(strikes, market_t), states, LEGACY_CFG,
             prev_forecasts=prev_fc, prev_consensus=prev_cons,
         )
         assert res.fair_value.anchor_method == AnchorMethod.BEUOY
@@ -544,8 +565,11 @@ def test_tail_bucket_error_lands_on_wing_even_when_extreme_strikes_are_belly():
     wing_creds = []
     T = 6
     for _ in range(T):
+        # LEGACY_CFG: the falsifiable signal here is wing's bankroll MOVING
+        # off 0.5 -- impossible under the pin (Fix 1), which is exactly the
+        # legacy Bayes evidence-routing this test exists to check.
         res = compute_fair_value(
-            _snapshot(strikes, pricer), _mids(strikes, market), states, CFG,
+            _snapshot(strikes, pricer), _mids(strikes, market), states, LEGACY_CFG,
             prev_forecasts=prev_fc, prev_consensus=prev_cons,
         )
         assert res.fair_value.anchor_method == AnchorMethod.BEUOY
@@ -569,13 +593,15 @@ def test_empty_region_skip_all_wing_ladder_belly_unaffected():
     # wing is non-empty; belly can be empty on an all-wing ladder). Belly
     # must skip cleanly: no fallback, no freeze, weights/update_count
     # unchanged; wing (non-empty) updates normally.
+    # LEGACY_CFG: asserts wing's update_count ADVANCES (normal Bayes update)
+    # while empty belly skips -- the pin (Fix 1) would skip wing too.
     strikes = [1.0, 2.0, 3.0]
     pricer = [0.97, 0.92, 0.83]
     market0 = [0.95, 0.90, 0.85]
     states = _states(0.5, 0.5)
     snap = _snapshot(strikes, pricer)
 
-    res1 = compute_fair_value(snap, _mids(strikes, market0), states, CFG)
+    res1 = compute_fair_value(snap, _mids(strikes, market0), states, LEGACY_CFG)
     assert res1.fair_value.anchor_method == AnchorMethod.BEUOY
     belly_before = dict(res1.bankroll_states[BELLY_REGION].bankrolls)
     belly_uc_before = res1.bankroll_states[BELLY_REGION].update_count
@@ -583,7 +609,7 @@ def test_empty_region_skip_all_wing_ladder_belly_unaffected():
 
     market1 = [0.96, 0.94, 0.90]
     res2 = compute_fair_value(
-        snap, _mids(strikes, market1), res1.bankroll_states, CFG,
+        snap, _mids(strikes, market1), res1.bankroll_states, LEGACY_CFG,
         prev_forecasts=res1.forecasts, prev_consensus=res1.consensus_bucket,
     )
     assert res2.fair_value.anchor_method == AnchorMethod.BEUOY
@@ -597,18 +623,20 @@ def test_empty_region_skip_all_wing_ladder_belly_unaffected():
 def test_empty_region_skip_all_belly_ladder_wing_evidence_from_tails_only():
     # All strikes classify belly -> wing owns ONLY the two tail buckets
     # (never empty, by the tail-pinning rule); no fallback, no freeze.
+    # LEGACY_CFG: wing's "evidence from the tail buckets only" update is the
+    # legacy Bayes path the pin (Fix 1) deliberately disables.
     strikes = [1.0, 2.0, 3.0]
     pricer = [0.7, 0.5, 0.3]
     market0 = [0.65, 0.5, 0.35]
     states = _states(0.5, 0.5)
     snap = _snapshot(strikes, pricer)
 
-    res1 = compute_fair_value(snap, _mids(strikes, market0), states, CFG)
+    res1 = compute_fair_value(snap, _mids(strikes, market0), states, LEGACY_CFG)
     assert res1.fair_value.anchor_method == AnchorMethod.BEUOY
 
     market1 = [0.6, 0.5, 0.4]
     res2 = compute_fair_value(
-        snap, _mids(strikes, market1), res1.bankroll_states, CFG,
+        snap, _mids(strikes, market1), res1.bankroll_states, LEGACY_CFG,
         prev_forecasts=res1.forecasts, prev_consensus=res1.consensus_bucket,
     )
     assert res2.fair_value.anchor_method == AnchorMethod.BEUOY
@@ -643,7 +671,9 @@ def test_degenerate_factor_skip_wing_belly_still_updates():
     }
     snap = _snapshot(strikes, pricer)
 
-    res1 = compute_fair_value(snap, _mids(strikes, market0), states, CFG)
+    # LEGACY_CFG: the s_R == 0 degenerate-factor skip branch for wing is
+    # unreachable under the pin (Fix 1) -- wing never evaluates factors.
+    res1 = compute_fair_value(snap, _mids(strikes, market0), states, LEGACY_CFG)
     assert res1.fair_value.anchor_method == AnchorMethod.BEUOY
     wing_before = dict(res1.bankroll_states[WING_REGION].bankrolls)
     wing_uc_before = res1.bankroll_states[WING_REGION].update_count
@@ -651,7 +681,7 @@ def test_degenerate_factor_skip_wing_belly_still_updates():
 
     market1 = [0.7, 0.55, 0.3]
     res2 = compute_fair_value(
-        snap, _mids(strikes, market1), res1.bankroll_states, CFG,
+        snap, _mids(strikes, market1), res1.bankroll_states, LEGACY_CFG,
         prev_forecasts=res1.forecasts, prev_consensus=res1.consensus_bucket,
     )
     assert res2.fair_value.anchor_method == AnchorMethod.BEUOY
@@ -671,12 +701,15 @@ def test_boundary_monotonicity_sharp_region_weight_difference():
     strikes = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]
     pricer = [0.95, 0.85, 0.6, 0.5, 0.4, 0.15, 0.05]
     market = [0.9, 0.8, 0.55, 0.5, 0.45, 0.2, 0.1]
-    # Sharp weight difference across the belly/wing boundary.
+    # Sharp weight difference across the belly/wing boundary. LEGACY_CFG so
+    # the designed 0.95-vs-0.05 contrast actually prices (the pin (Fix 1)
+    # would soften the wing side to 0.5/0.5); the pinned-path monotonicity is
+    # covered by the Fix 1 tests below.
     states = {
         BELLY_REGION: _bankrolls(0.95, 0.05),
         WING_REGION: _bankrolls(0.05, 0.95),
     }
-    res = compute_fair_value(_snapshot(strikes, pricer), _mids(strikes, market), states, CFG)
+    res = compute_fair_value(_snapshot(strikes, pricer), _mids(strikes, market), states, LEGACY_CFG)
     assert res.fair_value.anchor_method == AnchorMethod.BEUOY
     for region in (BELLY_REGION, WING_REGION):
         assert res.bankroll_states[region].frozen is False
@@ -693,3 +726,201 @@ def test_boundary_monotonicity_sharp_region_weight_difference():
     cons = np.array(vals)
     assert np.all(cons >= lo)
     assert np.all(cons <= hi)
+
+
+# ===========================================================================
+# Fix 1 (2026-08-08 wing-bleed fix): wing pricer weight PIN
+# ===========================================================================
+#
+# Default-on (MMConfig.wing_pricer_weight_pin = 0.5): the wing region's Bayes
+# update is a self-confirmation loop (factors score against a consensus built
+# from the pre-update weights), so wing weights are pinned and the wing update
+# is skipped entirely. LEGACY_CFG (pin = -1.0) disables.
+
+
+def _mixed_region_inputs():
+    """5-strike ladder spanning both regions. Market values classify (via the
+    sanitized-market ladder + inclusive in_belly_band) wing/belly/belly/belly/
+    wing. Both ladders monotone, so sanitized == raw and the per-strike blend
+    is hand-computable (neither cummin repair nor band clamp engages)."""
+    strikes = [1.0, 2.0, 3.0, 4.0, 5.0]
+    pricer = [0.95, 0.75, 0.55, 0.35, 0.15]
+    market = [0.9, 0.7, 0.5, 0.3, 0.1]
+    return strikes, pricer, market
+
+
+def _pin_states(update_count=0):
+    """Stored bankrolls mirroring the VPS forensics shape: belly 0.7/0.3,
+    wing re-learned to pricer 0.978 / market 0.022."""
+    return {
+        BELLY_REGION: _bankrolls(0.7, 0.3),
+        WING_REGION: _bankrolls(0.978, 0.022, update_count=update_count),
+    }
+
+
+def test_pin_binds_wing_consensus_belly_per_strike_unchanged():
+    strikes, pricer, market = _mixed_region_inputs()
+    res = compute_fair_value(
+        _snapshot(strikes, pricer), _mids(strikes, market), _pin_states(), CFG,
+    )
+    cp = res.fair_value.consensus_p
+    # Wing strikes price at the 0.5/0.5 PIN blend of the sanitized ladders,
+    # NOT the stored 0.978/0.022 blend.
+    assert cp[1.0] == pytest.approx(0.5 * 0.95 + 0.5 * 0.9, abs=1e-9)
+    assert cp[5.0] == pytest.approx(0.5 * 0.15 + 0.5 * 0.1, abs=1e-9)
+    # Belly PER-STRIKE consensus unchanged vs legacy (0.7/0.3 blend). NOTE:
+    # deliberately NOT asserting belly BANKROLLS unchanged -- the whole-ladder
+    # consensus feeds belly factors, so belly bankroll trajectories may shift.
+    legacy = compute_fair_value(
+        _snapshot(strikes, pricer), _mids(strikes, market), _pin_states(),
+        LEGACY_CFG,
+    )
+    for k, pv, mv in [(2.0, 0.75, 0.7), (3.0, 0.55, 0.5), (4.0, 0.35, 0.3)]:
+        assert cp[k] == pytest.approx(0.7 * pv + 0.3 * mv, abs=1e-9)
+        assert cp[k] == pytest.approx(legacy.fair_value.consensus_p[k], abs=1e-12)
+    assert res.fair_value.anchor_method == AnchorMethod.BEUOY
+
+
+def test_pin_persists_first_tick_and_update_path_update_count_unchanged():
+    strikes, pricer, market = _mixed_region_inputs()
+    res1 = compute_fair_value(
+        _snapshot(strikes, pricer), _mids(strikes, market),
+        _pin_states(update_count=7), CFG,
+    )
+    # First tick (prev history None) -- a non-fallback SKIP path: the
+    # persisted wing state is the pinned dict, update_count untouched.
+    assert res1.fair_value.anchor_method == AnchorMethod.BEUOY
+    assert res1.bankroll_states[WING_REGION].bankrolls == pytest.approx(
+        {"pricer": 0.5, "market": 0.5})
+    assert res1.bankroll_states[WING_REGION].update_count == 7
+    assert res1.bankroll_states[WING_REGION].frozen is False
+
+    # Second tick WITH threaded history -- the UPDATE path: belly Bayes
+    # fires, wing stays pinned and its update_count stays frozen at 7.
+    market2 = [0.91, 0.68, 0.52, 0.31, 0.11]
+    res2 = compute_fair_value(
+        _snapshot(strikes, pricer), _mids(strikes, market2),
+        res1.bankroll_states, CFG,
+        prev_forecasts=res1.forecasts, prev_consensus=res1.consensus_bucket,
+    )
+    assert res2.fair_value.anchor_method == AnchorMethod.BEUOY
+    assert res2.bankroll_states[WING_REGION].bankrolls == pytest.approx(
+        {"pricer": 0.5, "market": 0.5})
+    assert res2.bankroll_states[WING_REGION].update_count == 7
+    assert (res2.bankroll_states[BELLY_REGION].update_count
+            == res1.bankroll_states[BELLY_REGION].update_count + 1)
+
+
+def test_pin_persists_on_frozen_wing_skip_path():
+    strikes, pricer, market = _mixed_region_inputs()
+    states = {
+        BELLY_REGION: _bankrolls(0.6, 0.4),
+        WING_REGION: _bankrolls(0.9, 0.1, frozen=True, update_count=3),
+    }
+    res1 = compute_fair_value(
+        _snapshot(strikes, pricer), _mids(strikes, market), states, CFG,
+    )
+    # Pin applies regardless of the wing frozen flag; the flag itself is
+    # carried through untouched.
+    assert res1.fair_value.anchor_method == AnchorMethod.BEUOY
+    assert res1.bankroll_states[WING_REGION].bankrolls == pytest.approx(
+        {"pricer": 0.5, "market": 0.5})
+    assert res1.bankroll_states[WING_REGION].frozen is True
+    assert res1.bankroll_states[WING_REGION].update_count == 3
+
+    market2 = [0.91, 0.68, 0.52, 0.31, 0.11]
+    res2 = compute_fair_value(
+        _snapshot(strikes, pricer), _mids(strikes, market2),
+        res1.bankroll_states, CFG,
+        prev_forecasts=res1.forecasts, prev_consensus=res1.consensus_bucket,
+    )
+    assert res2.bankroll_states[WING_REGION].bankrolls == pytest.approx(
+        {"pricer": 0.5, "market": 0.5})
+    assert res2.bankroll_states[WING_REGION].frozen is True
+    assert res2.bankroll_states[WING_REGION].update_count == 3
+
+
+def test_pin_negative_disables_byte_identical_legacy():
+    # Regression pin on the legacy semantics the pin replaces: with pin =
+    # -1.0 the wing strikes price at the STORED weights, the wing credibility
+    # reports the stored weight, the persisted wing row is the stored dict,
+    # and the wing Bayes update still fires on the next tick.
+    strikes, pricer, market = _mixed_region_inputs()
+    res1 = compute_fair_value(
+        _snapshot(strikes, pricer), _mids(strikes, market), _pin_states(),
+        LEGACY_CFG,
+    )
+    cp = res1.fair_value.consensus_p
+    assert cp[1.0] == pytest.approx(0.978 * 0.95 + 0.022 * 0.9, abs=1e-9)
+    assert cp[5.0] == pytest.approx(0.978 * 0.15 + 0.022 * 0.1, abs=1e-9)
+    assert res1.fair_value.credibility_by_region[WING_REGION] == pytest.approx(0.978)
+    assert res1.bankroll_states[WING_REGION].bankrolls == pytest.approx(
+        {"pricer": 0.978, "market": 0.022})
+    assert res1.bankroll_states[WING_REGION].update_count == 0
+
+    market2 = [0.89, 0.69, 0.51, 0.31, 0.11]
+    res2 = compute_fair_value(
+        _snapshot(strikes, pricer), _mids(strikes, market2),
+        res1.bankroll_states, LEGACY_CFG,
+        prev_forecasts=res1.forecasts, prev_consensus=res1.consensus_bucket,
+    )
+    assert res2.fair_value.anchor_method == AnchorMethod.BEUOY
+    assert res2.bankroll_states[WING_REGION].update_count == 1  # Bayes ran
+
+
+def test_pin_rescues_degenerate_wing_bankrolls_with_warning(caplog):
+    strikes, pricer, market = _mixed_region_inputs()
+    states = {
+        BELLY_REGION: _bankrolls(0.6, 0.4),
+        WING_REGION: _bankrolls(0.0, 0.0),  # zero-sum -> degenerate stored row
+    }
+    with caplog.at_level(logging.WARNING, logger="market_maker.fair_value_anchor"):
+        res = compute_fair_value(
+            _snapshot(strikes, pricer), _mids(strikes, market), states, CFG,
+        )
+    # NO fallback: the pin rescues the tick, loudly, and the returned wing
+    # state is pinned (so the degenerate stored row gets overwritten).
+    assert res.fair_value.anchor_method == AnchorMethod.BEUOY
+    assert res.bankroll_states[WING_REGION].frozen is False
+    assert res.bankroll_states[BELLY_REGION].frozen is False
+    assert res.bankroll_states[WING_REGION].bankrolls == pytest.approx(
+        {"pricer": 0.5, "market": 0.5})
+    assert "pin rescued" in caplog.text
+
+    # Contrast: legacy (pin off) still falls back on the same degenerate
+    # wing row (the `weights_wing is None and not pinned` clause).
+    states2 = {
+        BELLY_REGION: _bankrolls(0.6, 0.4),
+        WING_REGION: _bankrolls(0.0, 0.0),
+    }
+    legacy = compute_fair_value(
+        _snapshot(strikes, pricer), _mids(strikes, market), states2, LEGACY_CFG,
+    )
+    assert legacy.fair_value.anchor_method == AnchorMethod.FIXED_BLEND_FALLBACK
+
+
+def test_pin_clamped_into_floor_band():
+    # pin = 1.0 with bankroll_floor = 0.02 -> effective 0.98/0.02 (the
+    # module's floor invariant holds at read time).
+    cfg = MMConfig(wing_pricer_weight_pin=1.0)
+    strikes, pricer, market = _mixed_region_inputs()
+    res = compute_fair_value(
+        _snapshot(strikes, pricer), _mids(strikes, market), _pin_states(), cfg,
+    )
+    cp = res.fair_value.consensus_p
+    assert cp[1.0] == pytest.approx(0.98 * 0.95 + 0.02 * 0.9, abs=1e-9)
+    assert res.fair_value.credibility_by_region[WING_REGION] == pytest.approx(0.98)
+    assert res.bankroll_states[WING_REGION].bankrolls == pytest.approx(
+        {"pricer": 0.98, "market": 0.02})
+
+
+def test_pin_credibility_reporting_scalar_strike_weighted():
+    strikes, pricer, market = _mixed_region_inputs()  # 3 belly + 2 wing strikes
+    res = compute_fair_value(
+        _snapshot(strikes, pricer), _mids(strikes, market), _pin_states(), CFG,
+    )
+    assert res.fair_value.credibility_by_region[WING_REGION] == pytest.approx(0.5)
+    assert res.fair_value.credibility_by_region[BELLY_REGION] == pytest.approx(0.7)
+    # Scalar = strike-count-weighted average USING the pin for wing.
+    assert res.fair_value.credibility == pytest.approx(
+        (3 * 0.7 + 2 * 0.5) / 5, abs=1e-9)

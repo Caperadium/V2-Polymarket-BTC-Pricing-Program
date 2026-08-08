@@ -386,11 +386,12 @@ def markout_report(
     mid_lookup: Callable[[str, datetime, datetime], Optional[float]],
     markets_registry: Dict[str, Tuple[str, float]],
     belly_band: Tuple[float, float],
-    horizons: Sequence[float] = (60.0, 600.0, 3600.0),
+    horizons: Sequence[float] = (60.0, 600.0, 3600.0, 21600.0, 86400.0),
     *,
     now: Optional[datetime] = None,
     persisted: Optional[Dict[Tuple[int, float], float]] = None,
     persist_cb: Optional[Callable[[List[Tuple[int, float, float]]], None]] = None,
+    epoch_ts: Optional[datetime] = None,
 ) -> Dict[str, object]:
     """Per-region, per-TTE-bucket, per-horizon markout report for Stage-B
     paper fills (plan Change C: measure whether the belly's model bias --
@@ -415,10 +416,25 @@ def markout_report(
     pseudo-fills) are never persisted and never looked up in `persisted`,
     degrading to the recompute-every-call behavior. The persisted map is
     keyed `(fill_id, float(horizon_s))` and does NOT capture the disjoint-
-    window upper bound `hi_s`; safe only because the production horizon set is
-    fixed at (60, 600, 3600) -- a changed horizon set could reuse a stored
-    markout under a different window width. Both params default to inert, so a
-    caller that omits them gets a byte-identical report.
+    window upper bound `hi_s`. Window-validity proof for the 2026-08-08
+    horizon APPEND ((60, 600, 3600) -> (60, 600, 3600, 21600, 86400),
+    temp/mm_wing_bleed_fix_plan.md section 2a): when horizons are APPENDED,
+    the only window that can change is the previously-LAST horizon's (`hi_s`
+    was `h + MARKOUT_WINDOW_S`, becomes `h + min(MARKOUT_WINDOW_S, next_h -
+    h)`); here `21600 - 3600 = 18000 >= MARKOUT_WINDOW_S = 600`, so 3600's
+    window stays [3600, 4200) and all three existing horizons are
+    byte-identical -- every persisted `(fill_id, 60/600/3600)` row in
+    fill_markouts remains valid, and the new horizons simply accumulate
+    fresh entries. Any FUTURE horizon change must re-verify this argument or
+    version the persisted map. Both params default to inert, so a caller
+    that omits them gets a byte-identical report.
+
+    Default horizons (2026-08-08 wing-bleed fix, section 2a): 21600 (6h) is
+    the slow-channel SIZING horizon (quotes pull 6h pre-settlement, so a 6h
+    markout is resolvable for essentially every fill incl. the 0-1d bucket);
+    86400 (24h) is DIAGNOSTICS-ONLY -- its cells stay n=0 for TTE<24h fills
+    (mid_log stops at settlement, so the 24h lookup window lies past the
+    last mid) and sizing never reads it.
 
     Price-scale ground truth (binding, see plan "Price-scale ground truth"):
     the fill's stored `price` is ALREADY YES-scale for both sides (the
@@ -437,6 +453,18 @@ def markout_report(
     (MID_LOG_RETENTION_S, 7d) are DELIBERATELY different: persisted per-fill
     markouts carry a cell's measurement across the gap, so the report can
     remember 28d while mids are kept only 7d.
+
+    Epoch (2026-08-08 wing-bleed fix, section 3a): `epoch_ts` (keyword-only,
+    tz-aware UTC, default None = inert) additionally hides fills BEFORE a
+    given instant: the effective per-fill skip bound is `max(lookback_cutoff,
+    epoch_ts)` (None-safe on both sides), applied BEFORE any resolution -- a
+    pre-epoch fill contributes to neither `n` nor `n_attempted` at any
+    horizon, in the aggregate/side/expiry channels alike, even when a
+    persisted markout exists for it. The boundary is INCLUSIVE-keep: a fill
+    with `ts >= epoch_ts` is kept. The persisted/prune machinery is
+    untouched -- epoch filtering is a read-side view only; stored
+    fill_markouts rows for pre-epoch fills remain and reappear if the epoch
+    is cleared.
 
     For each remaining fill (SETTLEMENT-tagged pseudo-fills excluded -- they
     are not a quoting decision to markout) and each horizon `h` in `horizons`
@@ -521,6 +549,8 @@ def markout_report(
          ``markets_registry``; "unknown" bucket for unregistered markets --
          additive key, existing consumers ignore it),
          "lookback_s": MARKOUT_LOOKBACK_S,
+         "epoch_ts": iso-or-None (additive, section 3a -- the epoch this
+         report was filtered with, None when inert),
          "generated_ts": iso}
     """
     # De-dup as well as sort: a duplicated horizon would produce a zero-width
@@ -532,6 +562,15 @@ def markout_report(
     if now is None:
         now = max((f.ts for f in eligible), default=None)
     cutoff = (now - timedelta(seconds=MARKOUT_LOOKBACK_S)) if now is not None else None
+    # Section 3a (2026-08-08 wing-bleed fix): effective per-fill skip bound is
+    # the LATER of the rolling lookback cutoff and the optional epoch_ts,
+    # None-safe on both sides. The skip below is strict `<`, so a fill with
+    # ts == epoch_ts is KEPT (boundary inclusive). Applied before ANY
+    # resolution, so a pre-epoch fill never resolves from `persisted` either.
+    if cutoff is not None and epoch_ts is not None:
+        skip_bound: Optional[datetime] = max(cutoff, epoch_ts)
+    else:
+        skip_bound = epoch_ts if epoch_ts is not None else cutoff
     # Fix 2a: the n_attempted young/old boundary (see docstring). A miss on a
     # fill older than this can never resolve (its mids are pruned), so it must
     # not count as an attempt. None (no `now`) -> treat every fill as young,
@@ -563,7 +602,7 @@ def markout_report(
     side_attempted: Dict[Tuple[str, str, float], Dict[Side, int]] = {}
 
     for f in eligible:
-        if cutoff is not None and f.ts < cutoff:
+        if skip_bound is not None and f.ts < skip_bound:
             continue
 
         mid_at_fill = getattr(f, "mid_at_fill", None)
@@ -624,9 +663,11 @@ def markout_report(
 
             # Resolution: persisted markout first (survives mid_log pruning),
             # else the live mid_log lookup. `hkey` is keyed (fill_id,
-            # float(h)) only -- it does NOT capture hi_s, safe only because
-            # the production horizon set is fixed (see docstring). id=None
-            # fills never persist and never resolve from `persisted`.
+            # float(h)) only -- it does NOT capture hi_s; valid under
+            # horizon APPENDS per the docstring's window-validity proof (any
+            # other horizon change must re-verify it or version the
+            # persisted map). id=None fills never persist and never resolve
+            # from `persisted`.
             hkey = (fill_id, float(h))
             mk: Optional[float] = None
             if fill_id is not None and persisted is not None and hkey in persisted:
@@ -717,6 +758,9 @@ def markout_report(
         "by_region": by_region,
         "by_expiry": by_expiry,
         "lookback_s": MARKOUT_LOOKBACK_S,
+        # Additive (section 3a): the epoch this report was filtered with,
+        # None when inert. Existing consumers ignore unknown keys.
+        "epoch_ts": epoch_ts.isoformat() if epoch_ts is not None else None,
         "generated_ts": datetime.now(timezone.utc).isoformat(),
     }
 

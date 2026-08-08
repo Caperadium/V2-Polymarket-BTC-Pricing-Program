@@ -80,6 +80,40 @@ bankroll weights and `wing` resets to 50/50 parity; both regions persist
 independently from then on. See [Market Making](../concepts/market-making.md#45-per-region-credibility-belly-vs-wing)
 for the reasoning.
 
+### 2026-08-08 wing-bleed fix wave: knobs and kill switches
+
+The wave ships five new `MMConfig` knobs, all **default-ON** after a plain
+pull + restart: `paper_run_config.json` keys map to argparse dests only and
+the runner constructs `MMConfig` bare, so new config fields activate at
+their defaults without any config-file change. Each has a kill switch
+(config-code edit, plus a CLI flag for the epoch):
+
+| Knob (default) | What it does | Kill switch |
+|------|------|------|
+| `wing_pricer_weight_pin` (0.5) | Pins the wing region's pricer weight in the fair-value consensus and skips the wing Bayes update (self-confirmation loop; see Market Making 4.6) | `-1.0` restores legacy wing Bayes |
+| `markout_slow_horizon_s` (21600.0) | Second sizing markout lookup at 6 h, a one-directional `min()` haircut on the Kelly net edge; slow-measured-toxic also suppresses the exploration carve-out | `0.0` = mid channel only |
+| `markout_epoch_utc` ("2026-07-27T15:48:00+00:00") | Fills before this UTC instant are hidden from the belly SIZING markout view; wing sizing, term 7 and the monitor keep the full 28d window | `""` disables; CLI `--markout-epoch` overrides the field (an explicit `--markout-epoch ""` also disables) |
+| `sizing_region_basis` ("mid") | Classifies the sizing/exploration-gate region from the live book mid (matching the markout report's fill tagging) instead of the consensus p | see the exact-legacy note below |
+| `sizing_region_hysteresis_p` (0.02) | Latches the sizing region per market; it flips only when the classifying probability clears the belly-band edge by this margin | `0.0` = raw region every tick (also a valid standalone switch if a stale held region misbehaves) |
+
+EXACT legacy sizing-region behavior requires BOTH
+`sizing_region_basis = "consensus"` AND `sizing_region_hysteresis_p = 0.0`
+-- the basis change alone yields consensus-with-latch, a third behavior
+that has never run in production. Each switch is independent, so item-level
+reverts do not require unbundling the deploy.
+
+Operator rule for the epoch: **bump `markout_epoch_utc` (or pass
+`--markout-epoch`) at any deploy that materially changes quoting
+behavior**, so belly sizing draws its evidence only from the current
+quoting regime; the runner logs the active epoch at startup and notes when
+it has aged past the 28d lookback (inert until bumped).
+
+Before rolling this wave -- or any quoting-behavior change -- to the VPS,
+take a **pre-deploy baseline snapshot** for post-deploy attribution:
+(a) `markout_report.json`, (b) each market's current QuoteMode and bid/ask
+sizes from the `quotes` table, (c) the `bankrolls` table's wing rows.
+Capture the same three after the deploy.
+
 ## Checking status
 
 ```bash
@@ -115,6 +149,18 @@ additions `n_expiries_active`, `ladders_settled_total`,
 `noarb_repairs`). Note: the legacy `noarb_violations` field does NOT
 count arb violations -- it counts warm-up ticks before a slot's first
 checked ladder (kept under its old name for consumer compat).
+
+Since 2026-08-08 the per-run output directory carries a second markout
+artifact next to `markout_report.json`: `markout_report_sizing.json`, the
+belly epoch-filtered SIZING view, written on the same cadence. The file
+holds what belly-region sizing actually reads -- it reflects the provider's
+fallback chain (a failed sizing build degrades to the previous view, else
+the protective full report), not the raw per-cadence build. The mm_monitor
+page captions the markout section with the active epoch, renders the
+sizing view as its own "belly sizing view" expander, and flags the wing
+`bankrolls` rows as PINNED: a flat 0.5 pricer weight with a frozen
+`update_count` on the wing rows is the wing pricer weight pin working, not
+a fault.
 
 ### mm_monitor dashboard over an SSH tunnel (optional)
 
@@ -233,3 +279,38 @@ Run once on the actual VPS before trusting an unattended month-long run:
    operation.
 
 See `deploy/README.md` for the fully detailed version of this procedure.
+
+## Wing-bleed fix wave: post-deploy watch (2026-08-08)
+
+Watch 3-5 days after deploying the wave, against the pre-deploy baseline
+snapshot from the install section:
+
+- **Wing exploration-fill detector.** Flag ANY new maker fill at market mid
+  < 0.30 on a market whose SIZING cell was not trusted-measured at quote
+  time (`n_attempted < markout_min_n` in `markout_report_sizing.json` for
+  the fill's region/tte cell), regardless of size -- the open exploration
+  gate produced floor-sized, Kelly-sized and tapered-floor fills alike, so
+  a size-match trigger misses cases. Report the fill size as a multiple of
+  `0.55/price` (the untapered floor unit) as a diagnostic column, not as
+  the trigger. Check-time caveat: the sizing report is overwritten each
+  cadence, so evaluate against the nearest retained snapshot if one is
+  kept, else the current file -- `n_attempted` only grows within the
+  window, so "flagged now" implies "under-attempted then" (no false
+  positives; a cell that crossed `markout_min_n` between fill and check
+  hides its earlier fills, the accepted miss direction). Expect ~0 wing YES
+  maker fills/day at mid < 0.2 from the exploration path.
+- **Settled PnL, two bands.** Fills at mid < 0.20 should settle to a mean
+  better than -1c/share (they ran -10 to -13c pre-fix); track mid 0.20-0.30
+  as its own line -- that band is deliberately REOPENED for bounded (0.33x)
+  exploration by the epoch + mid-basis changes, protected day-one by term-7
+  width alone until the slow haircut arms (fills aging past 6 h, roughly
+  1-3 weeks).
+- **Belly alive.** Sustained TWO_SIDED resting orders on near-money
+  markets; no fleet-wide zero-quote state.
+- **Boundary churn.** Orders + cancels per 10 minutes on markets with book
+  mid in [0.17, 0.23] (consensus band as a secondary cut): no square wave
+  vs baseline -- the hysteresis latch's job.
+- **Pin persistence.** After a restart, the state db's `bankrolls` wing
+  rows show pricer == 0.5, flat -- the pin overwrites the stale stored
+  weights on the first clean tick.
+- `stranded_markets` stays 0; no STALLED / CRASHED alerts.

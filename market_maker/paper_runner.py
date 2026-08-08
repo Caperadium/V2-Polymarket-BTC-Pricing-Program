@@ -65,6 +65,10 @@ Outputs under --out (default temp/paper_run/<UTC ts>/):
     markout_report.json  per-region/tte-bucket/horizon markout report (plan
                      Change C; additive by_expiry rollup), rewritten every
                      PER_MARKET_SNAPSHOT_EVERY_N_TICKS ticks
+    markout_report_sizing.json  belly epoch-filtered SIZING view of the same
+                     report (2026-08-08 wing-bleed fix 3c; epoch from
+                     --markout-epoch / MMConfig.markout_epoch_utc), written on
+                     the same cadence; consumed by belly-region sizing only
     paper_state.db  MMStateStore (orders/fills/inventory/quotes/mid_log
                      journal); relocated by --state-db
     run_meta.json    self-describing run config; the additive `events` list is
@@ -197,6 +201,23 @@ def _safe_mtime(path: Path) -> Optional[float]:
         return None
 
 
+def _parse_epoch(raw: Optional[str]) -> Optional[datetime]:
+    """Parse the belly sizing markout epoch (3b, 2026-08-08 wing-bleed fix):
+    the CLI --markout-epoch when given, else MMConfig.markout_epoch_utc.
+    Empty/None disables (returns None); a naive ISO timestamp is assumed UTC;
+    an unparseable value warns and disables rather than killing the runner."""
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(raw).strip())
+    except ValueError:
+        logger.warning("unparseable markout epoch %r; epoch disabled", raw)
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
 def _all_settled_terminal(store: MMStateStore, markets: List[Tuple[str, float]], expiry_key: str) -> bool:
     """Kept for tests/back-compat; the orchestrator has its own cached copy."""
     for m, _k in markets:
@@ -314,6 +335,10 @@ def run(argv: Optional[List[str]] = None) -> int:
                     help="shared engine GARCH cache max age before it is cleared and refit (plan 2.5)")
     ap.add_argument("--max-consecutive-tick-errors", type=int, default=20,
                     help="consecutive TICK_ERRORs before exiting tick_errors (plan 2.6)")
+    ap.add_argument("--markout-epoch", default=None,
+                    help="UTC ISO instant; fills before it are hidden from the belly SIZING "
+                         "markout view (2026-08-08 wing-bleed fix). Default (unset) uses "
+                         "MMConfig.markout_epoch_utc; an explicit \"\" disables the epoch")
 
     # --config pre-scan (parse_known_args so unrelated flags don't error out
     # here): load the JSON, apply as argparse defaults BEFORE the real parse
@@ -562,24 +587,62 @@ def run(argv: Optional[List[str]] = None) -> int:
         db_existed = state_db_path.exists()
         store = MMStateStore(str(state_db_path))
 
-        # wave 2 W7: seed the shared markout-report holder from the
-        # persistent store's own fills BEFORE the orchestrator/loops are
-        # built, so a restart does not lose a week of measurement (the
-        # holder stays {"report": None} on a fresh/empty store -- guarded,
-        # never fatal). The SAME holder is updated at the periodic
-        # markout_report() write further below so every slot's loop (via
-        # markout_provider=holder.get lambda) always sees the latest report.
-        _markout_holder: Dict[str, Optional[dict]] = {"report": None}
+        # 3c (2026-08-08 wing-bleed fix): ONE MMConfig for the whole runner --
+        # the seed report call, the orchestrator construction, and the
+        # periodic report block must agree on belly_band/epoch semantics.
+        cfg = MMConfig()
+
+        # 3b: resolve the belly sizing markout epoch ONCE. CLI
+        # --markout-epoch overrides the MMConfig field; explicit "" disables.
+        raw_epoch = (args.markout_epoch if args.markout_epoch is not None
+                     else getattr(cfg, "markout_epoch_utc", ""))
+        epoch = _parse_epoch(raw_epoch)
+        if epoch is not None:
+            logger.info("belly sizing markout epoch active: %s", epoch.isoformat())
+            if epoch < datetime.now(timezone.utc) - timedelta(seconds=MARKOUT_LOOKBACK_S):
+                logger.info(
+                    "markout epoch is older than the %.0fd report lookback -- "
+                    "inert until bumped (operator rule: bump at any deploy that "
+                    "materially changes quoting behavior)",
+                    MARKOUT_LOOKBACK_S / 86400.0)
+        else:
+            logger.info("belly sizing markout epoch disabled")
+
+        # wave 2 W7 + Fix 3 (2026-08-08): seed the shared markout-report
+        # holder from the persistent store's own fills BEFORE the
+        # orchestrator/loops are built, so a restart does not lose a week of
+        # measurement (guarded, never fatal). TWO views: "report" = the full
+        # 28d window (term-7 widening, wing sizing, monitor/telegram);
+        # "sizing" = the belly epoch-filtered view. The holder is INITIALIZED
+        # WITH BOTH KEYS (review round-3 F5 -- a missing "sizing" key would
+        # KeyError inside the periodic try and silently kill both reports
+        # every cadence). The SAME holder is updated at the periodic
+        # markout_report() write further below so every slot's loop (via the
+        # provider lambdas) always sees the latest pair.
+        _markout_holder: Dict[str, Optional[dict]] = {"report": None, "sizing": None}
         try:
             _seed_fills = store.get_fills()
             if _seed_fills:
-                _markout_holder["report"] = markout_report(
+                _seed_now = datetime.now(timezone.utc)
+                _seed_registry = store.get_market_registry()
+                report_full = markout_report(
                     _seed_fills, store.mid_at_or_after,
-                    store.get_market_registry(), MMConfig().belly_band,
-                    now=datetime.now(timezone.utc),
+                    _seed_registry, cfg.belly_band,
+                    now=_seed_now,
                     persisted=store.get_fill_markouts(),
                     persist_cb=store.append_fill_markouts,
                 )
+                report_sizing = markout_report(
+                    _seed_fills, store.mid_at_or_after,
+                    _seed_registry, cfg.belly_band,
+                    now=_seed_now,
+                    persisted=store.get_fill_markouts(),  # RE-READ after report_full so its
+                                                          # freshly persisted rows resolve
+                    persist_cb=None,                      # single-writer: full report persists
+                    epoch_ts=epoch,
+                )
+                _markout_holder["report"] = report_full
+                _markout_holder["sizing"] = report_sizing or _markout_holder["sizing"] or report_full
         except Exception:
             logger.warning("markout report seed failed; starting on the m_prior sizing path", exc_info=True)
 
@@ -595,7 +658,7 @@ def run(argv: Optional[List[str]] = None) -> int:
         orch = MultiExpiryOrchestrator(
             store=store,
             engine=engine,
-            config=MMConfig(),
+            config=cfg,
             bankroll_total=args.bankroll,
             max_expiries=max_expiries,
             tick_s=args.tick_s,
@@ -606,6 +669,10 @@ def run(argv: Optional[List[str]] = None) -> int:
             # cadence) updates the SAME holder in place, so every slot's loop
             # picks up the latest report without any additional wiring.
             markout_provider=lambda: _markout_holder["report"],
+            # Fix 3 (2026-08-08): the belly epoch-filtered SIZING view, same
+            # holder-lambda pattern -- consumed by each loop's belly-region
+            # sizing lookups only (wing sizing + term 7 keep the full report).
+            sizing_markout_provider=lambda: _markout_holder["sizing"],
             # Late-binding lambdas so the existing monkeypatch seams
             # (paper_runner.PolymarketFeedAdapter / .resolve_events_multi)
             # keep working -- the names resolve against THIS module's globals
@@ -937,18 +1004,52 @@ def run(argv: Optional[List[str]] = None) -> int:
                 if tick_n % PER_MARKET_SNAPSHOT_EVERY_N_TICKS == 0:
                     try:
                         if fills_all is not None:
-                            report_json = markout_report(
+                            # Perf (plan 2a): the 5-horizon default is ~3.3x
+                            # indexed mid_log probes per cadence vs the old 3
+                            # horizons (young unresolved fills re-probe until
+                            # matured or aged out -- bounded by fills-in-7d x
+                            # 5); every probe is an indexed lookup via
+                            # idx_mid_log_market_ts.
+                            registry_mk = store.get_market_registry()
+                            report_full = markout_report(
                                 fills_all, store.mid_at_or_after,
-                                store.get_market_registry(), orch.config.belly_band,
+                                registry_mk, cfg.belly_band,
                                 now=now,
                                 persisted=store.get_fill_markouts(),
                                 persist_cb=store.append_fill_markouts,
                             )
-                            _write_json_atomic(out_dir / "markout_report.json", report_json)
-                            # wave 2 W7: keep the shared sizing-provider holder
-                            # current -- every slot's loop reads this same
-                            # dict via markout_provider=lambda: holder["report"].
-                            _markout_holder["report"] = report_json
+                            # Fix 3 (2026-08-08): the belly epoch-filtered
+                            # SIZING view -- no persistence (single-writer:
+                            # the full report persists), persisted RE-READ
+                            # after report_full so its freshly persisted rows
+                            # resolve here too.
+                            report_sizing = markout_report(
+                                fills_all, store.mid_at_or_after,
+                                registry_mk, cfg.belly_band,
+                                now=now,
+                                persisted=store.get_fill_markouts(),
+                                persist_cb=None,
+                                epoch_ts=epoch,
+                            )
+                            # Build-both-then-assign-both: a failure above
+                            # leaves BOTH holder entries at their previous
+                            # values (the loops keep a consistent pair). The
+                            # sizing fallback chain degrades a None/empty
+                            # sizing view to the previous sizing view or the
+                            # PROTECTIVE full report -- never None -> m_prior.
+                            _markout_holder["report"] = report_full
+                            _markout_holder["sizing"] = (
+                                report_sizing or _markout_holder["sizing"] or report_full
+                            )
+                            _write_json_atomic(out_dir / "markout_report.json", report_full)
+                            # Write the HOLDER value, not report_sizing raw:
+                            # mm_monitor renders this file as "what sizing
+                            # actually reads", so it must reflect the same
+                            # fallback chain the provider serves.
+                            _write_json_atomic(
+                                out_dir / "markout_report_sizing.json",
+                                _markout_holder["sizing"],
+                            )
                             # Fix 2a: mid_log prunes to the shorter retention
                             # (persisted per-fill markouts carry the 28d
                             # measurement across the gap); the persisted-markout

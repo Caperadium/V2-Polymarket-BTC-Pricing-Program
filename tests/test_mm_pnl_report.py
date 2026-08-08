@@ -1529,3 +1529,283 @@ def test_markout_stats_side_resolution_unaffected_by_markout_stats_calls():
     side = markout_stats_side(report, "belly", "0-1d", 60.0, Side.BUY_YES, min_n=20)
     assert agg == (0.02, 0.0004, 25, 30)
     assert side == (-0.03, 25)
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-08 wing-bleed fix, section 2a: extended default horizons
+# (60, 600, 3600) -> (60, 600, 3600, 21600, 86400)
+# ---------------------------------------------------------------------------
+
+
+def test_markout_default_horizons_extended_to_slow_and_daily():
+    # Section 2a: the DEFAULT horizon tuple appends 21600 (slow sizing
+    # channel) and 86400 (diagnostics-only). All five horizons get cells,
+    # by_region entries, and side splits.
+    fill = _paper_fill("m1", Side.BUY_YES, 0.50, 5.0, mid_at_fill=0.50)
+    registry = {"m1": (FAR_EXPIRY, 100000.0)}
+    mid_rows = {"m1": [
+        (NOW + timedelta(seconds=60), 0.55),
+        (NOW + timedelta(seconds=600), 0.55),
+        (NOW + timedelta(seconds=3600), 0.55),
+        (NOW + timedelta(seconds=21600), 0.55),
+        (NOW + timedelta(seconds=86400), 0.55),
+    ]}
+    report = markout_report([fill], _mid_lookup_from_rows(mid_rows), registry, BELLY_BAND)
+    by_horizon = {c["horizon_s"]: c for c in report["cells"]}
+    assert set(by_horizon) == {60.0, 600.0, 3600.0, 21600.0, 86400.0}
+    for cell in by_horizon.values():
+        assert cell["n"] == 1
+        assert cell["mk_avg"] == pytest.approx(0.05)
+        assert set(cell["sides"].keys()) == {"BUY_YES", "BUY_NO"}
+        assert cell["sides"]["BUY_YES"]["n"] == 1
+    region = report["cells"][0]["region"]
+    assert set(report["by_region"][region].keys()) == {
+        "60.0", "600.0", "3600.0", "21600.0", "86400.0"
+    }
+    for entry in report["by_region"][region].values():
+        assert "sides" in entry
+
+
+def test_markout_new_default_tuple_legacy_horizon_cells_identical():
+    # Window-validity regression (section 2a proof): with horizons APPENDED,
+    # the 60/600/3600 cells produced by the NEW default tuple must be
+    # IDENTICAL to those from an explicit (60.0, 600.0, 3600.0) run --
+    # 21600 - 3600 = 18000 >= MARKOUT_WINDOW_S = 600, so 3600's window stays
+    # [3600, 4200) and nothing about the existing horizons changes.
+    f1 = _paper_fill("m1", Side.BUY_YES, 0.50, 5.0, mid_at_fill=0.50, order_id="f1", ts=NOW)
+    f2 = _paper_fill(
+        "m2", Side.BUY_NO, 0.90, 5.0, mid_at_fill=0.90, order_id="f2",
+        ts=NOW + timedelta(minutes=10),
+    )
+    registry = {"m1": (FAR_EXPIRY, 100000.0), "m2": (FAR_EXPIRY, 110000.0)}
+    mid_rows = {
+        "m1": [
+            (f1.ts + timedelta(seconds=60), 0.55),     # hits 60's [60, 600)
+            (f1.ts + timedelta(seconds=650), 0.52),    # hits 600's [600, 1200)
+            (f1.ts + timedelta(seconds=4100), 0.48),   # hits 3600's [3600, 4200) -- both runs
+            (f1.ts + timedelta(seconds=21650), 0.60),  # hits 21600's window -- NEW run only
+        ],
+        "m2": [
+            (f2.ts + timedelta(seconds=600), 0.88),    # hits 600 only
+            (f2.ts + timedelta(seconds=4200), 0.85),   # EXCLUDED from 3600 (exclusive upper bound) in both
+        ],
+    }
+    fills = [f1, f2]
+    lookup = _mid_lookup_from_rows(mid_rows)
+    report_new = markout_report(fills, lookup, registry, BELLY_BAND, now=NOW)
+    report_old = markout_report(
+        fills, lookup, registry, BELLY_BAND, horizons=(60.0, 600.0, 3600.0), now=NOW,
+    )
+
+    legacy = (60.0, 600.0, 3600.0)
+    new_legacy_cells = [c for c in report_new["cells"] if c["horizon_s"] in legacy]
+    assert new_legacy_cells == report_old["cells"]
+    # 3600's window proof point: the +4100 mid resolves in BOTH runs.
+    for rep in (report_new, report_old):
+        cell_3600 = next(
+            c for c in rep["cells"] if c["region"] == "belly" and c["horizon_s"] == 3600.0
+        )
+        assert cell_3600["n"] == 1
+        assert cell_3600["mk_avg"] == pytest.approx(-0.02)
+    # by_region / by_expiry legacy-horizon entries identical too.
+    for region, horizons_entry in report_old["by_region"].items():
+        for hk, entry in horizons_entry.items():
+            assert report_new["by_region"][region][hk] == entry
+    for ek, horizons_entry in report_old["by_expiry"].items():
+        for hk, entry in horizons_entry.items():
+            assert report_new["by_expiry"][ek][hk] == entry
+    # The appended horizon accumulates its own fresh data without disturbing
+    # the legacy cells above.
+    cell_21600 = next(
+        c for c in report_new["cells"] if c["region"] == "belly" and c["horizon_s"] == 21600.0
+    )
+    assert cell_21600["n"] == 1
+    assert cell_21600["mk_avg"] == pytest.approx(0.10)
+
+
+def test_markout_persisted_legacy_horizon_rows_valid_under_new_defaults():
+    # Every persisted (fill_id, 60/600/3600) fill_markouts row remains valid
+    # under the appended default tuple: the stored mk short-circuits the mid
+    # lookup for the legacy horizons; only the two NEW horizons hit the live
+    # lookup (attempted-only here, no mids supplied).
+    fill = _paper_fill_id("m1", Side.BUY_YES, 0.50, 1.0, 0.50, fid=7)
+    registry = {"m1": (FAR_EXPIRY, 100000.0)}
+    calls = []
+
+    def _lookup(market_id, ts_min, ts_max):
+        calls.append((ts_min, ts_max))
+        return None
+
+    persisted = {(7, 60.0): 0.01, (7, 600.0): -0.02, (7, 3600.0): 0.03}
+    report = markout_report([fill], _lookup, registry, BELLY_BAND, now=NOW, persisted=persisted)
+    by_horizon = {c["horizon_s"]: c for c in report["cells"]}
+    assert by_horizon[60.0]["n"] == 1
+    assert by_horizon[60.0]["mk_avg"] == pytest.approx(0.01)
+    assert by_horizon[600.0]["n"] == 1
+    assert by_horizon[600.0]["mk_avg"] == pytest.approx(-0.02)
+    assert by_horizon[3600.0]["n"] == 1
+    assert by_horizon[3600.0]["mk_avg"] == pytest.approx(0.03)
+    # Only the two new horizons ever reached the live lookup.
+    assert len(calls) == 2
+    assert by_horizon[21600.0]["n"] == 0
+    assert by_horizon[21600.0]["n_attempted"] == 1
+    assert by_horizon[86400.0]["n"] == 0
+    assert by_horizon[86400.0]["n_attempted"] == 1
+
+
+def test_markout_86400_attempted_only_when_settlement_within_24h():
+    # Plan 2a: 86400 is DIAGNOSTICS-ONLY -- a fill with TTE < 24h can never
+    # resolve it (mid_log stops at settlement, so the [86400, 87000) window
+    # lies past the last mid). The cell must be attempted-only (n=0,
+    # n_attempted=1), never phantom-measured; every pre-settlement horizon
+    # still resolves normally.
+    expiry = "2026-07-08"
+    settle = settlement_instant_utc(expiry)
+    fill_ts = settle - timedelta(hours=12)  # TTE 0.5d ("0-1d"), < 24h
+    fill = _paper_fill("m1", Side.BUY_YES, 0.50, 5.0, mid_at_fill=0.50, ts=fill_ts)
+    registry = {"m1": (expiry, 100000.0)}
+    # Mids exist only up to settlement (mid_log stops there): nothing at
+    # +86400, which is 12h past the settlement instant.
+    mid_rows = {"m1": [
+        (fill_ts + timedelta(seconds=60), 0.55),
+        (fill_ts + timedelta(seconds=600), 0.55),
+        (fill_ts + timedelta(seconds=3600), 0.55),
+        (fill_ts + timedelta(seconds=21600), 0.55),  # 6h, still pre-settlement
+    ]}
+    report = markout_report(
+        [fill], _mid_lookup_from_rows(mid_rows), registry, BELLY_BAND,
+        now=settle + timedelta(hours=13),
+    )
+    by_horizon = {c["horizon_s"]: c for c in report["cells"]}
+    for h in (60.0, 600.0, 3600.0, 21600.0):
+        assert by_horizon[h]["n"] == 1
+    assert by_horizon[86400.0]["n"] == 0
+    assert by_horizon[86400.0]["n_attempted"] == 1
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-08 wing-bleed fix, section 3a: epoch_ts keyword-only filter
+# ---------------------------------------------------------------------------
+
+
+def test_markout_epoch_ts_skips_pre_epoch_fills_entirely():
+    # Section 3a: a fill BEFORE epoch_ts is invisible -- neither n nor
+    # n_attempted, at every horizon, aggregate and side channels alike, EVEN
+    # when a persisted markout exists for it (the skip precedes resolution)
+    # -- and it never feeds persist_cb.
+    epoch = NOW - timedelta(days=2)
+    pre_wing = _paper_fill_id(
+        "m1", Side.BUY_YES, 0.50, 1.0, 0.90, fid=1, ts=epoch - timedelta(hours=1),
+    )
+    pre_belly = _paper_fill_id(
+        "m1", Side.BUY_NO, 0.50, 1.0, 0.50, fid=2, ts=epoch - timedelta(hours=2),
+    )
+    post = _paper_fill_id("m1", Side.BUY_YES, 0.50, 1.0, 0.50, fid=3, ts=NOW)
+
+    registry = {"m1": (FAR_EXPIRY, 100000.0)}
+    captured = []
+
+    def _lookup(market_id, ts_min, ts_max):
+        return 0.55  # every eligible window hits -- skips must show in counts
+
+    report = markout_report(
+        [pre_wing, pre_belly, post], _lookup, registry, BELLY_BAND,
+        horizons=(60.0, 600.0), now=NOW,
+        persisted={(2, 60.0): -0.50},  # pre-epoch persisted row must NOT resolve
+        persist_cb=captured.extend,
+        epoch_ts=epoch,
+    )
+    # The pre-epoch wing fill emitted NO cell at all, at any horizon.
+    assert {c["region"] for c in report["cells"]} == {"belly"}
+    assert "wing" not in report["by_region"]
+    by_horizon = {c["horizon_s"]: c for c in report["cells"]}
+    assert set(by_horizon) == {60.0, 600.0}
+    for cell in by_horizon.values():
+        # Only the post-epoch fill counts; pre_belly (same cell) is skipped.
+        assert cell["n"] == 1
+        assert cell["n_attempted"] == 1
+        assert cell["sides"]["BUY_YES"]["n"] == 1
+        assert cell["sides"]["BUY_NO"]["n"] == 0
+        assert cell["sides"]["BUY_NO"]["n_attempted"] == 0
+    # Only the post-epoch fill's fresh hits were persisted.
+    assert sorted(t[:2] for t in captured) == [(3, 60.0), (3, 600.0)]
+
+
+def test_markout_epoch_ts_boundary_inclusive_keep():
+    # Boundary: a fill with ts == epoch_ts is KEPT (skip is strict `<`).
+    epoch = NOW
+    fill = _paper_fill("m1", Side.BUY_YES, 0.50, 1.0, mid_at_fill=0.50, ts=epoch)
+    registry = {"m1": (FAR_EXPIRY, 100000.0)}
+    mid_rows = {"m1": [(fill.ts + timedelta(seconds=60), 0.55)]}
+    report = markout_report(
+        [fill], _mid_lookup_from_rows(mid_rows), registry, BELLY_BAND,
+        horizons=(60.0,), now=NOW, epoch_ts=epoch,
+    )
+    cell = report["cells"][0]
+    assert cell["n"] == 1
+    assert cell["n_attempted"] == 1
+    assert report["epoch_ts"] == epoch.isoformat()
+
+
+def test_markout_epoch_ts_none_inert_and_additive_key():
+    # epoch_ts=None (or omitted) is byte-identical to today's report except
+    # for the additive "epoch_ts": None key.
+    fill = _paper_fill("m1", Side.BUY_YES, 0.50, 5.0, mid_at_fill=0.50)
+    registry = {"m1": (FAR_EXPIRY, 100000.0)}
+    mid_rows = {"m1": [(fill.ts + timedelta(seconds=60), 0.55)]}
+    lookup = _mid_lookup_from_rows(mid_rows)
+    r_omitted = markout_report([fill], lookup, registry, BELLY_BAND, horizons=(60.0,), now=NOW)
+    r_explicit = markout_report(
+        [fill], lookup, registry, BELLY_BAND, horizons=(60.0,), now=NOW, epoch_ts=None,
+    )
+    assert r_omitted["epoch_ts"] is None
+    assert r_explicit["epoch_ts"] is None
+    # Legacy structure untouched around the additive key.
+    assert r_omitted["cells"][0]["n"] == 1
+    assert r_omitted["lookback_s"] == MARKOUT_LOOKBACK_S
+    r_omitted.pop("generated_ts")
+    r_explicit.pop("generated_ts")
+    assert r_omitted == r_explicit
+
+
+def test_markout_epoch_ts_max_with_lookback_cutoff_both_directions():
+    # Effective skip bound = max(lookback_cutoff, epoch_ts):
+    #  - epoch OLDER than the 28d cutoff -> the lookback binds (a fill past
+    #    the window stays excluded even though it is post-epoch);
+    #  - epoch NEWER than the cutoff -> the epoch binds (a fill inside the
+    #    window but pre-epoch is excluded).
+    registry = {"m1": (FAR_EXPIRY, 100000.0)}
+
+    def _lookup(market_id, ts_min, ts_max):
+        return 0.55  # every eligible window hits
+
+    old_fill = _paper_fill(
+        "m1", Side.BUY_YES, 0.50, 1.0, mid_at_fill=0.50, order_id="old",
+        ts=NOW - timedelta(seconds=MARKOUT_LOOKBACK_S + 3600.0),  # past 28d
+    )
+    mid_fill = _paper_fill(
+        "m1", Side.BUY_YES, 0.50, 1.0, mid_at_fill=0.50, order_id="mid",
+        ts=NOW - timedelta(days=6),  # inside 28d lookback AND 7d retention
+    )
+    new_fill = _paper_fill(
+        "m1", Side.BUY_YES, 0.50, 1.0, mid_at_fill=0.50, order_id="new",
+        ts=NOW - timedelta(days=1),
+    )
+    fills = [old_fill, mid_fill, new_fill]
+
+    r_lookback_binds = markout_report(
+        fills, _lookup, registry, BELLY_BAND, horizons=(60.0,), now=NOW,
+        epoch_ts=NOW - timedelta(days=40),  # older than the cutoff
+    )
+    assert len(r_lookback_binds["cells"]) == 1
+    assert r_lookback_binds["cells"][0]["n"] == 2           # mid + new
+    assert r_lookback_binds["cells"][0]["n_attempted"] == 2
+
+    r_epoch_binds = markout_report(
+        fills, _lookup, registry, BELLY_BAND, horizons=(60.0,), now=NOW,
+        epoch_ts=NOW - timedelta(days=5),  # newer than the cutoff
+    )
+    assert len(r_epoch_binds["cells"]) == 1
+    assert r_epoch_binds["cells"][0]["n"] == 1              # new only
+    assert r_epoch_binds["cells"][0]["n_attempted"] == 1
+    assert r_epoch_binds["epoch_ts"] == (NOW - timedelta(days=5)).isoformat()

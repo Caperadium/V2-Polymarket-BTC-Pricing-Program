@@ -231,6 +231,70 @@ class MMConfig:
     # pick-off signal this term is meant to react to.
     markout_widen_horizon_s: float = 60.0
 
+    # --- wing pricer weight pin (2026-08-08 wing-bleed fix) ---
+    # VPS evidence 2026-08-08: the wing region's own Bayes updates re-awarded
+    # the pricer ~0.98 weight while every wing YES fill settled worthless (66k
+    # NO 6/6 days since 08-01, -3.5 realized). The wing update is a
+    # self-confirmation loop (factors score against a consensus built from the
+    # pre-update weights), so the wing pricer weight is PINNED and the wing
+    # Bayes update is skipped entirely. In [0,1]: pricer weight = pin (clamped
+    # into [bankroll_floor, 1-bankroll_floor] at read time so the module's
+    # floor invariant holds), remainder to the other models pro rata
+    # (all-market in the 2-model case). Negative disables (legacy Bayes).
+    # Belly untouched. Runner/harness never read this directly -- only
+    # fair_value_anchor.compute_fair_value does.
+    wing_pricer_weight_pin: float = 0.5
+
+    # --- slow-horizon sizing haircut (2026-08-08 wing-bleed fix) ---
+    # The 600s mid markout is structurally blind to slow theta bleed on
+    # low-delta wings (measured -2.7c at 600s vs -10 to -13c realized at
+    # settlement, VPS 2026-08-08). A second sizing lookup at this longer mid
+    # horizon acts as a strictly ONE-DIRECTIONAL haircut on the Kelly net
+    # edge (min(); it can never raise m). 21600 (6h), NOT 86400: quotes pull
+    # 6h before settlement (near_resolution_pull_hours), so a 6h markout is
+    # resolvable for essentially every fill, while a 24h markout can never
+    # resolve for TTE<24h fills (mid_log stops at settlement) -- the
+    # highest-volume 0-1d bucket would be permanently unmeasured. <= 0
+    # disables (harness skips the lookup AND _leg_edge ignores any supplied
+    # slow fields).
+    markout_slow_horizon_s: float = 21600.0
+
+    # --- belly sizing markout epoch (2026-08-08 wing-bleed fix) ---
+    # Fills BEFORE this UTC instant are invisible to the SIZING markout
+    # report, which the harness consults for BELLY-region markets only (wing
+    # sizing keeps the full 28d window: the wing 600s cells are currently
+    # measured-toxic -- n=21/22/27 at -12.7/-4.0/-2.7c, VPS 2026-08-08 -- and
+    # clearing them would revert wing sizing to the optimistic m_prior path).
+    # The spread-widening (term 7) / monitor / telegram report also keeps the
+    # full window -- widening is unconditionally protective. Rationale: the
+    # live window held 289 pre- vs 40 post-restart fills (belly 1-2d n=38 >
+    # 40 post-restart fills TOTAL), so the belly stayed Kelly-clamped for
+    # pre-fix burst sins until ~Aug 23. Set to the 2026-07-27 bleed-fix
+    # restart (start of the current quoting regime). OPERATOR RULE: bump at
+    # any deploy that materially changes quoting behavior. Empty string
+    # disables. Runner-only: paper_runner parses it (CLI --markout-epoch
+    # overrides); harness/quoting never read it.
+    markout_epoch_utc: str = "2026-07-27T15:48:00+00:00"
+
+    # --- sizing-region basis + hysteresis (2026-08-08 wing-bleed fix) ---
+    # Basis for the per-market SIZING-region classification.
+    # "mid" (default) = live book mid via _market_mid (matches the markout
+    # report's mid_at_fill tagging, closing the region-basis mismatch that
+    # sustained the exploration-floor wing bleed); "consensus" = legacy
+    # behavior (the leaking basis -- kill switch only).
+    sizing_region_basis: str = "mid"
+    # Hysteresis for the per-market SIZING-region classification.
+    # The raw region flips only when the classifying probabilities clear the
+    # belly-band edge by this margin (prob units); prevents a boundary market
+    # (consensus/mid jitter around 0.20) from flapping its sizing cell between
+    # two views with opposite verdicts -- which would alternate resting
+    # quotes <-> full cancel each tick (0 <-> N size crosses requote_size_tol)
+    # and burn paper-sim queue position. 0 disables (raw region every tick).
+    # BOUND: must stay well below (belly_hi - belly_lo)/2 (= 0.3 at the
+    # default band); at or above that the wing->belly flip window is empty
+    # and every market latches wing forever.
+    sizing_region_hysteresis_p: float = 0.02
+
 
 def in_belly_band(p: float, belly_band: Tuple[float, float]) -> bool:
     """Inclusive belly-band membership: belly_lo <= p <= belly_hi.

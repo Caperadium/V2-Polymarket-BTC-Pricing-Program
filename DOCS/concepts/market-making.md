@@ -368,6 +368,50 @@ package B2 only stops one scalar from giving the pricer unchecked authority
 in the region it is worst at, and spread term 7 (Section 7) covers the
 residual at the quote layer.
 
+### 4.6 The wing pricer weight pin (2026-08-08)
+
+The wing parity reset of Section 4.5 did not hold. The bankroll update of
+Section 4.3 has a structural flaw the wing exposed: each expert's Bayes
+factor scores its previous forecast against a consensus built from the
+*pre-update* weights, so a pricer-heavy wing consensus keeps rewarding the
+pricer for agreeing with itself -- a **self-confirmation loop** -- and
+because Beuoy never marks to realized settlement, being wrong at settlement
+costs the pricer nothing. Observed live (VPS forensics, 2026-08-08): the
+wing pricer weight had re-learned to ~0.978 from its 50/50 seed while every
+wing YES fill settled worthless (the 66k strike resolved NO six days out of
+six since 08-01, -3.5 realized).
+
+The wing pricer weight is therefore **pinned**
+(`MMConfig.wing_pricer_weight_pin`, default 0.5). While the pin is in
+[0, 1]:
+
+- The wing weight vector is replaced outright: pricer at the pin (clamped
+  into [bankroll_floor, 1 - bankroll_floor] at read time, so the
+  no-expert-silenced floor invariant of Section 4.3 holds by construction),
+  remainder to the other models pro rata -- all to the market ladder in the
+  two-model case.
+- The wing Bayes update of Section 4.5 is **skipped entirely**; wing
+  `update_count` never advances. Belly is untouched: belly *per-strike
+  consensus* is unchanged by the pin (belly *bankroll* trajectories can
+  shift slightly, because the whole-ladder consensus feeds belly factors
+  and the boundary bucket carries wing-weighted values).
+- Every non-fallback return path persists the *pinned* wing bankrolls, so a
+  stale stored row (the live db carried pricer 0.978) is overwritten on the
+  first clean tick after a restart -- the Section 4.5 wing parity seed is
+  moot while the pin is active. The fallback path still copies the raw
+  stored dicts (it freezes both regions and prices a fixed 50/50 blend
+  anyway); the next clean tick re-pins and overwrites. Degenerate *stored*
+  wing bankrolls, which pre-pin forced a whole-ladder fallback, are instead
+  rescued by the pin with a logged warning -- self-healing must not be
+  silent.
+
+Coverage limit: the pin's region map is the anchor's own (strike region
+from the sanitized market ladder against the belly band), so strikes whose
+market mid sits at 0.20-0.28 classify belly and the pin does not touch
+them -- protection there comes from term-7 widening and the sizing-layer
+changes of Section 8. Kill switch: a negative pin (`-1.0`) restores legacy
+wing Bayes exactly.
+
 ---
 
 ## 5. A change of coordinates: log-odds space
@@ -599,9 +643,11 @@ charge** otherwise:
 ```
 structural_edge = belief - price                 # e.g. p_hat - our_posted_bid
 m_prior         = structural_edge - eps_base      # AS prior charge
-m = mk_avg   if (measured: mk_n >= markout_min_n)
-    m_prior  otherwise
-m = max(m, 0)                                     # Glosten-Milgrom: no edge -> no size
+baseline = mk_avg   if (measured: mk_n >= markout_min_n)
+           m_prior  otherwise
+m_gate   = min(baseline, mk_slow_avg)  if slow channel measured (2026-08-08)
+           baseline                    otherwise   # one-directional: never raises
+m = max(m_gate, 0)                                # Glosten-Milgrom: no edge -> no size
 f*, b = kelly_buy(price + m, price)               # belief_eff = price + m
 ```
 
@@ -627,6 +673,63 @@ restores the size-to-spread coupling a 2026-07-12 defect had severed
 (sizing on the raw pre-widen proposal, with no adverse-selection haircut at
 all, left size unconditionally coupled to `p_hat` alone regardless of how
 thin the posted spread actually was).
+
+**Which cell? The sizing region is mid-basis (2026-08-08).** The `region`
+half of the cell key is classified, for the sizing lookups only, from the
+market's own live **book mid** (the same `harness._market_mid` policy the
+fill simulator uses when it stamps `mid_at_fill`: two-sided midpoint, else
+the single displayed side, else None -- with an added NaN guard), the
+consensus p serving only as the empty-book fallback. This closes the
+region-basis mismatch that sustained the post-07-27 wing bleed: the
+sizing/exploration-gate lookup used to classify the market from the
+*consensus* p, while the markout report tags each fill's region from its
+own recorded book mid -- so a pricer-rich consensus (~0.21) classified a
+mid-0.13 market "belly" for the gate while its fills measured into the
+*wing* cell. The gate was checking a cell the fills never fed: the belly
+cell stayed under-attempted, the exploration carve-out (Section 8.2)
+re-armed on every new expiry ladder, and -- because it is exactly the
+pricer's tail richness that pushes consensus across the 0.2 boundary --
+the leak self-selected for the markets where the pricer is most wrong (VPS
+forensics traced every wing bleed fill to this path, floor-sized and
+Kelly-sized alike). With the mid basis, the cell the gate checks *is* the
+cell the fills feed, in both directions. A per-market **hysteresis latch**
+(`sizing_region_hysteresis_p`, 0.02) keeps a boundary market jittering
+around 0.20 from flapping its sizing cell between two views with opposite
+verdicts (which would alternate resting quotes and full cancels each tick
+and burn queue position): the latched region only flips once the
+classifying probability clears the belly-band edge by the margin; the latch
+is in-process, re-seeded from the first tick's raw region after a restart.
+The region also selects which *report* the lookup resolves against:
+belly-region sizing reads the epoch-filtered sizing view, wing-region
+sizing the full 28-day report (Section 14.2). The quoting-side consumers --
+term-7 widening and the region credibility of Section 7 -- deliberately
+keep the consensus basis: widening is unconditionally protective and needs
+no fill-cell alignment (the canonical enumeration of these deliberate basis
+differences lives in `spread_builder`'s "Deliberate basis inconsistencies"
+docstring section). Kill switch: exact legacy behavior requires BOTH
+`sizing_region_basis = "consensus"` AND `sizing_region_hysteresis_p = 0.0`
+-- the basis alone yields consensus-with-latch, a combination that has
+never run in production.
+
+**The slow-horizon haircut (2026-08-08).** The 600-second markout is
+structurally blind to slow theta bleed on low-delta wings: a wing YES fill
+can mark only -2.7c at 600 s and still lose 10-13c by settlement (VPS
+measurement). Sizing therefore does a *second* `markout_stats` lookup on
+the same cell at `markout_slow_horizon_s` (21600 s = 6 h) and, when that
+slow cell is measured (`mk_slow_n >= markout_min_n`), applies it as the
+strictly one-directional `min()` in the block above -- the slow channel can
+*lower* the net edge Kelly sees, never raise it, and it never sets
+`sigma2_edge` (Baker-McHale below still shrinks on the mid channel's
+variance or the prior). 6 h rather than 24 h because quotes pull 6 h before
+settlement (`near_resolution_pull_hours`), so a 6 h markout is resolvable
+for essentially every fill including the highest-volume 0-1d bucket,
+whereas a 24 h markout can never resolve for TTE<24h fills (the mid log
+stops at settlement) -- the 86400 s horizon the report also carries is
+diagnostics-only and sizing never reads it. The slow cell's `n_attempted`
+is deliberately discarded: young fills inflate it (future-window lookups
+miss until the fill matures), so it must never feed the exploration gate or
+the unmeasured-cell multiplier -- gates stay on the mid cell. Kill switch:
+`markout_slow_horizon_s <= 0` disables both the lookup and the haircut.
 
 The `mk_n_attempted` returned by `markout_stats` is ALWAYS the exact cell's
 attempted count, even when the measurement itself came from the region
@@ -710,18 +813,34 @@ in this order:
   side's inventory approaches q_max (so the floor never fights the inventory
   cap below it). Pure `max()` against the Kelly size when its gate is open --
   it only ever raises a leg, never lowers one a firmer cap has already set.
-  The gate: `(m_gate >= 0) or (mk_n_attempted < markout_min_n)`, where
-  `m_gate` is the same measured-or-prior net edge used above (unclamped).
-  A cell that has never been measured (or barely measured) keeps the floor
-  on regardless of the edge's sign -- the **exploration carve-out**: fills
-  are the only source of markout/credibility calibration, so an unmeasured
-  cell must keep a minimum resting presence to ever accumulate the evidence
-  that would let it earn a real edge-driven size. Only once a cell is
-  *trusted* (enough fills) and shows a *measured, negative* net edge does the
-  floor turn off on that side -- the failure mode this closes is a
-  perpetually-resting floor quote bleeding to a genuinely toxic counterparty
-  forever, which the wave-1 unconditional floor could not distinguish from
-  ordinary cold-start presence.
+  The gate:
+  `(m_gate >= 0) or (mk_n_attempted < markout_min_n and not measured_slow_toxic)`,
+  where `m_gate` is the same measured-or-prior net edge used above
+  (unclamped, after the slow-channel `min()`) and `measured_slow_toxic`
+  means the slow channel is measured with a negative average (the predicate
+  lives in one place, `_leg_edge`, which returns it as the fourth element
+  of its tuple). A cell that has never been measured (or barely measured)
+  keeps the floor on regardless of the edge's sign -- the **exploration
+  carve-out**: fills are the only source of markout/credibility
+  calibration, so an unmeasured cell must keep a minimum resting presence
+  to ever accumulate the evidence that would let it earn a real edge-driven
+  size. Only once a cell is *trusted* (enough fills) and shows a *measured,
+  negative* net edge does the floor turn off on that side -- the failure
+  mode this closes is a perpetually-resting floor quote bleeding to a
+  genuinely toxic counterparty forever, which the wave-1 unconditional
+  floor could not distinguish from ordinary cold-start presence. Since the
+  2026-08-08 wing-bleed fix the carve-out is additionally **suppressed
+  while the slow channel is measured-toxic**. Because slow-toxic implies
+  `mk_slow_avg < 0` implies `m_gate = min(baseline, mk_slow_avg) < 0`, the
+  new gate is exactly "slow-toxic -> floor off unconditionally; otherwise
+  unchanged". Without the suppression the gate closure has a 28-day period:
+  wider quotes stop the fills, the cell ages out of the lookback,
+  `n_attempted` falls below `markout_min_n`, the carve-out re-arms, and
+  ~20 exploration fills of tuition are paid before the cell re-measures and
+  closes again. The carve-out's rationale ("fills are the only calibration
+  source") does not apply when a second channel *is* measured; and no
+  deadlock is possible, because a fill-less slow cell also ages out at 28
+  days, restoring the carve-out.
 - **Unmeasured-cell multiplier (2026-07-26).** The gate above has a gap the
   live bleed exposed: an UNMEASURED cell's `m_gate` is the structural prior
   (posted-edge minus eps_base), which is roughly +half-spread -- positive --
@@ -1098,7 +1217,7 @@ current mids, settlement-aware.
 
 Raw PnL is noisy and slow. The sharper diagnostic is **markout**: for each
 fill, compare the fill price to the market mid at fixed horizons *after* the
-fill (60 s, 10 min, 1 h; disjoint windows). If we bought at 0.44 and the mid
+fill (60 s, 10 min, 1 h, 6 h, 24 h; disjoint windows). If we bought at 0.44 and the mid
 is 0.47 ten minutes later, the +3 markout says the quote was well-placed; a
 systematically *negative* markout is the numeric signature of adverse
 selection -- takers were right and we were the wrong side. Spread revenue with
@@ -1131,6 +1250,18 @@ input to the post-acceptance spread recalibration: per-cell, spreads should
 cover realized adverse selection, and cells that never fill are charging too
 much.
 
+The two longest horizons were appended 2026-08-08 (wing-bleed fix): 6 h
+(21600 s) is the slow sizing channel of Section 8.1, and 24 h (86400 s) is
+**diagnostics-only** -- its cells stay n=0 for fills within 24 h of expiry
+(the mid log stops at settlement, so the 24 h lookup window lies past the
+last mid) and sizing never reads it. Appending horizons leaves every
+pre-existing window byte-identical (each horizon's window is capped at the
+next horizon's start, and 21600 - 3600 comfortably exceeds the 600 s window
+length, so the 1 h window is unchanged), which is what keeps every
+persisted `(fill_id, 60/600/3600)` row valid across the change -- any
+future horizon change must re-verify that argument or version the persisted
+map.
+
 Package E (2026-07-15) added a per-side breakdown for quoting to consume:
 every cell, and every `by_region` rollup, gains an additive `"sides"` key --
 `{"BUY_YES": {n, n_attempted, mk_avg, mk_var}, "BUY_NO": {...}}` -- populated
@@ -1144,8 +1275,33 @@ rather than raising on a malformed report. This is what feeds spread term 7
 horizon and turns a measurably negative one into extra width on exactly
 that side.
 
-The report is written to `markout_report.json` on a fixed cadence and rendered
-read-only in the monitoring dashboard (`app/pages/mm_monitor.py`).
+Since the 2026-08-08 wing-bleed fix the runner builds **two** reports per
+cadence. The **full report** (`markout_report.json`) is the protective
+28-day window described above; it feeds spread term 7, wing-region sizing,
+the monitoring dashboard, and the Telegram bot. The **sizing view**
+(`markout_report_sizing.json`) is the same report with a keyword-only
+`epoch_ts` cutoff applied -- the effective per-fill bound is
+`max(lookback_cutoff, epoch_ts)` -- so fills before
+`MMConfig.markout_epoch_utc` (default the 2026-07-27 bleed-fix restart;
+CLI `--markout-epoch` overrides, an explicit empty string disables) are
+invisible: they count in neither `n` nor `n_attempted`, even when a
+persisted markout exists for them. The epoch is a read-side view only;
+stored `fill_markouts` rows for pre-epoch fills remain and reappear if the
+epoch is cleared. The harness routes **belly**-region sizing lookups to the
+epoch view and **wing**-region lookups to the full report: the wing 600 s
+cells are currently measured-toxic and that verdict is protective, while
+the belly's 28-day window was dominated by 289 pre-restart burst fills
+against 40 post-restart ones (the belly 1-2d cell alone held n=38), which
+would have kept the belly Kelly-clamped for pre-fix sins until late August.
+A failed or empty sizing build degrades to the previous sizing view, else
+the full report -- never to None (which would silently put sizing on the
+optimistic prior path). Operator rule: **bump the epoch at any deploy that
+materially changes quoting behavior** -- it marks the start of the quoting
+regime the sizing evidence should be drawn from. Both reports are rendered
+read-only in the monitoring dashboard (`app/pages/mm_monitor.py`), which
+captions the markout section with the active epoch, shows the belly-sizing
+view as its own table, and flags the wing bankroll rows as PINNED
+(Section 4.6) so a flat 0.5 credibility does not read as a fault.
 
 ### 14.3 Maker-rebate accounting (display-only)
 

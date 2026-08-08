@@ -934,3 +934,168 @@ def test_unmeasured_multiplier_disabled_byte_identical():
     assert abs(dec["m0"].ask_size - expected) < 1e-9
     stage = next(s for s in audit["stages"] if s["stage"] == "unmeasured_mult")
     assert stage["legs"] == []
+
+
+# --- 2026-08-08 wing-bleed fix (plan 2c): slow-horizon haircut (min rule) ---
+
+
+def _slow_case(p_hat=0.6, cfg=None, **mk_kwargs):
+    """Single-contract size_ladder run; returns (decision, audit)."""
+    cfg = cfg or MMConfig(presence_frac=0.0, markout_min_n=20)
+    c = ContractSizingInput("m0", p_hat=p_hat, bid_price=0.5, ask_price=0.5, **mk_kwargs)
+    dec, audit = size_ladder(
+        [c], _snap(0.0), bankroll=1000.0, ts=TS, config=cfg,
+        per_expiry_cap_frac=0.9, bankroll_util_cap=0.9,
+    )
+    return dec["m0"], audit
+
+
+def test_slow_haircut_lowers_m_when_both_measured():
+    # min rule: mid measured 0.03, slow measured 0.01 -> m = 0.01.
+    d, _ = _slow_case(
+        p_hat=0.5, mk_avg=0.03, mk_var=0.0009, mk_n=25, mk_n_attempted=25,
+        mk_slow_avg=0.01, mk_slow_n=25,
+    )
+    f_expected, _b = kelly_buy(0.5 + 0.01, 0.5)
+    assert abs(d.f_kelly - f_expected) < 1e-9
+
+
+def test_slow_haircut_never_raises_m():
+    # One-directional: slow measured ABOVE the mid baseline changes nothing.
+    d_slow, _ = _slow_case(
+        p_hat=0.5, mk_avg=0.01, mk_var=0.0009, mk_n=25, mk_n_attempted=25,
+        mk_slow_avg=0.05, mk_slow_n=25,
+    )
+    d_base, _ = _slow_case(
+        p_hat=0.5, mk_avg=0.01, mk_var=0.0009, mk_n=25, mk_n_attempted=25,
+    )
+    assert d_slow.f_kelly == d_base.f_kelly
+    assert d_slow.bid_size == d_base.bid_size
+    f_expected, _b = kelly_buy(0.5 + 0.01, 0.5)
+    assert abs(d_slow.f_kelly - f_expected) < 1e-9
+
+
+def test_slow_only_measured_haircuts_m_prior_baseline():
+    # Mid unmeasured -> baseline = m_prior (0.0915 here); slow measured 0.02
+    # -> m = min(0.0915, 0.02) = 0.02.
+    cfg = MMConfig(presence_frac=0.0, markout_min_n=20)
+    d, _ = _slow_case(p_hat=0.6, cfg=cfg, mk_n_attempted=20,
+                      mk_slow_avg=0.02, mk_slow_n=25)
+    f_expected, _b = kelly_buy(0.5 + 0.02, 0.5)
+    assert abs(d.f_kelly - f_expected) < 1e-9
+    # Toxic slow (-0.02) against the same positive m_prior -> m clamps to 0.
+    d_tox, _ = _slow_case(p_hat=0.6, cfg=cfg, mk_n_attempted=20,
+                          mk_slow_avg=-0.02, mk_slow_n=25)
+    assert d_tox.f_kelly == 0.0
+    assert d_tox.bid_size == 0.0
+
+
+def test_slow_unmeasured_or_thin_baseline_unchanged():
+    # Neither channel measured -> pure m_prior path (legacy). A THIN slow
+    # channel (mk_slow_n < min_n) is equally ignored.
+    cfg = MMConfig(presence_frac=0.0, markout_min_n=20)
+    m_prior = (0.6 - 0.5) - cfg.eps_base
+    f_expected, _b = kelly_buy(0.5 + m_prior, 0.5)
+    d_none, _ = _slow_case(p_hat=0.6, cfg=cfg)
+    d_thin, _ = _slow_case(p_hat=0.6, cfg=cfg, mk_slow_avg=-0.05, mk_slow_n=5)
+    assert abs(d_none.f_kelly - f_expected) < 1e-12
+    assert abs(d_thin.f_kelly - f_expected) < 1e-12
+
+
+def test_slow_horizon_zero_disables_slow_fields_entirely():
+    # markout_slow_horizon_s <= 0 is a belt-and-braces kill switch: supplied
+    # slow fields (even toxic, trusted-n) are ignored by _leg_edge.
+    cfg = MMConfig(presence_frac=0.0, markout_min_n=20, markout_slow_horizon_s=0.0)
+    m_prior = (0.6 - 0.5) - cfg.eps_base
+    f_expected, _b = kelly_buy(0.5 + m_prior, 0.5)
+    d, _ = _slow_case(p_hat=0.6, cfg=cfg, mk_slow_avg=-0.05, mk_slow_n=25)
+    assert abs(d.f_kelly - f_expected) < 1e-12
+    assert d.bid_size > 0.0
+
+
+def _sigma2_edge_of_bid_leg(audit):
+    stage = next(s for s in audit["stages"] if s["stage"] == "kelly+baker_mchale")
+    return next(v for mid, is_yes, v in stage["sigma2_edge"] if is_yes)
+
+
+def test_sigma2_never_set_by_slow_channel():
+    cfg = MMConfig(presence_frac=0.0, markout_min_n=20, markout_prior_var=0.02)
+    # Mid measured + slow measured lower: sigma2_edge stays the MID channel's
+    # mk_var/mk_n even though the slow channel binds the edge.
+    _d, audit = _slow_case(
+        p_hat=0.5, cfg=cfg, mk_avg=0.03, mk_var=0.0004, mk_n=25, mk_n_attempted=25,
+        mk_slow_avg=0.01, mk_slow_n=25,
+    )
+    assert abs(_sigma2_edge_of_bid_leg(audit) - 0.0004 / 25) < 1e-15
+    # Mid unmeasured + slow measured: sigma2_edge stays the uninformed prior.
+    _d2, audit2 = _slow_case(
+        p_hat=0.6, cfg=cfg, mk_n_attempted=20, mk_slow_avg=0.01, mk_slow_n=25,
+    )
+    assert abs(_sigma2_edge_of_bid_leg(audit2) - cfg.markout_prior_var) < 1e-15
+
+
+# --- 2026-08-08 wing-bleed fix (plan 2c): FIVE-arm W4 gate test -------------
+# 2x2 over (slow-toxic / slow-unmeasured) x (mid n_attempted below /
+# at-or-above min_n), plus the baseline-sign variant (arm 3). The gate flag is
+# read from the presence_floor audit stage's bid (YES) leg.
+
+
+def _gate_arm(cfg=None, p_hat=0.5, **mk_kwargs):
+    cfg = cfg or MMConfig(presence_frac=0.05, markout_min_n=20)
+    c = ContractSizingInput("m0", p_hat=p_hat, bid_price=0.5, ask_price=0.5, **mk_kwargs)
+    dec, audit = size_ladder(
+        [c], _snap(0.0), bankroll=1000.0, ts=TS, config=cfg,
+        per_expiry_cap_frac=0.9, bankroll_util_cap=0.9,
+    )
+    stage = next(s for s in audit["stages"] if s["stage"] == "presence_floor")
+    bid_leg = next(lg for lg in stage["legs"] if lg["is_yes"])
+    return bid_leg["gate"], dec["m0"].bid_size
+
+
+def test_gate_arm1_slow_unmeasured_unattempted_floor_on():
+    # Arm 1: slow UNmeasured, n_attempted < min_n -> exploration carve-out,
+    # floor ON -- the backward-compat arm (all existing tests: slow fields at
+    # defaults -> unchanged legacy behavior).
+    gate, bid = _gate_arm(mk_avg=-0.02, mk_var=0.0004, mk_n=3, mk_n_attempted=3)
+    assert gate is True
+    assert bid > 0.0
+
+
+def test_gate_arm2_day_one_brake_mid_toxic_slow_unarmed():
+    # Arm 2 -- ITEM 4's DAY-ONE BRAKE, as a named unit arm: slow UNmeasured,
+    # n_attempted >= min_n, mid-measured NEGATIVE -> m_gate < 0 -> floor OFF.
+    # This is the wing-cell-measured-toxic path that stops the exploration
+    # bids on day one, before the slow channel has armed.
+    gate, bid = _gate_arm(mk_avg=-0.02, mk_var=0.0004, mk_n=25, mk_n_attempted=25)
+    assert gate is False
+    assert bid == 0.0
+
+
+def test_gate_arm3_attempts_missed_positive_prior_floor_on():
+    # Arm 3: slow UNmeasured, n_attempted >= min_n but n < min_n (attempts
+    # that missed): baseline = m_prior > 0 -> m_gate > 0 -> floor stays ON --
+    # the surprising pre-existing case.
+    gate, bid = _gate_arm(p_hat=0.6, mk_n=0, mk_n_attempted=25)
+    assert gate is True
+    assert bid > 0.0
+
+
+def test_gate_arm4_slow_toxic_suppresses_carve_out():
+    # Arm 4 -- the 28d-relapse killer: slow measured-TOXIC, n_attempted <
+    # min_n -> the exploration carve-out is SUPPRESSED, floor OFF (the old
+    # gate would have kept it on and re-armed the tuition faucet every 28d).
+    gate, bid = _gate_arm(p_hat=0.6, mk_n_attempted=3,
+                          mk_slow_avg=-0.02, mk_slow_n=25)
+    assert gate is False
+    assert bid == 0.0
+
+
+def test_gate_arm5_slow_toxic_attempted_above_min():
+    # Arm 5: slow measured-TOXIC, n_attempted >= min_n -> floor OFF via
+    # m_gate = min(baseline, mk_slow_avg) < 0 -- same observable as arm 4,
+    # distinct route (here the mid channel is measured POSITIVE and the slow
+    # channel alone drags m_gate negative).
+    gate, bid = _gate_arm(mk_avg=0.03, mk_var=0.0009, mk_n=25, mk_n_attempted=25,
+                          mk_slow_avg=-0.02, mk_slow_n=25)
+    assert gate is False
+    assert bid == 0.0

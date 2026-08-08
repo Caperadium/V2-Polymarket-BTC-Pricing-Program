@@ -656,6 +656,27 @@ def render_bankrolls(db_path: Optional[Path]) -> None:
         out[["expiry_key", "region", "pricer_credibility", "update_count", "frozen", "last_update"]],
         use_container_width=True, hide_index=True,
     )
+    st.caption(
+        "Wing rows are PINNED (2026-08-08 wing-bleed fix): the wing Bayes "
+        "update is skipped and the wing pricer weight is held at "
+        "MMConfig.wing_pricer_weight_pin (default 0.5), so a flat wing "
+        "pricer_credibility and a non-advancing wing update_count are "
+        "EXPECTED -- not a fault. Belly rows still learn via Bayes."
+    )
+
+
+def _markout_cells_df(cells: List[Dict[str, Any]]) -> pd.DataFrame:
+    """Cells list -> DataFrame with the F2 computed coverage column
+    (n / n_attempted) -- a cell can have n_attempted > 0 with n == 0 (every
+    lookup for it missed), so this is distinct from just showing the raw
+    n/n_attempted columns. Shared by the full report table and the belly
+    sizing view (3e, same coverage-column treatment)."""
+    cells_df = pd.DataFrame(cells)
+    if "n_attempted" in cells_df.columns:
+        n_attempted = pd.to_numeric(cells_df["n_attempted"], errors="coerce")
+        n = pd.to_numeric(cells_df["n"], errors="coerce")
+        cells_df["coverage"] = (n / n_attempted).where(n_attempted > 0, 0.0)
+    return cells_df
 
 
 def render_markout(out_dir: Optional[Path]) -> None:
@@ -675,14 +696,7 @@ def render_markout(out_dir: Optional[Path]) -> None:
     if not cells:
         st.info("markout report has no cells yet")
         return
-    cells_df = pd.DataFrame(cells)
-    # F2: explicit computed coverage column (n / n_attempted) -- a cell can
-    # have n_attempted > 0 with n == 0 (every lookup for it missed) so this is
-    # distinct from just showing the raw n/n_attempted columns.
-    if "n_attempted" in cells_df.columns:
-        n_attempted = pd.to_numeric(cells_df["n_attempted"], errors="coerce")
-        n = pd.to_numeric(cells_df["n"], errors="coerce")
-        cells_df["coverage"] = (n / n_attempted).where(n_attempted > 0, 0.0)
+    cells_df = _markout_cells_df(cells)
     st.dataframe(cells_df, use_container_width=True, hide_index=True)
     st.caption(
         "mk_h = sign*(mid_h - fill price), sign=+1 BUY_YES / -1 BUY_NO (never "
@@ -691,6 +705,25 @@ def render_markout(out_dir: Optional[Path]) -> None:
         "horizon lookup found a mid). Generated %s. Net per-share fill "
         "quality (est) = mk_avg + rebate_avg." % report.get("generated_ts", "?")
     )
+
+    # 3e (2026-08-08 wing-bleed fix, display-only): the belly SIZING view --
+    # the epoch-filtered second report the runner writes next to
+    # markout_report.json. Caption the section with its epoch when present.
+    sizing_report = _load_json(out_dir / "markout_report_sizing.json")
+    if sizing_report:
+        st.caption(
+            "Belly sizing epoch: %s -- fills before this instant are hidden "
+            "from BELLY-region sizing lookups only (wing sizing, term-7 "
+            "widening and the table above keep the full window)."
+            % (sizing_report.get("epoch_ts") or "disabled (full window)")
+        )
+        with st.expander("Belly sizing view (epoch-filtered markout report)"):
+            s_cells = sizing_report.get("cells") or []
+            if not s_cells:
+                st.info("sizing view has no cells yet (no post-epoch fills)")
+            else:
+                st.dataframe(_markout_cells_df(s_cells),
+                             use_container_width=True, hide_index=True)
 
     by_expiry = report.get("by_expiry") or {}
     if by_expiry:

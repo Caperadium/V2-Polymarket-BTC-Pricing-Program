@@ -84,6 +84,34 @@ term-1 inline comment). Composition mechanics per plan 2.5: widen -> floor
 half-spread to >= 1 tick -> clamp to the venue price band -> tick-quantize
 (floor bid, ceil ask, so quantization never shrinks the spread) -> resolve any
 crossing left by quantization by widening the ask one tick.
+
+Deliberate basis inconsistencies (canonical region-basis enumeration,
+referenced from harness._compose_quote_sets):
+
+- QUOTING region (the wing/belly terms 5/6, term 7's side-split lookups, and
+  the region-appropriate credibility in term 4) is classified from the Beuoy
+  CONSENSUS p of the strike being quoted (harness `region`). Widening is
+  unconditionally protective, so it needs no alignment with any measurement
+  cell.
+- The Beuoy ANCHOR's own region map (fair_value_anchor, per-region bankroll
+  updates + the wing pricer-weight pin) classifies from the SANITIZED MARKET
+  ladder vs belly_band -- never from the consensus being built.
+- The markout REPORT tags each fill's region from the fill's OWN recorded
+  book mid (`mid_at_fill`, pnl_report) -- the measurement basis.
+- SIZING region (item 4, 2026-08-08 wing-bleed fix) is classified from the
+  market's live BOOK MID via harness._market_mid (consensus only as the
+  empty-book fallback), latched with hysteresis -- NOT from consensus: the
+  W4 exploration gate and the Kelly markout haircut read a
+  (region, tte-bucket) cell, and the fills that feed that cell are tagged by
+  the report's mid basis above, so only the mid basis makes "the cell the
+  gate checks" and "the cell the fills feed" the same cell in BOTH
+  directions. The consensus basis let a pricer-rich consensus (~0.21)
+  classify a mid-0.13 market "belly" for the gate while its fills measured
+  into the WING cell, so the exploration faucet could never close (the
+  2026-08-08 wing bleed).
+- The sizing markout HORIZONS (600s mid channel + 21600s slow channel) also
+  deliberately differ from term 7's 60s widening horizon -- net edge for
+  Kelly vs pick-off signal for widening (see MMConfig.markout_widen_horizon_s).
 """
 from __future__ import annotations
 

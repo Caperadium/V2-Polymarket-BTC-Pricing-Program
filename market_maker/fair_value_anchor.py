@@ -80,6 +80,24 @@ args and both envelopes are non-increasing). The existing sanity-band check
 
 FairValue.credibility is the strike-count-weighted average of the two regions'
 pricer credibilities (FairValue.credibility_by_region carries both, additively).
+
+WING PRICER WEIGHT PIN (2026-08-08 wing-bleed fix). The wing region's Bayes
+update is a self-confirmation loop: factors score against a consensus built
+from the PRE-update weights, so a pricer-heavy wing consensus keeps awarding
+the pricer more wing weight (VPS 2026-08-08: wing pricer weight re-learned to
+~0.978 while every wing YES fill settled worthless). When
+`MMConfig.wing_pricer_weight_pin` is in [0, 1], the wing weights are PINNED --
+pricer at the pin (clamped into [bankroll_floor, 1-bankroll_floor]), remainder
+to the other models pro rata -- and the wing Bayes update is skipped entirely:
+wing update_count never advances and every NON-FALLBACK return path persists
+the pinned bankrolls (the fallback still copies the raw stored dicts; the next
+clean tick re-pins and overwrites). Negative pin disables (legacy Bayes).
+COVERAGE LIMIT: the region map is the anchor's own (strike region from the
+sanitized MARKET ladder vs belly_band), so market-mid 0.20-0.28 strikes are
+belly and the pin does not touch them. Belly PER-STRIKE consensus is unchanged
+by the pin; belly BANKROLL trajectories can shift slightly (the whole-ladder
+consensus feeds belly factors and the boundary bucket carries wing-weighted
+values).
 """
 from __future__ import annotations
 
@@ -226,6 +244,25 @@ def _weight_dict(w_arr: np.ndarray, model_ids: List[str]) -> Dict[str, float]:
     return {mid: float(w_arr[i]) for i, mid in enumerate(model_ids)}
 
 
+def _pinned_weights(model_ids: List[str], pin: float) -> np.ndarray:
+    """Deterministic wing weight vector (Fix 1): pricer at `pin`, remainder
+    split pro rata across the other models (2-model case: market = 1-pin);
+    pricer absent -> uniform. Caller passes `pin` already clamped into
+    [floor, 1-floor], so the module's floor invariant holds by construction."""
+    m = len(model_ids)
+    if m == 0:
+        return np.zeros(0, dtype=float)
+    if PRICER_MODEL_ID not in model_ids:
+        return np.full(m, 1.0 / m)
+    if m == 1:
+        return np.ones(1, dtype=float)
+    w = np.empty(m, dtype=float)
+    share = (1.0 - pin) / (m - 1)
+    for i, mid in enumerate(model_ids):
+        w[i] = pin if mid == PRICER_MODEL_ID else share
+    return w
+
+
 # ---------------------------------------------------------------------------
 # Ladder-space consensus (plan step 4)
 # ---------------------------------------------------------------------------
@@ -286,6 +323,11 @@ def compute_fair_value(
     m_ts = market_ts if market_ts is not None else getattr(snapshot, "ts", now)
     floor = float(getattr(config, "bankroll_floor", DEFAULT_BANKROLL_FLOOR))
     belly_band = getattr(config, "belly_band", (0.2, 0.8))
+    # Wing pricer weight PIN (Fix 1, 2026-08-08 wing-bleed fix; module
+    # docstring). Negative (or out-of-[0,1]) disables -> legacy Bayes.
+    pin_raw = float(getattr(config, "wing_pricer_weight_pin", -1.0))
+    pinned = 0.0 <= pin_raw <= 1.0
+    pin = min(max(pin_raw, floor), 1.0 - floor) if pinned else pin_raw
 
     strikes = sorted(float(s) for s in snapshot.strikes)
     n = len(strikes)
@@ -313,11 +355,25 @@ def compute_fair_value(
 
     weights_belly = _normalized_weights(model_ids, belly_state.bankrolls)
     weights_wing = _normalized_weights(model_ids, wing_state.bankrolls)
+    wing_was_degenerate = weights_wing is None
+    if pinned:
+        # Fix 1: the pin replaces the stored wing weights outright -- BEFORE
+        # the fallback path could consult weights_by_region_arr (so even a
+        # fallback's cosmetic credibility reports the pin).
+        weights_wing = _pinned_weights(model_ids, pin)
     weights_by_region_arr = {BELLY_REGION: weights_belly, WING_REGION: weights_wing}
-    if inputs_bad or weights_belly is None or weights_wing is None:
+    if inputs_bad or weights_belly is None or (weights_wing is None and not pinned):
         return _fallback(
             snapshot, strikes, raw_ladders, model_ids, bankroll_states,
             weights_by_region_arr, now, m_ts, reason="non-finite inputs or degenerate bankrolls",
+        )
+    if pinned and wing_was_degenerate:
+        # Self-healing must not be silent: degenerate STORED wing bankrolls
+        # would have fallen back pre-pin; the pin rescues the tick and the
+        # non-fallback return below overwrites the stored row with the pin.
+        logger.warning(
+            "fair_value_anchor: wing bankrolls degenerate; pin rescued "
+            "(stored row will be overwritten)"
         )
 
     # --- per-model bucket forecasts (shared across regions) ---
@@ -346,11 +402,18 @@ def compute_fair_value(
         WING_REGION: _weight_dict(weights_wing, model_ids),
     }
     # Default: unchanged unless a region's update fires below (Step 3.3/3.4).
+    # While pinned, weight_dicts_pre[WING] IS the pinned dict (weights_wing
+    # was replaced above), so pre and post wing dicts both carry the pin.
     weight_dicts_post = dict(weight_dicts_pre)
 
     new_bankrolls_by_region = {
         BELLY_REGION: dict(belly_state.bankrolls),
-        WING_REGION: dict(wing_state.bankrolls),
+        # Fix 1: seed wing from the PINNED dict (not the stored bankrolls) so
+        # every NON-FALLBACK return path -- frozen wing, first tick (no
+        # threaded history), per-region skip branches -- persists the pinned
+        # state and overwrites a stale stored row on the next append.
+        WING_REGION: (dict(weight_dicts_pre[WING_REGION]) if pinned
+                      else dict(wing_state.bankrolls)),
     }
     update_counts = {
         BELLY_REGION: belly_state.update_count,
@@ -378,6 +441,12 @@ def compute_fair_value(
         # non-finite-factor check then routes to the same per-region skip.
         if consensus_new_bucket.shape == cprev.shape:
             for region in REGIONS:
+                if region == WING_REGION and pinned:
+                    # Fix 1: wing Bayes update skipped entirely while pinned
+                    # (self-confirmation loop); wing update_count unchanged.
+                    # Applies regardless of the frozen flag (carried through
+                    # untouched either way).
+                    continue
                 state = bankroll_states[region]
                 if state.frozen:
                     continue

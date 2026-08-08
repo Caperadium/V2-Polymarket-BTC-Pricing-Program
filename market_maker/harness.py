@@ -225,6 +225,7 @@ class PaperTradingLoop:
         vol_gate_fn: Optional[Callable[[], object]] = None,
         data_provider: Optional[BTCDataProvider] = None,
         markout_provider: Optional[Callable[[], Optional[dict]]] = None,
+        sizing_markout_provider: Optional[Callable[[], Optional[dict]]] = None,
         bankroll: float = 1000.0,
         tick_dt_s: float = 60.0,
         quote_variant: str = "dalen",
@@ -244,6 +245,26 @@ class PaperTradingLoop:
         # dict (or None -- cold start / never wired). Called ONCE per tick by
         # _compose_quote_sets, never per-market.
         self.markout_provider = markout_provider
+        # Fix 3 (2026-08-08 wing-bleed fix): optional second callable
+        # returning the belly EPOCH-FILTERED sizing view of the markout
+        # report. None (default) -> sizing falls back to markout_provider's
+        # full report, preserving shadow_runner + every existing
+        # construction. Also called ONCE per tick by _compose_quote_sets.
+        self.sizing_markout_provider = sizing_markout_provider
+        # Item 4 (2026-08-08 wing-bleed fix): per-market latched SIZING
+        # region (see _compose_quote_sets). Created HERE (a bare .get on an
+        # uninitialized attribute would be an AttributeError on the first
+        # tick); in-process only, per loop -- a rollover tears the loop down
+        # with it, and a restart re-seeds from the first tick's raw region.
+        self._sizing_region: Dict[str, str] = {}
+        # Item 4: sizing-region basis, validated ONCE here (not in the hot
+        # per-market loop -- this IS the one-time-warning mechanism). Unknown
+        # values warn once and default to "mid".
+        basis = str(getattr(self.config, "sizing_region_basis", "mid") or "mid")
+        if basis not in ("mid", "consensus"):
+            logger.warning("unknown sizing_region_basis %r; defaulting to 'mid'", basis)
+            basis = "mid"
+        self._sizing_region_basis = basis
         self.bankroll = bankroll
         self.tick_dt_s = tick_dt_s
         self.quote_variant = quote_variant
@@ -466,11 +487,13 @@ class PaperTradingLoop:
         tick's risk-directive loop, so it is fresh). None (default) keeps
         the DEPTH cap inert, matching prior behavior.
 
-        `market_states` (plan C1): dict market_id -> MarketState, the same
-        dict `tick()` builds in step 1. No longer used to compute a sizing
-        mid (wave 2 W2 removed ContractSizingInput.mkt_mid -- sizing now
-        edges off our OWN posted quote, not the market mid); kept as a
-        parameter for signature stability in case a future caller needs it.
+        `market_states` (plan C1; item 4, 2026-08-08 wing-bleed fix): dict
+        market_id -> MarketState, the same dict `tick()` builds in step 1.
+        Wave 2 W2 removed its old sizing-mid use (ContractSizingInput.mkt_mid
+        -- sizing edges off our OWN posted quote); item 4 consumes it again,
+        as the book-mid source for the SIZING-region classification (see the
+        inline item-4 block below). None degrades every market to the
+        consensus-basis fallback.
 
         Wave 2 W1/W7 ordering (package E extends this, 2026-07-15): for each
         market, build the proposal, resolve `region` from `consensus_p_k`,
@@ -485,7 +508,15 @@ class PaperTradingLoop:
         aggregate-vs-side-split basis than term 7, see spread_builder module
         docstring "Deliberate basis inconsistencies"), THEN size the ladder,
         THEN `build_quote_set(..., posted=...)` so the QuoteSet's prices are
-        exactly the ones sizing used -- never recomputed."""
+        exactly the ones sizing used -- never recomputed.
+
+        2026-08-08 wing-bleed fix: the SIZING lookups (600s + the
+        `cfg.markout_slow_horizon_s` slow channel) resolve against
+        `sizing_src` on `sizing_region` -- a per-market MID-BASIS region
+        (item 4, latched with hysteresis) selecting between the belly
+        epoch-filtered sizing view and the full report (Fix 3). Term 7's
+        `markout_stats_side` lookups and `region_credibility` keep the full
+        `report` + the consensus-basis `region`."""
         cfg = self.config
         now = self.clock.now()
         tte = max(snap.tte_days, 0.0)
@@ -494,6 +525,11 @@ class PaperTradingLoop:
         # A cold/unwired provider (None) or an empty report (None return)
         # both degrade every market to the m_prior path in robustness_sizing.
         report = self.markout_provider() if self.markout_provider is not None else None
+        # Fix 3 (2026-08-08): the belly epoch-filtered SIZING view, pulled
+        # ONCE per tick like `report`. No dedicated provider -> falls back to
+        # the full report (identical behavior to pre-fix).
+        sizing_report = (self.sizing_markout_provider()
+                         if self.sizing_markout_provider is not None else report)
         tte_bucket = tte_bucket_label(tte)
 
         proposals = {}
@@ -536,6 +572,82 @@ class PaperTradingLoop:
             # single compute_posted_prices call, not after.
             region = BELLY_REGION if in_belly_band(consensus_p_k, cfg.belly_band) else WING_REGION
 
+            # --- Item 4 (2026-08-08 wing-bleed fix): SIZING-region basis ---
+            # The sizing/gate lookups below classify region from the market's
+            # own live book MID (consensus only as the empty-book fallback),
+            # so the cell the W4 exploration gate checks IS the cell the
+            # fills feed (the markout report tags each fill's region from its
+            # own recorded book mid). The consensus basis let a pricer-rich
+            # consensus (~0.21) classify a mid-0.13 market "belly" for the
+            # gate while its fills measured into the WING cell -- the
+            # exploration faucet could never close (VPS forensics 2026-08-08:
+            # every wing bleed fill traced to that mismatch).
+            #
+            # BLOCKER-resolution (round 4): the mid source is _market_mid
+            # over the already-threaded `market_states` param (reserved for
+            # exactly this; the tick's call site already passes it). NEVER
+            # self.books[m] (BookMirror best_bid/best_ask are METHODS ->
+            # TypeError every tick -> tick_errors exit 1). NEVER
+            # _two_sided_mid (returns None on one-sided books -- but
+            # paper_fill_sim._mid, which writes mid_at_fill, FALLS BACK to
+            # the single side; a None-on-one-sided policy here would degrade
+            # thin wing books to the consensus basis and silently restore
+            # the leak on exactly the affected markets). harness._market_mid
+            # is policy-identical to paper_fill_sim._mid MODULO NaN (guarded
+            # below): two-sided midpoint, else best_bid, else best_ask, else
+            # None. REUSE IT; the codebase already has four mid helpers and
+            # item 4 exists because two of them diverge -- add NO fifth
+            # (round-4 minor 6).
+            ms = (market_states or {}).get(m)
+            book_mid = _market_mid(ms) if ms is not None else None
+            if book_mid is not None and math.isnan(book_mid):
+                # round-5 minor 4: paper_fill_sim._is_num rejects NaN book
+                # prices; _market_mid does not -- guard here so a NaN
+                # best_bid cannot silently force wing via
+                # in_belly_band(nan)=False. (Residual (d): on a
+                # NaN-bid/valid-ask book the fill sim tags from the ask
+                # while sizing falls back to consensus.)
+                book_mid = None
+            basis = self._sizing_region_basis  # validated once in __init__
+            if basis == "mid":
+                basis_p = book_mid if book_mid is not None else consensus_p_k
+            else:
+                # "consensus" -- kill switch only (the leaking basis). NOTE
+                # (round-6 minor 3): this alone yields consensus-basis-WITH-
+                # LATCH, a never-run-in-production third behavior; EXACT
+                # legacy also needs sizing_region_hysteresis_p = 0.0.
+                basis_p = consensus_p_k
+            sizing_region_raw = (
+                BELLY_REGION if in_belly_band(basis_p, cfg.belly_band)
+                else WING_REGION
+            )
+            # Hysteresis latch (round-3 F1): the region flips only when
+            # basis_p clears the belly-band edge by h, so a boundary market
+            # jittering around 0.20 cannot flap its sizing cell between two
+            # views with opposite verdicts (0 <-> N size crosses
+            # requote_size_tol -> full cancel/repost churn, burned paper-sim
+            # queue position). Evaluated over the SINGLE basis_p in use
+            # (round-4 minor 4). h = 0 disables (raw region every tick).
+            h = float(getattr(cfg, "sizing_region_hysteresis_p", 0.0) or 0.0)
+            if h <= 0.0:
+                sizing_region = sizing_region_raw
+            else:
+                belly_lo, belly_hi = cfg.belly_band
+                latched = self._sizing_region.setdefault(m, sizing_region_raw)
+                if latched == WING_REGION:
+                    if belly_lo + h <= basis_p <= belly_hi - h:
+                        latched = BELLY_REGION
+                else:
+                    if basis_p < belly_lo - h or basis_p > belly_hi + h:
+                        latched = WING_REGION
+                self._sizing_region[m] = latched
+                sizing_region = latched
+            # Fix 3: belly-region sizing reads the epoch-filtered sizing
+            # view; wing sizing keeps the full 28d window (the wing cells are
+            # currently measured-toxic -- clearing them would revert wing
+            # sizing to the optimistic m_prior path).
+            sizing_src = sizing_report if sizing_region == BELLY_REGION else report
+
             # term 7 (package E): markout-fed widening, resolved per side off
             # the SIDE-SPLIT markout report (BUY_YES -> bid, BUY_NO -> ask) at
             # cfg.markout_widen_horizon_s (60s, deliberately different from
@@ -559,10 +671,16 @@ class PaperTradingLoop:
             # Package B2 (2026-07-15): region-appropriate credibility into
             # compute_posted_prices ONLY (build_quote_set's credibility arg
             # is moot when posted= is threaded, plan review item 13). Region
-            # basis is the SAME `region` variable computed just above from
-            # consensus_p_k (round-2 review item 2) -- NOT the anchor's
-            # market-mid region map (a deliberate, documented basis
-            # inconsistency, see fair_value_anchor / spread_builder docs).
+            # basis is the SAME consensus-basis `region` variable computed
+            # above (round-2 review item 2) -- NOT the anchor's market-mid
+            # region map, and NOT the mid-basis `sizing_region` (item 4,
+            # 2026-08-08): the SIZING lookups are mid-basis because their
+            # cell must match the cell the fills feed; the quoting terms
+            # (term 7 widening + this credibility widening) deliberately
+            # keep the consensus basis -- widening is unconditionally
+            # protective and needs no fill-cell alignment. See
+            # spread_builder's "Deliberate basis inconsistencies" docstring
+            # section (the canonical enumeration).
             region_credibility = (
                 fv.credibility_by_region.get(region, fv.credibility)
                 if fv.credibility_by_region is not None else fv.credibility
@@ -577,18 +695,39 @@ class PaperTradingLoop:
             posted_by_market[m] = posted
             posted_bid, posted_ask, _terms = posted
 
-            if report is not None:
+            # Sizing lookups (2026-08-08): BOTH the guard and the arguments
+            # moved to sizing_src/sizing_region (review round-3 F4 -- a
+            # partial edit here is a silent bug).
+            if sizing_src is not None:
                 mk_avg, mk_var, mk_n, mk_n_attempted = markout_stats(
-                    report, region, tte_bucket, cfg.markout_horizon_s, cfg.markout_min_n
+                    sizing_src, sizing_region, tte_bucket, cfg.markout_horizon_s,
+                    cfg.markout_min_n,
                 )
             else:
                 mk_avg, mk_var, mk_n, mk_n_attempted = None, None, 0, 0
+
+            # Fix 2 (2026-08-08): slow-horizon channel for the one-directional
+            # Kelly haircut (robustness_sizing._leg_edge min rule). <= 0
+            # disables the lookup entirely.
+            slow_h = float(getattr(cfg, "markout_slow_horizon_s", 0.0) or 0.0)
+            if sizing_src is not None and slow_h > 0.0:
+                mk_slow_avg, _v, mk_slow_n, _slow_att = markout_stats(
+                    sizing_src, sizing_region, tte_bucket, slow_h, cfg.markout_min_n)
+                # _slow_att DISCARDED BY DESIGN: young fills inflate the slow
+                # cell's n_attempted (future-window lookups miss until the
+                # fill matures), so it must never feed the W4 exploration
+                # gate or the 5b multiplier -- wiring it in would reproduce
+                # the 2026-07-15 rollup-n_attempted shutdown shape. Gates
+                # stay on the MID cell.
+            else:
+                mk_slow_avg, mk_slow_n = None, 0
 
             contracts.append(
                 ContractSizingInput(market_id=m, p_hat=float(fv.consensus_p[k]),
                                     bid_price=posted_bid, ask_price=posted_ask,
                                     strike=float(k), mk_avg=mk_avg, mk_var=mk_var,
-                                    mk_n=mk_n, mk_n_attempted=mk_n_attempted)
+                                    mk_n=mk_n, mk_n_attempted=mk_n_attempted,
+                                    mk_slow_avg=mk_slow_avg, mk_slow_n=mk_slow_n)
             )
         self.last_proposals = proposals
 

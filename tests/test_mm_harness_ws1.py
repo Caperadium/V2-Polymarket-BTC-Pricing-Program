@@ -1744,3 +1744,441 @@ def test_flat_mid_sequence_never_fires_rule_h(store):
     for m, d in loop.last_directives.items():
         assert d.mode == QuoteMode.TWO_SIDED, m
         assert RiskTrigger.MID_VELOCITY not in d.triggers, m
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-08 wing-bleed fix (temp/mm_wing_bleed_fix_plan.md):
+#   - Fix 2 (2d): slow-horizon sizing lookup threaded into ContractSizingInput
+#   - Item 4: mid-basis SIZING-region classification (+ NaN/empty-book
+#     fallbacks, hysteresis latch) and the forensics-pinning regression
+# ---------------------------------------------------------------------------
+
+from types import SimpleNamespace  # noqa: E402  (section-local test helper import)
+
+_EMPTY_REPORT = {"cells": [], "by_region": {}, "by_expiry": {}}
+
+
+def _stub_ms(bid, ask):
+    """Minimal MarketState stand-in for item 4's mid source: _market_mid reads
+    only the .best_bid/.best_ask ATTRIBUTES of what it is given (MarketState
+    carries plain floats there, unlike BookMirror's methods)."""
+    return SimpleNamespace(best_bid=bid, best_ask=ask)
+
+
+def _compose_with_stub_books(loop, stub_mids):
+    """One direct _compose_quote_sets call (on a tick-warmed loop) against
+    stub market_states, spying on harness.markout_stats. Returns the spy's
+    call list in call order: [{"report", "region", "horizon"}, ...]."""
+    import market_maker.harness as harness_mod
+    calls = []
+    orig = harness_mod.markout_stats
+
+    def spy(report_arg, region, bucket, horizon, min_n):
+        calls.append({"report": report_arg, "region": region, "horizon": horizon})
+        return orig(report_arg, region, bucket, horizon, min_n)
+
+    market_states = {m: _stub_ms(*stub_mids[m]) for m in stub_mids}
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(harness_mod, "markout_stats", spy)
+        loop._compose_quote_sets(
+            loop.last_snapshot, loop.last_fair_value, loop.last_directives,
+            liquidity=loop.last_liquidity, market_states=market_states,
+        )
+    return calls
+
+
+def _mid_horizon_regions(calls, cfg):
+    """The 600s (cfg.markout_horizon_s) sizing-call regions, in ladder
+    (strike-ascending) order -- one per market per compose call."""
+    return [c["region"] for c in calls if c["horizon"] == cfg.markout_horizon_s]
+
+
+def _warmed_loop(store, cfg, markets=None, provider_report=_EMPTY_REPORT):
+    markets = markets or MARKETS
+    loop = PaperTradingLoop(
+        store=store, expiry_key=EXPIRY, markets=markets, engine_fn=_engine(),
+        config=cfg, clock=SimClock(START), vol_gate_fn=_vol_gate(),
+        markout_provider=lambda: provider_report,
+    )
+    loop.tick({m: _snapshot_msg(0.5) for m, _k in markets})
+    assert loop.last_fair_value is not None
+    return loop
+
+
+def test_item4_mid_wing_consensus_belly_classifies_wing(store):
+    """THE leak case: book mid in the wing (0.13) while consensus sits in the
+    belly (~0.5 here) -> the SIZING region is WING (mid basis wins). Under
+    the legacy consensus basis the gate would have checked the belly cell
+    while the fills fed the wing cell."""
+    cfg = MMConfig(gamma=0.5, k_arrival=1.0)
+    loop = _warmed_loop(store, cfg)
+    calls = _compose_with_stub_books(
+        loop, {"m-100k": (0.10, 0.16), "m-102k": (0.47, 0.53)})
+    regions = _mid_horizon_regions(calls, cfg)
+    # ladder order: m-100k first. Consensus ~0.5 (belly) for both markets;
+    # m-100k's stub mid 0.13 clears the hysteresis edge (0.2 - 0.02) so the
+    # belly latch from the warm tick flips to wing.
+    assert regions == ["wing", "belly"]
+
+
+def test_item4_mid_belly_consensus_wing_classifies_belly(store):
+    """Exact-alignment case in the other direction: consensus in the wing
+    (~0.05) while the book mid is in the belly (0.5) -> sizing region is
+    BELLY (the 0.20-0.28-mid band the two-basis rule would have excluded)."""
+    cfg = MMConfig(gamma=0.5, k_arrival=1.0)
+    markets = [("m-100k", 100000.0), ("m-106k", 106000.0)]
+    loop = PaperTradingLoop(
+        store=store, expiry_key=EXPIRY, markets=markets, engine_fn=_engine(),
+        config=cfg, clock=SimClock(START), vol_gate_fn=_vol_gate(),
+        markout_provider=lambda: _EMPTY_REPORT,
+    )
+    # Books that agree with the pricer per strike: m-106k mid ~0.047 -> wing
+    # consensus AND wing latch on the warm tick.
+    loop.tick({m: _snapshot_msg(_p_of_strike(k)) for m, k in markets})
+    assert loop.last_fair_value is not None
+    assert float(loop.last_fair_value.consensus_p[106000.0]) < 0.2  # premise
+    calls = _compose_with_stub_books(
+        loop, {"m-100k": (0.47, 0.53), "m-106k": (0.47, 0.53)})
+    regions = _mid_horizon_regions(calls, cfg)
+    # m-106k: stub mid 0.5 clears the wing->belly hysteresis bound
+    # (0.2 + 0.02) -> BELLY despite the wing consensus.
+    assert regions == ["belly", "belly"]
+
+
+def test_item4_empty_book_falls_back_to_consensus(store):
+    """Empty book (no bid, no ask) -> book_mid None -> the consensus-basis
+    fallback classifies. Demonstrated discriminatingly: latch m-100k to WING
+    via a 0.13 stub mid, then hand it an EMPTY book -- consensus (~0.5,
+    belly) must drive the wing->belly flip; a policy that kept (or ignored)
+    the dead mid could not flip."""
+    cfg = MMConfig(gamma=0.5, k_arrival=1.0)
+    loop = _warmed_loop(store, cfg)
+    calls1 = _compose_with_stub_books(
+        loop, {"m-100k": (0.10, 0.16), "m-102k": (0.47, 0.53)})
+    assert _mid_horizon_regions(calls1, cfg)[0] == "wing"
+    calls2 = _compose_with_stub_books(
+        loop, {"m-100k": (None, None), "m-102k": (0.47, 0.53)})
+    assert _mid_horizon_regions(calls2, cfg)[0] == "belly"
+
+
+def test_item4_nan_bid_valid_ask_falls_back_to_consensus(store):
+    """Residual (d) pin (round-6 minor 4, option a): a NaN best_bid with a
+    VALID wing-side ask (0.13) must fall back to the CONSENSUS basis (belly
+    here) -- the NaN guard maps the poisoned mid to None rather than letting
+    in_belly_band(nan)=False silently force wing. (paper_fill_sim._mid would
+    tag a fill on this book from the ask -- an accepted divergence.)"""
+    cfg = MMConfig(gamma=0.5, k_arrival=1.0)
+    loop = _warmed_loop(store, cfg)
+    calls = _compose_with_stub_books(
+        loop, {"m-100k": (float("nan"), 0.13), "m-102k": (0.47, 0.53)})
+    assert _mid_horizon_regions(calls, cfg)[0] == "belly"
+
+
+def test_item4_one_sided_book_still_mid_basis(store):
+    """One-sided book (bid only, 0.13) still classifies on the MID basis via
+    _market_mid's single-side fallback -> wing. A None-on-one-sided policy
+    (_two_sided_mid) would have degraded exactly the thin wing books to the
+    consensus basis (belly here) and silently restored the leak."""
+    cfg = MMConfig(gamma=0.5, k_arrival=1.0)
+    loop = _warmed_loop(store, cfg)
+    calls = _compose_with_stub_books(
+        loop, {"m-100k": (0.13, None), "m-102k": (0.47, 0.53)})
+    assert _mid_horizon_regions(calls, cfg)[0] == "wing"
+
+
+def test_item4_hysteresis_dead_zone_holds_latch(store):
+    """Jitter across the 0.20 band edge WITHOUT clearing the h=0.02 margin
+    does not flip the latch; clearing the margin flips it."""
+    cfg = MMConfig(gamma=0.5, k_arrival=1.0)  # default hysteresis 0.02
+    loop = _warmed_loop(store, cfg)  # warm tick latches m-100k BELLY (mid 0.5)
+    seq = []
+    for mid in (0.19, 0.17, 0.21, 0.23):
+        calls = _compose_with_stub_books(
+            loop, {"m-100k": (mid - 0.03, mid + 0.03), "m-102k": (0.47, 0.53)})
+        seq.append(_mid_horizon_regions(calls, cfg)[0])
+    # 0.19: belly->wing needs outside [0.18, 0.82] -> held belly;
+    # 0.17: clears -> wing; 0.21: wing->belly needs inside [0.22, 0.78] ->
+    # held wing; 0.23: clears -> belly.
+    assert seq == ["belly", "wing", "wing", "belly"]
+
+
+def test_item4_hysteresis_zero_disables_latch(store):
+    """h=0 -> raw region every tick (no dead zone)."""
+    cfg = MMConfig(gamma=0.5, k_arrival=1.0, sizing_region_hysteresis_p=0.0)
+    loop = _warmed_loop(store, cfg)
+    seq = []
+    for mid in (0.19, 0.21, 0.19):
+        calls = _compose_with_stub_books(
+            loop, {"m-100k": (mid - 0.03, mid + 0.03), "m-102k": (0.47, 0.53)})
+        seq.append(_mid_horizon_regions(calls, cfg)[0])
+    assert seq == ["wing", "belly", "wing"]
+
+
+def test_slow_horizon_lookup_threads_into_sizing_inputs(store):
+    """A report cell at cfg.markout_slow_horizon_s resolves into
+    ContractSizingInput.mk_slow_avg/mk_slow_n (Fix 2 / 2d threading)."""
+    import market_maker.harness as harness_mod
+
+    cfg = MMConfig(gamma=0.5, k_arrival=1.0)
+    holder: dict = {"report": None}
+    loop = PaperTradingLoop(
+        store=store, expiry_key=EXPIRY, markets=MARKETS, engine_fn=_engine(),
+        config=cfg, clock=SimClock(START), vol_gate_fn=_vol_gate(),
+        markout_provider=lambda: holder["report"],
+    )
+    loop.tick({m: _snapshot_msg(0.5) for m, _k in MARKETS})  # cold tick
+    from market_maker.pnl_report import tte_bucket_label
+    tte_bucket = tte_bucket_label(max(loop.last_snapshot.tte_days, 0.0))
+    holder["report"] = {
+        "cells": [
+            {"region": "belly", "tte_bucket": tte_bucket,
+             "horizon_s": cfg.markout_horizon_s,
+             "n": cfg.markout_min_n, "n_attempted": cfg.markout_min_n,
+             "mk_avg": 0.02, "mk_var": 0.0009},
+            {"region": "belly", "tte_bucket": tte_bucket,
+             "horizon_s": cfg.markout_slow_horizon_s,
+             "n": cfg.markout_min_n, "n_attempted": cfg.markout_min_n,
+             "mk_avg": -0.03, "mk_var": 0.0016},
+        ],
+        "by_region": {}, "by_expiry": {},
+    }
+
+    captured = {}
+    orig_size_ladder = harness_mod.size_ladder
+
+    def spy(*args, **kwargs):
+        captured["args"] = args
+        return orig_size_ladder(*args, **kwargs)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(harness_mod, "size_ladder", spy)
+        loop.tick({m: _snapshot_msg(0.5) for m, _k in MARKETS})
+
+    contracts = captured["args"][0]
+    assert contracts
+    for c in contracts:
+        assert c.mk_avg == pytest.approx(0.02)
+        assert c.mk_slow_avg == pytest.approx(-0.03)
+        assert c.mk_slow_n == cfg.markout_min_n
+
+
+def test_slow_horizon_zero_skips_lookup_and_defaults_fields(store):
+    """cfg.markout_slow_horizon_s = 0 -> the slow lookup is skipped entirely
+    (no markout_stats call at the slow horizon) and the ContractSizingInput
+    slow fields keep their inert defaults (None, 0)."""
+    import market_maker.harness as harness_mod
+
+    cfg = MMConfig(gamma=0.5, k_arrival=1.0, markout_slow_horizon_s=0.0)
+    loop = _warmed_loop(store, cfg)
+
+    captured = {}
+    orig_size_ladder = harness_mod.size_ladder
+
+    def spy(*args, **kwargs):
+        captured["args"] = args
+        return orig_size_ladder(*args, **kwargs)
+
+    stats_calls = []
+    orig_stats = harness_mod.markout_stats
+
+    def stats_spy(report_arg, region, bucket, horizon, min_n):
+        stats_calls.append(horizon)
+        return orig_stats(report_arg, region, bucket, horizon, min_n)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(harness_mod, "size_ladder", spy)
+        mp.setattr(harness_mod, "markout_stats", stats_spy)
+        loop.tick({m: _snapshot_msg(0.5) for m, _k in MARKETS})
+
+    for c in captured["args"][0]:
+        assert c.mk_slow_avg is None
+        assert c.mk_slow_n == 0
+    assert all(h == cfg.markout_horizon_s for h in stats_calls)
+
+
+def test_item4_forensics_regression_no_bid_on_mid_wing_consensus_belly(tmp_path):
+    """THE regression pinning the VPS forensics (plan section 0): a market
+    whose consensus (~0.25, pricer-rich) classifies BELLY while its book mid
+    (0.13) classifies WING, with the full-report WING 600s cell
+    measured-toxic and the sizing-view belly cell unmeasured -> NO bid at
+    all (gate closed on the wing cell, Kelly m-clamped to 0). Under the
+    legacy consensus basis (kill-switch control below) the same setup keeps
+    an exploration-floor bid alive on the unmeasured belly cell -- the exact
+    bleed path of every observed wing fill."""
+    cfg = MMConfig(gamma=0.5, k_arrival=1.0)
+    markets = [("m-101k", 101000.0), ("m-103k", 103000.0)]
+    books = {"m-101k": _snapshot_msg(0.13), "m-103k": _snapshot_msg(0.06)}
+
+    def _run(loop_cfg, db_name):
+        st = MMStateStore(str(tmp_path / db_name))
+        try:
+            holder: dict = {"report": None, "sizing": None}
+            loop = PaperTradingLoop(
+                store=st, expiry_key=EXPIRY, markets=markets, engine_fn=_engine(),
+                config=loop_cfg, clock=SimClock(START), vol_gate_fn=_vol_gate(),
+                markout_provider=lambda: holder["report"],
+                sizing_markout_provider=lambda: holder["sizing"],
+            )
+            loop.tick(books)  # cold tick: learn bucket + consensus, set latch
+            assert loop.last_fair_value is not None
+            consensus_101k = float(loop.last_fair_value.consensus_p[101000.0])
+            # Premise check (the fixture must reproduce the forensics shape):
+            # consensus in the belly, book mid in the wing.
+            assert consensus_101k > 0.2, consensus_101k
+            from market_maker.pnl_report import tte_bucket_label
+            tte_bucket = tte_bucket_label(max(loop.last_snapshot.tte_days, 0.0))
+            holder["report"] = {
+                "cells": [
+                    {"region": "wing", "tte_bucket": tte_bucket,
+                     "horizon_s": loop_cfg.markout_horizon_s,
+                     "n": loop_cfg.markout_min_n,
+                     "n_attempted": loop_cfg.markout_min_n,
+                     "mk_avg": -0.05, "mk_var": 0.0004},
+                ],
+                "by_region": {}, "by_expiry": {},
+            }
+            holder["sizing"] = {"cells": [], "by_region": {}, "by_expiry": {}}
+            loop.tick(books)
+            return loop.last_quote_sets["m-101k"]
+        finally:
+            st.close()
+
+    qs_fixed = _run(cfg, "fixed.db")
+    assert qs_fixed.bid_size == 0.0  # gate closed + Kelly 0: NO bid
+
+    # Kill-switch control (round-6 minor 3): EXACT legacy = consensus basis
+    # AND hysteresis 0 TOGETHER -> the belly cell (unmeasured in the sizing
+    # view) re-opens the exploration floor and the leak-shaped bid returns.
+    cfg_legacy = MMConfig(gamma=0.5, k_arrival=1.0,
+                          sizing_region_basis="consensus",
+                          sizing_region_hysteresis_p=0.0)
+    qs_legacy = _run(cfg_legacy, "legacy.db")
+    assert qs_legacy.bid_size > 0.0
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-08 wing-bleed fix (3d): two-report routing -- belly-region markets
+# read the SIZING view, wing-region markets read the FULL view, term 7 always
+# reads the FULL view; a None sizing provider falls back to markout_provider.
+# ---------------------------------------------------------------------------
+
+
+def _two_view_reports(cfg, tte_bucket):
+    """Full/sizing reports with DIFFERENT belly 600s verdicts + a wing 600s
+    cell only in the full report."""
+    full = {
+        "cells": [
+            {"region": "belly", "tte_bucket": tte_bucket,
+             "horizon_s": cfg.markout_horizon_s,
+             "n": cfg.markout_min_n, "n_attempted": cfg.markout_min_n,
+             "mk_avg": 0.04, "mk_var": 0.0009},
+            {"region": "wing", "tte_bucket": tte_bucket,
+             "horizon_s": cfg.markout_horizon_s,
+             "n": cfg.markout_min_n, "n_attempted": cfg.markout_min_n,
+             "mk_avg": -0.05, "mk_var": 0.0004},
+        ],
+        "by_region": {}, "by_expiry": {},
+    }
+    sizing = {
+        "cells": [
+            {"region": "belly", "tte_bucket": tte_bucket,
+             "horizon_s": cfg.markout_horizon_s,
+             "n": cfg.markout_min_n, "n_attempted": cfg.markout_min_n,
+             "mk_avg": -0.06, "mk_var": 0.0016},
+        ],
+        "by_region": {}, "by_expiry": {},
+    }
+    return full, sizing
+
+
+def test_two_report_routing_belly_sizing_wing_full_term7_full(store):
+    """Belly market (mid 0.5) resolves its sizing cell from the SIZING view
+    (-0.06); wing market (mid ~0.047) from the FULL view (-0.05); every
+    term-7 markout_stats_side call reads the FULL report object."""
+    import market_maker.harness as harness_mod
+    from market_maker.pnl_report import tte_bucket_label
+
+    cfg = MMConfig(gamma=0.5, k_arrival=1.0)
+    markets = [("m-100k", 100000.0), ("m-106k", 106000.0)]
+    holder: dict = {"report": None, "sizing": None}
+    loop = PaperTradingLoop(
+        store=store, expiry_key=EXPIRY, markets=markets, engine_fn=_engine(),
+        config=cfg, clock=SimClock(START), vol_gate_fn=_vol_gate(),
+        markout_provider=lambda: holder["report"],
+        sizing_markout_provider=lambda: holder["sizing"],
+    )
+    books = {m: _snapshot_msg(_p_of_strike(k)) for m, k in markets}
+    loop.tick(books)  # cold tick: latch regions, learn bucket
+    tte_bucket = tte_bucket_label(max(loop.last_snapshot.tte_days, 0.0))
+    holder["report"], holder["sizing"] = _two_view_reports(cfg, tte_bucket)
+
+    captured = {}
+    orig_size_ladder = harness_mod.size_ladder
+
+    def spy(*args, **kwargs):
+        captured["args"] = args
+        return orig_size_ladder(*args, **kwargs)
+
+    side_reports = []
+    orig_side = harness_mod.markout_stats_side
+
+    def side_spy(report_arg, region, bucket, horizon, side, min_n):
+        side_reports.append(report_arg)
+        return orig_side(report_arg, region, bucket, horizon, side, min_n)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(harness_mod, "size_ladder", spy)
+        mp.setattr(harness_mod, "markout_stats_side", side_spy)
+        loop.tick(books)
+
+    by_market = {c.market_id: c for c in captured["args"][0]}
+    assert by_market["m-100k"].mk_avg == pytest.approx(-0.06)  # sizing view
+    assert by_market["m-106k"].mk_avg == pytest.approx(-0.05)  # full view
+    assert side_reports  # term 7 ran
+    assert all(r is holder["report"] for r in side_reports)  # full view only
+
+
+def test_sizing_provider_none_falls_back_to_markout_provider(store):
+    """No sizing_markout_provider wired -> belly-region sizing reads the
+    full report (pre-fix behavior preserved for shadow_runner and every
+    existing construction)."""
+    import market_maker.harness as harness_mod
+    from market_maker.pnl_report import tte_bucket_label
+
+    cfg = MMConfig(gamma=0.5, k_arrival=1.0)
+    holder: dict = {"report": None}
+    loop = PaperTradingLoop(
+        store=store, expiry_key=EXPIRY, markets=MARKETS, engine_fn=_engine(),
+        config=cfg, clock=SimClock(START), vol_gate_fn=_vol_gate(),
+        markout_provider=lambda: holder["report"],
+    )
+    loop.tick({m: _snapshot_msg(0.5) for m, _k in MARKETS})
+    tte_bucket = tte_bucket_label(max(loop.last_snapshot.tte_days, 0.0))
+    full, _sizing = _two_view_reports(cfg, tte_bucket)
+    holder["report"] = full
+
+    calls = []
+    orig = harness_mod.markout_stats
+
+    def stats_spy(report_arg, region, bucket, horizon, min_n):
+        calls.append({"report": report_arg, "region": region, "horizon": horizon})
+        return orig(report_arg, region, bucket, horizon, min_n)
+
+    captured = {}
+    orig_size_ladder = harness_mod.size_ladder
+
+    def spy(*args, **kwargs):
+        captured["args"] = args
+        return orig_size_ladder(*args, **kwargs)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(harness_mod, "markout_stats", stats_spy)
+        mp.setattr(harness_mod, "size_ladder", spy)
+        loop.tick({m: _snapshot_msg(0.5) for m, _k in MARKETS})
+
+    # Every sizing lookup resolved against the FULL report object (fallback),
+    # and the belly market got the full report's belly verdict.
+    assert calls
+    assert all(c["report"] is full for c in calls)
+    by_market = {c.market_id: c for c in captured["args"][0]}
+    assert by_market["m-100k"].mk_avg == pytest.approx(0.04)

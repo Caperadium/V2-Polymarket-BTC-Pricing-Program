@@ -152,6 +152,7 @@ def _mk_orch(
     reprice_s: float = 0.0,
     jump_loader=None,
     markout_provider=None,
+    sizing_markout_provider=None,
 ) -> Tuple[MultiExpiryOrchestrator, SharedPricingEngine, _ScriptedCompute]:
     compute = compute or _ScriptedCompute()
     engine = SharedPricingEngine(reprice_s=reprice_s, compute_fn=compute, jump_loader=jump_loader)
@@ -165,6 +166,7 @@ def _mk_orch(
         vol_gate_fn=_vol_gate,
         data_provider=data_provider or _empty_provider(),
         markout_provider=markout_provider,
+        sizing_markout_provider=sizing_markout_provider,
         adapter_factory=lambda tokens: _FakeAdapter(tokens),
         resolver=resolver,
         auto_mode=auto_mode,
@@ -348,6 +350,24 @@ def test_markout_provider_none_default_keeps_existing_constructors_green(store):
     orch.startup(NOW0, [("ev-a", EXPIRY_A, LADDER_A)], db_existed=False)
     for slot in orch.slots.values():
         assert slot.loop.markout_provider is None
+        assert slot.loop.sizing_markout_provider is None
+
+
+def test_sizing_markout_provider_threaded_into_every_slot_loop(store):
+    # Fix 3 (2026-08-08 wing-bleed fix, 3d): the belly epoch-filtered sizing
+    # provider is threaded through _build_slot exactly like markout_provider
+    # (single construction point -- covers startup slots AND mid-run
+    # acquisitions by the same code path).
+    stub_full = lambda: {"stub": "full"}
+    stub_sizing = lambda: {"stub": "sizing"}
+    orch, engine, compute = _mk_orch(
+        store, markout_provider=stub_full, sizing_markout_provider=stub_sizing)
+    orch.startup(NOW0, [("ev-a", EXPIRY_A, LADDER_A), ("ev-b", EXPIRY_B, LADDER_B)],
+                 db_existed=False)
+    assert len(orch.slots) == 2
+    for slot in orch.slots.values():
+        assert slot.loop.markout_provider is stub_full
+        assert slot.loop.sizing_markout_provider is stub_sizing
 
 
 def test_reprice_grant_rotates_round_robin(store):

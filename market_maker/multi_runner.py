@@ -318,6 +318,7 @@ class MultiExpiryOrchestrator:
         vol_gate_fn: Optional[Callable[[], object]] = None,
         data_provider: Optional[BTCDataProvider] = None,
         markout_provider: Optional[Callable[[], Optional[dict]]] = None,
+        sizing_markout_provider: Optional[Callable[[], Optional[dict]]] = None,
         adapter_factory: Callable[[Dict[str, str]], Any] = None,
         resolver: Optional[Callable[..., List[Tuple[str, str, list]]]] = None,
         auto_mode: bool = False,
@@ -351,6 +352,11 @@ class MultiExpiryOrchestrator:
         # sharing above). None (default) keeps every loop's sizing on the
         # m_prior path, same as an unwired single-expiry loop.
         self.markout_provider = markout_provider
+        # Fix 3 (2026-08-08 wing-bleed fix): the belly epoch-filtered SIZING
+        # view, shared across slots exactly like markout_provider above (same
+        # _build_slot single construction point). None (default) -> each
+        # loop's sizing falls back to markout_provider's full report.
+        self.sizing_markout_provider = sizing_markout_provider
         self.adapter_factory = adapter_factory
         self.resolver = resolver
         self.auto_mode = auto_mode
@@ -404,6 +410,7 @@ class MultiExpiryOrchestrator:
             vol_gate_fn=self.vol_gate_fn,
             data_provider=self.data_provider,
             markout_provider=self.markout_provider,
+            sizing_markout_provider=self.sizing_markout_provider,
             bankroll=self.bankroll_share,
             tick_dt_s=self.tick_s,
             feed_capability=FeedCapability.FULL_L2,

@@ -656,3 +656,110 @@ def test_missing_btc_csv_counts_as_stale(tmp_path, monkeypatch):
     assert hb["btc_data_age_s"] is None  # missing -> None, still counts as stale
     quotes_csv = (out_dir / "quotes.csv").read_text(encoding="ascii")
     assert "PULLED" in quotes_csv
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-08 wing-bleed fix (3b/3c): --markout-epoch parsing, the two-report
+# holder (build-both-then-assign-both), markout_report_sizing.json, and the
+# sizing_markout_provider orchestrator wiring.
+# ---------------------------------------------------------------------------
+
+
+def test_parse_epoch_cases():
+    # empty / None / garbage -> disabled (None), never raises.
+    assert paper_runner._parse_epoch(None) is None
+    assert paper_runner._parse_epoch("") is None
+    assert paper_runner._parse_epoch("not-a-date") is None
+    # naive ISO -> assumed UTC; tz-aware ISO -> same instant.
+    naive = paper_runner._parse_epoch("2026-07-27T15:48:00")
+    assert naive == datetime(2026, 7, 27, 15, 48, tzinfo=timezone.utc)
+    aware = paper_runner._parse_epoch("2026-07-27T15:48:00+00:00")
+    assert aware == naive
+
+
+def test_markout_sizing_json_written_and_provider_wired(tmp_path, monkeypatch):
+    """After one PER_MARKET_SNAPSHOT_EVERY_N_TICKS cadence: BOTH report files
+    exist (full = epoch_ts None; sizing = the MMConfig default epoch), and
+    the orchestrator was constructed with both provider callables."""
+    from market_maker.config import MMConfig
+    from market_maker.pnl_report import PER_MARKET_SNAPSHOT_EVERY_N_TICKS
+
+    _install_common_stubs(monkeypatch, tmp_path)
+    captured: Dict[str, object] = {}
+    real_orch = paper_runner.MultiExpiryOrchestrator
+
+    class _CapturingOrch(real_orch):
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            super().__init__(**kwargs)
+
+    monkeypatch.setattr(paper_runner, "MultiExpiryOrchestrator", _CapturingOrch)
+
+    out_dir = tmp_path / "out"
+    ctl_dir = tmp_path / "control"
+    t, result = _run_in_thread([
+        "--event-slug", "fake-event", "--minutes", "0", "--tick-s", "0.2",
+        "--warmup-s", "0", "--out", str(out_dir), "--control-dir", str(ctl_dir),
+    ])
+    try:
+        tick = _wait_for_heartbeat_tick(
+            out_dir, PER_MARKET_SNAPSHOT_EVERY_N_TICKS + 1, timeout_s=60.0)
+        assert tick >= PER_MARKET_SNAPSHOT_EVERY_N_TICKS
+        (ctl_dir / "mm_paper.stop").write_text("", encoding="ascii")
+        t.join(timeout=20.0)
+        assert not t.is_alive()
+    finally:
+        if t.is_alive():  # pragma: no cover
+            t.join(timeout=5.0)
+    assert result.get("code") == 0
+
+    full = json.loads((out_dir / "markout_report.json").read_text(encoding="ascii"))
+    sizing = json.loads((out_dir / "markout_report_sizing.json").read_text(encoding="ascii"))
+    assert full.get("epoch_ts") is None  # full report: never epoch-filtered
+    expected_epoch = paper_runner._parse_epoch(MMConfig().markout_epoch_utc)
+    assert expected_epoch is not None
+    assert sizing.get("epoch_ts") == expected_epoch.isoformat()
+
+    # 3c/3d wiring: the orchestrator got BOTH holder-lambda providers.
+    assert callable(captured.get("markout_provider"))
+    assert callable(captured.get("sizing_markout_provider"))
+
+
+def test_sizing_report_build_failure_keeps_previous_pair(tmp_path, monkeypatch):
+    """Build-both-then-assign-both inside the ONE existing try/except: a
+    sizing-view build failure (raises on the epoch_ts call) aborts the whole
+    block BEFORE any holder assignment or json write -- neither report file
+    appears, the pair stays at its previous (seed) values, and the runner
+    keeps ticking (warning only, clean stop exit 0)."""
+    from market_maker.pnl_report import PER_MARKET_SNAPSHOT_EVERY_N_TICKS
+
+    _install_common_stubs(monkeypatch, tmp_path)
+    real_report = paper_runner.markout_report
+
+    def raising_on_epoch(*args, **kwargs):
+        if kwargs.get("epoch_ts") is not None:
+            raise RuntimeError("synthetic sizing-report failure")
+        return real_report(*args, **kwargs)
+
+    monkeypatch.setattr(paper_runner, "markout_report", raising_on_epoch)
+
+    out_dir = tmp_path / "out"
+    ctl_dir = tmp_path / "control"
+    t, result = _run_in_thread([
+        "--event-slug", "fake-event", "--minutes", "0", "--tick-s", "0.2",
+        "--warmup-s", "0", "--out", str(out_dir), "--control-dir", str(ctl_dir),
+    ])
+    try:
+        tick = _wait_for_heartbeat_tick(
+            out_dir, PER_MARKET_SNAPSHOT_EVERY_N_TICKS + 1, timeout_s=60.0)
+        assert tick >= PER_MARKET_SNAPSHOT_EVERY_N_TICKS
+        (ctl_dir / "mm_paper.stop").write_text("", encoding="ascii")
+        t.join(timeout=20.0)
+        assert not t.is_alive()
+    finally:
+        if t.is_alive():  # pragma: no cover
+            t.join(timeout=5.0)
+    assert result.get("code") == 0  # failure is non-fatal (caught + warned)
+
+    assert not (out_dir / "markout_report.json").exists()
+    assert not (out_dir / "markout_report_sizing.json").exists()

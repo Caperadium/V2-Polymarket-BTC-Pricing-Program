@@ -19,10 +19,24 @@ FRACTION SPACE:
 
        structural_edge = belief_leg - price_leg
        m_prior = structural_edge - config.eps_base   # AS prior charge
-       m = mk_avg if (mk_avg is not None and mk_n >= config.markout_min_n)
-           else m_prior                                # measured net edge
+       baseline = mk_avg if (mk_avg is not None and mk_n >= config.markout_min_n)
+                  else m_prior                       # measured net edge (mid channel)
+       m = min(baseline, mk_slow_avg) if slow channel measured else baseline
+                                    # slow-horizon haircut (2026-08-08 wing-bleed
+                                    # fix): strictly ONE-DIRECTIONAL -- min() can
+                                    # lower m, never raise it
        m = max(m, 0.0)              # Glosten-Milgrom: negative net edge -> no size
        f_star, b = kelly_buy(price_leg + m, price_leg)  # belief_eff = price_leg + m
+
+     The slow channel (2026-08-08 wing-bleed fix, temp/mm_wing_bleed_fix_plan.md
+     2c): mk_slow_avg/mk_slow_n are the SAME market cell's markout at
+     config.markout_slow_horizon_s (21600s/6h -- the 600s mid markout is
+     structurally blind to slow theta bleed on low-delta wings, measured
+     -2.7c at 600s vs -10 to -13c realized at settlement). It is "measured"
+     only when markout_slow_horizon_s > 0 (belt-and-braces kill switch even
+     for direct size_ladder callers), mk_slow_avg is not None and mk_slow_n
+     >= markout_min_n. The slow channel NEVER sets sigma2_edge (Baker-McHale
+     variance stays the mid channel's mk_var/mk_n or the prior).
 
      bid_price/ask_price are now the POSTED quote prices (the caller passes
      post-spread-builder prices, not our raw proposal) -- this is the
@@ -54,9 +68,10 @@ NO bet at our ask -- the capital actually at risk per share if filled):
      presence_frac * bankroll / price_per_share, tapered toward zero as
      inventory on that side approaches q_max. Gated on measured net edge:
 
-       m_gate = mk_avg when (mk_avg is not None and mk_n >= markout_min_n)
-                else m_prior                       # NOT clamped at 0 here
-       gate = (m_gate >= 0.0) or (mk_n_attempted < config.markout_min_n)
+       m_gate = min-rule net edge from Stage 1 (baseline, haircut by a
+                measured slow channel)                # NOT clamped at 0 here
+       gate = (m_gate >= 0.0) or (
+           mk_n_attempted < config.markout_min_n and not measured_slow_toxic)
        floor applies only when gate is True
 
      The exploration carve-out (mk_n_attempted < markout_min_n -> gate stays
@@ -66,7 +81,12 @@ NO bet at our ask -- the capital actually at risk per share if filled):
      markout fields at all, mk_n_attempted=0) is always in the exploration
      carve-out, so it behaves exactly as wave 1 (unconditional floor). Once
      measured (mk_n_attempted >= min_n) with a negative net edge, the floor
-     turns off on that side. A pure floor otherwise -- it only ever raises a
+     turns off on that side. 2026-08-08 wing-bleed fix: the carve-out is
+     additionally SUPPRESSED while the slow channel is measured-toxic
+     (measured_slow_toxic, see _leg_edge) -- without this the gate closure
+     has a 28-day period (no fills -> the cell ages out of
+     MARKOUT_LOOKBACK_S -> n_attempted falls below min_n -> carve-out
+     re-arms -> ~20 exploration fills of tuition -> re-measure -> repeat). A pure floor otherwise -- it only ever raises a
      leg's size, never lowers one respected by a firmer cap below. Records an
      audit "presence_floor" stage; does NOT add a SizingCap member (the floor
      is not a cap).
@@ -206,6 +226,14 @@ class ContractSizingInput:
     average. All default to "unmeasured" (None/0) so a caller that never
     wires markout data gets the m_prior fallback path everywhere.
 
+    mk_slow_avg/mk_slow_n (2026-08-08 wing-bleed fix, additive) are the SAME
+    market cell's markout at config.markout_slow_horizon_s (the slow
+    channel). When measured (slow horizon enabled, mk_slow_avg not None,
+    mk_slow_n >= markout_min_n) the Kelly net edge is haircut one-directionally
+    to min(baseline, mk_slow_avg) and a NEGATIVE mk_slow_avg additionally
+    suppresses the W4 exploration carve-out (see _leg_edge / the module
+    docstring). Defaults (None/0) leave every existing caller byte-identical.
+
     strike is optional; when provided and present in the PricerSnapshot's
     per-strike sigma2 map, it participates in the bucket worst-case recheck
     (plan C5). Missing strikes fall back to a conservative sum-cap fallback
@@ -224,6 +252,8 @@ class ContractSizingInput:
     mk_var: Optional[float] = None
     mk_n: int = 0
     mk_n_attempted: int = 0
+    mk_slow_avg: Optional[float] = None
+    mk_slow_n: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -271,30 +301,52 @@ def _leg_edge(
     mk_var: Optional[float],
     mk_n: int,
     config: MMConfig,
-) -> Tuple[float, float, float]:
+    mk_slow_avg: Optional[float] = None,
+    mk_slow_n: int = 0,
+) -> Tuple[float, float, float, bool]:
     """Wave 2 W2 per-leg edge/variance resolution, shared by the YES and NO
     legs (both are computed in the leg's own price scale, so this one
     function serves both -- see the module docstring's explicit per-side
-    frame). Returns (m_gate, m_clamped, sigma2_edge):
+    frame). Returns a 4-tuple (m_gate, m_clamped, sigma2_edge,
+    measured_slow_toxic) as of the 2026-08-08 wing-bleed fix:
 
       structural_edge = belief_leg - price_leg
       m_prior = structural_edge - config.eps_base
-      measured = mk_avg is not None and mk_n >= config.markout_min_n
-      m_gate = mk_avg if measured else m_prior      # UNclamped, for the W4 floor gate
+      measured_mid = mk_avg is not None and mk_n >= config.markout_min_n
+      baseline = mk_avg if measured_mid else m_prior
+      slow_h_on = config.markout_slow_horizon_s > 0     # kill switch
+      measured_slow = slow_h_on and mk_slow_avg is not None
+                      and mk_slow_n >= config.markout_min_n
+      m_gate = min(baseline, mk_slow_avg) if measured_slow else baseline
+                                                     # UNclamped, W4 floor gate;
+                                                     # min() = one-directional
       m_clamped = max(m_gate, 0.0)                   # Glosten-Milgrom floor at 0
-      sigma2_edge = (mk_var / mk_n) if (measured and mk_var is not None)
-                    else config.markout_prior_var
+      sigma2_edge = (mk_var / mk_n) if (measured_mid and mk_var is not None)
+                    else config.markout_prior_var    # slow NEVER sets sigma2
+      measured_slow_toxic = measured_slow and mk_slow_avg < 0.0
+
+    measured_slow_toxic is the single home of the slow-toxicity predicate
+    (round-5 major 2: never re-derived in size_ladder) -- it suppresses the
+    W4 exploration carve-out downstream.
     """
     structural_edge = belief_leg - price_leg
     m_prior = structural_edge - config.eps_base
-    measured = mk_avg is not None and mk_n >= config.markout_min_n
-    m_gate = mk_avg if measured else m_prior
+    measured_mid = mk_avg is not None and mk_n >= config.markout_min_n
+    baseline = mk_avg if measured_mid else m_prior
+    slow_h_on = float(getattr(config, "markout_slow_horizon_s", 0.0) or 0.0) > 0.0
+    measured_slow = (slow_h_on and mk_slow_avg is not None
+                     and mk_slow_n >= config.markout_min_n)
+    m_gate = min(baseline, mk_slow_avg) if measured_slow else baseline
     m_clamped = max(m_gate, 0.0)
-    if measured and mk_var is not None and mk_n > 0:
+    # sigma2_edge UNCHANGED by the slow channel: mid channel's mk_var/mk_n
+    # when measured_mid, else markout_prior_var. The slow channel NEVER sets
+    # sigma2.
+    if measured_mid and mk_var is not None and mk_n > 0:
         sigma2_edge = mk_var / mk_n
     else:
         sigma2_edge = config.markout_prior_var
-    return m_gate, m_clamped, sigma2_edge
+    measured_slow_toxic = measured_slow and mk_slow_avg < 0.0
+    return m_gate, m_clamped, sigma2_edge, measured_slow_toxic
 
 
 # ---------------------------------------------------------------------------
@@ -314,6 +366,7 @@ class _Leg:
     f: float  # working fraction through the fraction-space stages
     m_gate: float = 0.0  # wave 2 W4: measured net edge (unclamped) used for the floor gate
     sigma2_edge: float = 0.0  # wave 2 W2: markout-measurement variance used for Baker-McHale
+    measured_slow_toxic: bool = False  # 2026-08-08: slow channel measured AND negative (_leg_edge)
     shares: float = 0.0  # working shares through the share-space stages
 
 
@@ -349,26 +402,30 @@ def size_ladder(
     for c in contracts:
         yes_price = c.bid_price
         yes_belief = c.p_hat
-        m_gate_yes, m_yes, sigma2_yes = _leg_edge(
-            yes_price, yes_belief, c.mk_avg, c.mk_var, c.mk_n, config
+        m_gate_yes, m_yes, sigma2_yes, slow_toxic_yes = _leg_edge(
+            yes_price, yes_belief, c.mk_avg, c.mk_var, c.mk_n, config,
+            mk_slow_avg=c.mk_slow_avg, mk_slow_n=c.mk_slow_n,
         )
         f_yes, b_yes = kelly_buy(yes_price + m_yes, yes_price)
         k_yes = baker_mchale(f_yes, b_yes, sigma2_yes)
         legs.append(
             _Leg(c.market_id, True, c.strike, yes_price, f_yes, b_yes, k_yes, f_yes * k_yes,
-                 m_gate=m_gate_yes, sigma2_edge=sigma2_yes)
+                 m_gate=m_gate_yes, sigma2_edge=sigma2_yes,
+                 measured_slow_toxic=slow_toxic_yes)
         )
 
         no_price = 1.0 - c.ask_price
         no_belief = 1.0 - c.p_hat
-        m_gate_no, m_no, sigma2_no = _leg_edge(
-            no_price, no_belief, c.mk_avg, c.mk_var, c.mk_n, config
+        m_gate_no, m_no, sigma2_no, slow_toxic_no = _leg_edge(
+            no_price, no_belief, c.mk_avg, c.mk_var, c.mk_n, config,
+            mk_slow_avg=c.mk_slow_avg, mk_slow_n=c.mk_slow_n,
         )
         f_no, b_no = kelly_buy(no_price + m_no, no_price)
         k_no = baker_mchale(f_no, b_no, sigma2_no)
         legs.append(
             _Leg(c.market_id, False, c.strike, no_price, f_no, b_no, k_no, f_no * k_no,
-                 m_gate=m_gate_no, sigma2_edge=sigma2_no)
+                 m_gate=m_gate_no, sigma2_edge=sigma2_no,
+                 measured_slow_toxic=slow_toxic_no)
         )
     audit["stages"].append(
         {"stage": "kelly+baker_mchale",
@@ -411,13 +468,30 @@ def size_ladder(
     # shares. presence_frac<=0 disables (floor contributes 0) independent of
     # the gate.
     #
-    # gate = (m_gate >= 0.0) or (mk_n_attempted < markout_min_n)   -- W4
+    # gate = (m_gate >= 0.0) or (n_attempted < markout_min_n
+    #                            and not measured_slow_toxic)   -- W4 + 2026-08-08
     # m_gate is the leg's UNclamped measured/prior net edge (set in Stage 1);
     # the exploration carve-out (n_attempted below the trust threshold) keeps
     # the floor ON regardless of m_gate's sign so a never-measured cell can
     # accumulate fills. mk_n_attempted is per-CONTRACT (ContractSizingInput),
     # shared by both legs of that market (one measurement cell), so we look
     # it up by market_id via the original contracts, not per-leg.
+    #
+    # 2026-08-08 wing-bleed fix (ONE deliberate change, round-4 major 3): the
+    # carve-out is suppressed while the slow channel is measured-toxic.
+    # EQUIVALENCE (round-5 major 3): since measured_slow_toxic =>
+    # mk_slow_avg < 0 => m_gate = min(baseline, mk_slow_avg) < 0, the new
+    # gate is exactly "if slow-toxic -> floor OFF unconditionally; otherwise
+    # unchanged". Rationale: without it, item 4's gate closure has a 28-DAY
+    # PERIOD -- no wing fills -> the wing cells age out of MARKOUT_LOOKBACK_S
+    # -> n_attempted falls below min_n -> carve-out re-arms -> ~20
+    # exploration fills of tuition (~-12 at the observed -0.6/fill) ->
+    # re-measure -> close -> repeat. The W4 rationale ("fills are the only
+    # calibration source") does not apply when a second channel IS measured.
+    # No deadlock: a fill-less slow cell also ages out at 28d, restoring the
+    # carve-out. n_attempted stays the MID cell's; stage 5b is unchanged (its
+    # 0.33x is moot on a floor-gated-off leg: measured_slow_toxic ->
+    # m_clamped = 0 -> f* = 0 -> shares 0).
     mk_n_attempted_by_market: Dict[str, int] = {c.market_id: c.mk_n_attempted for c in contracts}
     inv_by_market: Dict[str, Any] = dict(inventory.per_contract) if inventory is not None else {}
     presence_info: List[Dict[str, Any]] = []
@@ -437,7 +511,8 @@ def size_ladder(
             if s_presence is None:
                 continue
             n_attempted = mk_n_attempted_by_market.get(lg.market_id, 0)
-            gate = (lg.m_gate >= 0.0) or (n_attempted < config.markout_min_n)
+            gate = (lg.m_gate >= 0.0) or (
+                n_attempted < config.markout_min_n and not lg.measured_slow_toxic)
             taper = 1.0
             cinv = inv_by_market.get(lg.market_id)
             if cinv is not None:
