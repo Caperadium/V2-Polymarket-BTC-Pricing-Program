@@ -134,6 +134,45 @@ NO bet at our ask -- the capital actually at risk per share if filled):
   6. Inventory headroom cap (plan C2): bid_shares <= q_max - q, ask_shares <=
      q_max + q, from InventoryState when provided. Records INVENTORY when
      binding.
+  6b. Skew-aware entry cap (2026-08-10 skew-fix wave item 2, temp/
+     mm_skew_fix_plan.md): item 1 (quote_engine's skew_x_cap) makes big q
+     SAFE but not SENSIBLE -- once the reservation-shift clamp binds,
+     additional inventory no longer moves the quote, so the ladder's main
+     inventory-control channel saturates. Cap the ADD side so a leg's
+     position cannot outrun that channel's authority:
+
+       q_skew_max = skew_q_headroom_mult * config.skew_x_cap / unit_skew_x
+       bid_shares <= max(0.0, q_skew_max - q)   # YES/bid = add side when q>=0
+       ask_shares <= max(0.0, q_skew_max + q)   # NO/ask  = add side when q<0
+
+     unit_skew_x (ContractSizingInput, additive) is the per-share reservation
+     shift for this market this tick, resolved by the harness via
+     quote_engine.per_share_skew_x(quote_variant, sigma_b, gamma, k_arrival,
+     arrival_scale_A, tte) -- the SAME code path and the SAME sigma_b the
+     quote engine used to build this tick's proposal, so the sizing cap and
+     the quote clamp agree on the bind point under both variants (this
+     module never imports quote_engine -- the field arrives pre-computed).
+     0.0 (default) = unwired/disabled for that leg -> stage inert for it.
+     config.skew_x_cap <= 0 is the paired kill switch (also stage inert,
+     mirrors the quote-engine clamp's own disable). Gated on `inventory is
+     not None` (needs the same per-market q the headroom cap above already
+     resolves). Placed AFTER Stage 6 (inventory headroom) and BEFORE Stage 7
+     (depth) / Stage 8 (bucket) -- caps dominate floors, same discipline as
+     every other cap in this pipeline; runs after the Stage 5/5b/5c floors.
+     No reduce-side exemption: for q >= 0, q_skew_max - q < q_skew_max + q
+     always, so a long position's bid (its ADD side) binds strictly before
+     its ask (its REDUCE side) -- the reduce side always has strictly more
+     headroom and can never be the tighter bound; symmetric for q < 0.
+     Verified by test, not special-cased (the plan is explicit that this is
+     NOT needed, unlike Stage 5c). NO floor-back to depth_cap_floor_shares:
+     this is a RISK cap, not a presence mechanism -- a side capped below the
+     venue minimum becomes a no-quote via the existing order_lifecycle
+     min-size rule. Records SizingCap.SKEW when it actually reduces a leg's
+     shares. Journal truthfulness: max_add_yes/max_add_no report min(Stage-6
+     value, q_skew_max bound) only for a leg where this stage is active;
+     otherwise they are left exactly as Stage 6 set them (a naive min
+     against an unset/zero q_skew_max would collapse reported headroom to 0
+     on every legacy/kill-switch run).
   7. Depth cap, FLOORED (wave 2 W5): quote size bounded by
      max(realized_depth_side, config.depth_cap_floor_shares) rather than raw
      realized_depth_side -- a dead book (realized_depth=0) no longer
@@ -198,6 +237,7 @@ _CAP_ORDER = [
     SizingCap.RUIN,
     SizingCap.BANKROLL,
     SizingCap.INVENTORY,
+    SizingCap.SKEW,
     SizingCap.DEPTH,
     SizingCap.FRACTIONAL_C,
 ]
@@ -241,6 +281,14 @@ class ContractSizingInput:
     per-strike snapshot.sigma2 map is no longer used for leg shrinkage
     (sigma2_edge instead); strike's only remaining sizing role is the bucket
     recheck.
+
+    unit_skew_x (2026-08-10 skew-fix wave item 2, additive) is the per-share
+    reservation shift quote_engine.per_share_skew_x(variant, sigma_b, gamma,
+    k, A, tte) would produce for THIS market this tick, variant-correct
+    (resolved by the harness -- this module never imports quote_engine).
+    Feeds Stage 6b's skew-aware entry cap (see the module docstring).
+    Default 0.0 = unwired/disabled -> that stage is inert for this contract
+    (all existing callers unaffected).
     """
 
     market_id: str
@@ -254,6 +302,7 @@ class ContractSizingInput:
     mk_n_attempted: int = 0
     mk_slow_avg: Optional[float] = None
     mk_slow_n: int = 0
+    unit_skew_x: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -616,6 +665,61 @@ def size_ladder(
                     triggered.add(SizingCap.INVENTORY)
     audit["stages"].append(
         {"stage": "inventory_headroom", "max_add_yes": dict(max_add_yes), "max_add_no": dict(max_add_no)}
+    )
+
+    # Stage 6b: skew-aware entry cap (2026-08-10 skew-fix wave item 2) --
+    # caps ONLY the side of each leg that GROWS |q| (bid when q>=0, ask when
+    # q<0). Slotted with Stage 6 (same discipline: caps dominate floors),
+    # after the 5b multiplier and 5c reduce floor, before Stage 7 depth /
+    # Stage 8 bucket. See the module docstring's "6b" paragraph for the full
+    # rationale. Guards, BOTH per-leg (unit_skew_x <= 0 -- unwired/disabled
+    # for that contract) and pipeline-global (config.skew_x_cap <= 0 -- the
+    # kill switch paired with the quote-engine clamp): either leaves the leg
+    # exactly as Stage 6 left it (shares AND max_add_yes/no unchanged).
+    skew_x_cap_cfg = float(getattr(config, "skew_x_cap", 0.0) or 0.0)
+    skew_headroom_mult = float(getattr(config, "skew_q_headroom_mult", 1.0) or 1.0)
+    skew_info: List[Dict[str, Any]] = []
+    if inventory is not None and skew_x_cap_cfg > 0.0:
+        contract_by_market: Dict[str, ContractSizingInput] = {
+            c.market_id: c for c in contracts
+        }
+        for lg in legs:
+            cinv = inv_by_market.get(lg.market_id)
+            if cinv is None:
+                continue
+            c_in = contract_by_market.get(lg.market_id)
+            unit_skew = c_in.unit_skew_x if c_in is not None else 0.0
+            if unit_skew <= 0.0:
+                continue  # unwired/disabled for this contract -- stage inert
+            # q_skew_max: inventory level at which the per-share skew term
+            # alone reaches the quote-engine's clamp, scaled by the headroom
+            # multiplier (some saturation tolerated -- fills are the
+            # calibration source and the venue-min floor must stay
+            # reachable).
+            q_skew_max = skew_headroom_mult * skew_x_cap_cfg / unit_skew
+            if lg.is_yes:
+                bound = max(0.0, q_skew_max - cinv.q)
+                # Journal truthfulness: report min(Stage-6, this bound) only
+                # here (this leg is active) -- max_add_yes was already set by
+                # Stage 6 above for every leg with cinv present.
+                max_add_yes[lg.market_id] = min(
+                    max_add_yes.get(lg.market_id, bound), bound
+                )
+            else:
+                bound = max(0.0, q_skew_max + cinv.q)
+                max_add_no[lg.market_id] = min(
+                    max_add_no.get(lg.market_id, bound), bound
+                )
+            if lg.shares > bound + 1e-12:
+                lg.shares = bound
+                triggered.add(SizingCap.SKEW)
+            skew_info.append(
+                {"market_id": lg.market_id, "is_yes": lg.is_yes,
+                 "unit_skew_x": unit_skew, "q_skew_max": q_skew_max, "bound": bound}
+            )
+    audit["stages"].append(
+        {"stage": "skew_entry_cap", "legs": skew_info,
+         "skew_x_cap": skew_x_cap_cfg, "skew_q_headroom_mult": skew_headroom_mult}
     )
 
     # Stage 7: depth cap -- hard min, AFTER the floor and inventory cap

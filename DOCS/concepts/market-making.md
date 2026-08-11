@@ -412,6 +412,39 @@ them -- protection there comes from term-7 widening and the sizing-layer
 changes of Section 8. Kill switch: a negative pin (`-1.0`) restores legacy
 wing Bayes exactly.
 
+### 4.7 Bankroll update tempering (2026-08-10)
+
+Section 4.3's mark-to-market multiplies bankroll by a per-tick Bayes
+factor; at the 15-second quoting cadence those factors turned out to be
+far more informative than one tick of mid movement can justify. Forensics
+around the 2026-08-10 skew incident (Section 6.3) found belly weights
+flipping the *full* range -- pricer weight 0.02 to 0.98 and back -- within
+hours, repeatedly, in both directions, on every expiry checked; the
+instability pre-dates the wing pin of Section 4.6 and is not fallout from
+it. A pricer-rich phase (weight ramping toward 0.98) posts consensus
+prices above the market and hands Kelly a phantom edge (`belief - posted
+price`), which is exactly what sized the oversized entry that armed the
+skew term in the incident.
+
+`MMConfig.bankroll_update_temper` (default 0.1) tempers each region's
+Bayes-factor vector before the weight update, `factors = factors **
+bankroll_update_temper`, applied after the existing non-finite-factor skip
+(Section 4.4) and before the weight multiply, for every *unpinned* region
+(belly always; wing only if `wing_pricer_weight_pin` is disabled --
+Section 4.6's pinned wing skips its update before factors are even
+computed, so tempering never touches it). Factors are non-negative by
+construction, so `factor ** t` is always real and a zero factor stays
+zero. At t = 0.1 a full 0.02 <-> 0.98 flip takes roughly 10x as many ticks
+to complete -- about 5-7.5 hours of consistent evidence instead of
+30-45 minutes.
+
+This is a **rate** bound, not an attractor fix: tempering slows how fast
+weight moves toward the 0.98/0.02 corner, it does not change that the
+corner is still where the self-confirmation dynamic (Section 4.6) points.
+The floor, normalization, and skip rules of Sections 4.3-4.4 are
+unaffected. `bankroll_update_temper = 1.0` is exact legacy (untempered)
+Bayes.
+
 ---
 
 ## 5. A change of coordinates: log-odds space
@@ -516,6 +549,72 @@ bid/ask in both spaces, plus a hash of every parameter used (so any quote in
 the journal can be traced to the exact settings that produced it). This is not
 yet an order: it says where the *core* quote stands before venue realities and
 model-quality charges are added.
+
+### 6.3 The skew displacement cap (2026-08-10)
+
+The reservation formula's skew term, `q * gamma * sigma_b^2 * tte`, is
+unbounded in q. On 2026-08-10 a 13.4-share belly fill, combined with a
+genuine sigma_b spike to 2.46 (belief volatility really was that high in
+the moment -- see below), produced `skew_x = -8.83` log-odds. The
+reservation landed at `r_x = logit(0.001)`, the p-clamp floor, and the bot
+posted asks around 0.14-0.23 into a 0.71 market: a fire-sale of a winning
+13-share position roughly 55 cents under fair value, -7.4 realized inside
+half an hour. The consensus itself never moved -- x_fair stayed sane
+throughout -- this was purely an unbounded displacement term turning an
+ordinary fill into a catastrophic quote.
+
+`make_quote` now caps the displacement via `MMConfig.skew_x_cap` (default
+1.0 x-unit), in four steps:
+
+0. Clamp `x_fair` into the logit band `[x_lo, x_hi]` (the same bounds the
+   pre-existing band clamp uses, hoisted earlier in the function).
+   Production `x_fair` always arrives already band-clamped, so this is
+   normally a no-op; it exists so the invariant below holds unconditionally
+   even for `make_quote`'s public, out-of-band callers.
+1. If `skew_x_cap > 0`, clamp `skew_x` to `[-skew_x_cap, skew_x_cap]` and
+   rebuild `r_x = x_fair + skew_x` from the clamped value.
+2. Run the pre-existing band clamp on `r_x` into `[x_lo, x_hi]`, unchanged
+   from before this fix.
+3. Gated on `skew_x_cap > 0`, re-derive `skew_x = r_x - x_fair`. Because the
+   band clamp only ever shrinks `|r_x - x_fair|`, this keeps
+   `|skew_x| <= skew_x_cap` and makes the identity `x_fair == r_x - skew_x`
+   exact -- the journaled `skew_x` is then always the true displacement
+   behind the quote, never a stale pre-band value. With the cap disabled,
+   step 3 is skipped: legacy behavior deliberately keeps the older
+   band-clamp offset, so disabling the cap is a true revert, not an
+   approximation of one.
+
+The same per-share displacement formula (`per_share_skew_x`, shared by both
+quoting and sizing) also feeds a sizing-side entry cap (Section 8.2), so
+quoting and sizing agree on where inventory growth should slow. At 1.0
+x-unit the cap still leans the quote hard -- roughly p 0.5 -> 0.73 at the
+center, less near the extremes -- but it can no longer pin the reservation
+at the clamp floor the way an unbounded term can.
+
+**sigma_b was not the bug.** A cross-check of the 2026-08-09/10 quotes
+journal (x_fair-implied volatility, 5-minute sampling) found the estimator
+honest: realized x_fair volatility ran about 1.0/sqrt-day against a
+journaled sigma_b average of 0.9 on calm markets, and the incident's 2.2-2.6
+reading was a genuine vol spike, not an artifact -- logit convexity near
+the p-clamp extremes makes x-space volatility large even for a modest
+p-space move. No sigma_b recalibration was needed or made; the defect was
+purely that `skew ~ q * sigma_b^2 * tte` has no ceiling, so even at a
+normal sigma_b of 1.0 a position of roughly 10 shares already shifts the
+reservation more than a full spread width.
+
+Kill switch: `skew_x_cap <= 0` disables the cap entirely -- steps 1 and 3
+are both skipped, and `make_quote` reproduces the pre-fix, unbounded
+behavior byte-for-byte.
+
+**Deferred root cause.** The harness passes raw share counts as the
+Avellaneda-Stoikov `q`, though the quote engine's own docstring calls for
+the caller to normalize shares by some config unit first. That mismatch is
+why the term reaches multi-x-unit displacements from a fill of only a
+dozen-odd shares, and why `gamma` cannot be meaningfully calibrated against
+real fill data as things stand. Normalizing `q` is the principled fix, but
+it touches every gamma-dependent calibration at once and is left for a
+follow-up wave; until then `skew_x_cap` is the de facto inventory-control
+scale.
 
 ---
 
@@ -883,6 +982,39 @@ in this order:
   Section 10 and is untouched by the package D breach-metric change (Section
   11) -- only the risk controller's own breach *trigger* is now risk-based,
   not this headroom cap.
+- **Skew-aware entry cap (Stage 6b, 2026-08-10).** Section 6.3's
+  displacement cap makes a large position *safe* -- once it binds, more
+  inventory no longer moves the quote -- but not *sensible*: the ladder's
+  primary, continuous inventory-control channel has just saturated. Stage
+  6b caps the *add* side only (never the reduce side) so a position cannot
+  outrun that channel's authority:
+
+  ```
+  q_skew_max = skew_q_headroom_mult * skew_x_cap / unit_skew_x
+  bid_shares <= max(0, q_skew_max - q)      # add side when long or flat
+  ask_shares <= max(0, q_skew_max + q)      # add side when short or flat
+  ```
+
+  `unit_skew_x` is the per-share reservation displacement for this market
+  this tick, computed by the harness via `quote_engine.per_share_skew_x` --
+  the same formula, the same `sigma_b`, and the same quote variant the
+  quote engine itself used to build the tick's proposal, so the sizing cap
+  and the quote-engine clamp agree on exactly where the skew channel binds
+  under either variant. `skew_q_headroom_mult` (default 1.5) lets a
+  position run 50% past the clamp-bind quantity before the add side starts
+  shrinking -- fills remain the calibration source, and the venue-minimum
+  floor still has to be reachable. This is a risk cap, not a presence
+  mechanism: unlike the depth cap below, a leg capped under the venue
+  minimum is simply not quoted rather than floored back up. Recorded as
+  `SizingCap.SKEW` when it binds.
+
+  Incident replay: at the incident's sigma_b of 2.46 this caps the same
+  13-17-share bids down to about 2.3 shares; at a calm sigma_b of 0.9 the
+  cap sits around 17 shares and does not bind in normal conditions. The
+  cap is structurally inert near expiry (`q_skew_max ~ 1/tte`, since the
+  skew channel itself is inert there too) -- 0-1 day position bounds still
+  come from the S'(x)-based `q_max`, the bucket worst-case cap, and depth,
+  unchanged.
 - **Depth cap, floored at a minimum restorable size.** Each side's size is
   also bounded by `max(realized_depth, depth_cap_floor_shares)` -- the
   liquidity monitor's realized displayed depth (Section 11.2), never allowed

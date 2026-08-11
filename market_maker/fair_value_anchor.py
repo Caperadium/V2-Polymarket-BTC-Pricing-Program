@@ -98,6 +98,28 @@ belly and the pin does not touch them. Belly PER-STRIKE consensus is unchanged
 by the pin; belly BANKROLL trajectories can shift slightly (the whole-ladder
 consensus feeds belly factors and the boundary bucket carries wing-weighted
 values).
+
+BANKROLL UPDATE TEMPERING (2026-08-10 skew-fix wave item 3). Per-tick Bayes
+factors at 15s cadence can flip a region's weights full range (0.02 <-> 0.98)
+within hours -- far more weight movement than one tick of mid movement can
+justify; the resulting pricer-rich phases post rich bids and inflate Kelly's
+phantom edge, the belly-side co-driver of the 2026-08-10 skew-explosion
+incident (temp/mm_skew_fix_plan.md item 3). `MMConfig.bankroll_update_temper`
+(t, default 0.1) tempers each region's per-tick Bayes-factor vector,
+`factors = factors ** t`, applied AFTER the existing non-finite-factor check
+(3.3) -- tempering must never mask that skip -- and BEFORE the weight update,
+for every UNPINNED region (belly always; wing only when
+`wing_pricer_weight_pin` is disabled; the pinned wing skip precedes factor
+computation entirely and is untouched). Factors are non-negative by
+construction (`ladder_to_buckets` clips at 0), so `factor**t` is always real
+and a zero factor stays zero. t=1.0 -- or any non-finite/non-positive/>1
+value, clamped -- is legacy untempered Bayes; 0<t<1 slows learning: t=0.1
+makes a full 0.02<->0.98 flip take ~10x as many ticks (~5-7.5h of consistent
+evidence instead of ~30-45min), clearing the 6h acceptance bar. Tempering
+changes the RATE, not the attractor -- the 0.98/0.02 self-confirmation corner
+is still where the dynamic points; this only bounds the damage rate. The
+skip rules (3.3), floor, normalization, and update_count semantics are all
+unchanged by tempering -- it only shrinks the per-tick step size.
 """
 from __future__ import annotations
 
@@ -244,6 +266,22 @@ def _weight_dict(w_arr: np.ndarray, model_ids: List[str]) -> Dict[str, float]:
     return {mid: float(w_arr[i]) for i, mid in enumerate(model_ids)}
 
 
+def _bankroll_update_temper(config) -> float:
+    """Resolve `MMConfig.bankroll_update_temper`, robustly clamped into
+    (0, 1] (module docstring, "BANKROLL UPDATE TEMPERING"). 1.0 = legacy
+    untempered Bayes. Any garbage value -- missing attribute, non-numeric,
+    non-finite, <= 0, or > 1 -- falls back to 1.0 (legacy) rather than
+    raising or silently misbehaving."""
+    raw = getattr(config, "bankroll_update_temper", 1.0)
+    try:
+        t = float(raw)
+    except (TypeError, ValueError):
+        return 1.0
+    if not np.isfinite(t) or t <= 0.0 or t > 1.0:
+        return 1.0
+    return t
+
+
 def _pinned_weights(model_ids: List[str], pin: float) -> np.ndarray:
     """Deterministic wing weight vector (Fix 1): pricer at `pin`, remainder
     split pro rata across the other models (2-model case: market = 1-pin);
@@ -323,6 +361,9 @@ def compute_fair_value(
     m_ts = market_ts if market_ts is not None else getattr(snapshot, "ts", now)
     floor = float(getattr(config, "bankroll_floor", DEFAULT_BANKROLL_FLOOR))
     belly_band = getattr(config, "belly_band", (0.2, 0.8))
+    # Bayes-factor tempering (2026-08-10 skew-fix wave item 3; module
+    # docstring "BANKROLL UPDATE TEMPERING"). 1.0 = legacy untempered.
+    temper = _bankroll_update_temper(config)
     # Wing pricer weight PIN (Fix 1, 2026-08-08 wing-bleed fix; module
     # docstring). Negative (or out-of-[0,1]) disables -> legacy Bayes.
     pin_raw = float(getattr(config, "wing_pricer_weight_pin", -1.0))
@@ -475,6 +516,17 @@ def compute_fair_value(
                         "region is zero or degenerate)", region,
                     )
                     continue
+                # Tempering runs AFTER the non-finite-factor check (must never
+                # mask that skip) and applies to every UNPINNED region update
+                # reaching this point (belly always; wing only when the pin is
+                # disabled -- the pinned wing `continue` above precedes factor
+                # computation entirely). Factors are non-negative by
+                # construction (`ladder_to_buckets` clips at 0), so
+                # factor**t is always real and a zero factor stays zero;
+                # tempering changes the RATE of the weight update, not the
+                # attractor it converges toward.
+                if temper < 1.0:
+                    factors = factors ** temper
                 w_pre_arr = np.array([weight_dicts_pre[region][mid] for mid in model_ids])
                 updated = w_pre_arr * factors
                 s = updated.sum()

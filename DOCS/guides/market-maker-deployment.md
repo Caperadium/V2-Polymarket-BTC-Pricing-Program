@@ -114,6 +114,24 @@ take a **pre-deploy baseline snapshot** for post-deploy attribution:
 sizes from the `quotes` table, (c) the `bankrolls` table's wing rows.
 Capture the same three after the deploy.
 
+### 2026-08-10 skew-fix wave: knobs and kill switches
+
+Fixes the 2026-08-10 incident (-7.4 realized, 64k Aug-11 ladder): an
+unbounded inventory-skew term pinned the reservation price at the p-clamp
+floor and fire-sold a winning position ~55c under fair. See
+[Market Making 6.3](../concepts/market-making.md#63-the-skew-displacement-cap-2026-08-10)
+for the full mechanism and forensics. Three new `MMConfig` knobs, same
+default-ON deployment story as the wave above: `paper_run_config.json`
+maps to argparse dests only and `paper_runner` constructs `MMConfig` bare,
+so these fields activate at their production defaults on a plain
+pull + restart, no config-file change needed.
+
+| Knob (default) | What it does | Kill switch |
+|------|------|------|
+| `skew_x_cap` (1.0) | Caps the AS/GLFT reservation displacement `skew_x` at this many x-units in `quote_engine.make_quote` (Market Making 6.3) | `<= 0` restores legacy unbounded `skew_x` exactly |
+| `skew_q_headroom_mult` (1.5) | Sizing-side entry cap (`robustness_sizing` Stage 6b, Market Making 8.2): add-side shares capped at `skew_q_headroom_mult * skew_x_cap / unit_skew_x` | raise to loosen; the stage is already inert whenever `skew_x_cap <= 0` |
+| `bankroll_update_temper` (0.1) | Tempers each region's per-tick Bayes factor (`factors ** t`) before the bankroll weight update in `fair_value_anchor.compute_fair_value` (Market Making 4.7) | `1.0` restores legacy (untempered) Bayes speed |
+
 ## Checking status
 
 ```bash
@@ -314,3 +332,31 @@ snapshot from the install section:
   rows show pricer == 0.5, flat -- the pin overwrites the stale stored
   weights on the first clean tick.
 - `stranded_markets` stays 0; no STALLED / CRASHED alerts.
+
+## Skew-fix wave: post-deploy watch (2026-08-10)
+
+Watch 2-4 days after deploying the wave, against a pre-deploy baseline
+snapshot of the `quotes` and `bankrolls` tables:
+
+- **Displacement invariant.** Journaled `|skew_x| <= skew_x_cap` on every
+  `quotes` row -- with the cap on, this must hold exactly (Market Making
+  6.3's re-derivation step makes it so). A violation means the cap is not
+  actually wired for that call site.
+- **Consensus-vs-skew divergence.** Reconstruct `x_fair = r_x - skew_x` per
+  quoted row and compare it against `logit(mid)` from `mid_log`. Divergence
+  beyond roughly 1.5 x-units flags a **consensus** fault (fair-value
+  anchor, staleness, a bad snapshot) -- not a skew fault; the cap only
+  bounds displacement, it says nothing about whether `x_fair` itself is
+  reasonable.
+- **No fire-sale fills.** No fill should land more than about 2
+  half-spreads through the prevailing `mid_log` mid. This is the direct
+  regression check for the incident pattern (asks 0.14-0.23 into a 0.71
+  market).
+- **Belly bankroll flip rate.** No belly region 0.02 <-> 0.98 full flip
+  inside less than 6 hours. This is a **rate** criterion, not a ceiling --
+  the 0.98/0.02 corner is still the attractor (Market Making 4.7); the
+  temper only slows the approach.
+- **Position bound.** Per-market `|q|` stays under roughly 1.5x the
+  clamp-bind quantity (`skew_q_headroom_mult`'s own bound) -- a
+  sustained excess means Stage 6b (Market Making 8.2) is not binding where
+  expected, e.g. `unit_skew_x` not threaded for that market.

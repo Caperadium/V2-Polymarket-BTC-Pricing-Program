@@ -146,7 +146,7 @@ def test_enums_complete():
         "FEED_STALE", "PRICER_STALE", "LIQ_DEGENERATE", "MANUAL",
     }
     assert {m.name for m in c.SizingCap} == {
-        "LADDER_JOINT", "RUIN", "BANKROLL", "INVENTORY", "DEPTH", "FRACTIONAL_C",
+        "LADDER_JOINT", "RUIN", "BANKROLL", "INVENTORY", "SKEW", "DEPTH", "FRACTIONAL_C",
     }
     assert {m.name for m in c.LiquidityRegime} == {"THICK", "NORMAL", "THIN", "DEGENERATE"}
 

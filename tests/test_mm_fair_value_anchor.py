@@ -95,11 +95,17 @@ def _mids(strikes, p_list):
 
 
 CFG = MMConfig()
-# Legacy (pre-Fix-1) behavior: negative pin disables the wing pricer weight
-# pin, restoring the wing region's own Bayes updates. Tests whose PURPOSE is
-# the legacy wing Bayes dynamics (region attribution, floor, skip rules, ...)
-# run with this config; tests of the production path use CFG (pin = 0.5).
-LEGACY_CFG = MMConfig(wing_pricer_weight_pin=-1.0)
+# Legacy (pre-Fix-1, pre-item-3) behavior: negative pin disables the wing
+# pricer weight pin, restoring the wing region's own Bayes updates; temper=1.0
+# disables Bayes-factor tempering (2026-08-10 skew-fix wave item 3), restoring
+# the untempered per-tick step size. Tests whose PURPOSE is the legacy Bayes
+# dynamics (region attribution, floor, skip rules, ...) run with this config
+# -- MMConfig's own default (0.1) would otherwise make every such test move
+# ~10x slower per tick and silently invalidate any magnitude assertion
+# calibrated to the untempered math; tests of the production path use CFG
+# (pin = 0.5, temper = 0.1). See the "Bankroll update tempering" section below
+# for tests whose PURPOSE is the temper mechanism itself.
+LEGACY_CFG = MMConfig(wing_pricer_weight_pin=-1.0, bankroll_update_temper=1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -924,3 +930,265 @@ def test_pin_credibility_reporting_scalar_strike_weighted():
     # Scalar = strike-count-weighted average USING the pin for wing.
     assert res.fair_value.credibility == pytest.approx(
         (3 * 0.7 + 2 * 0.5) / 5, abs=1e-9)
+
+
+# ===========================================================================
+# Item 3 (2026-08-10 skew-fix wave): bankroll update tempering
+# ===========================================================================
+#
+# MMConfig.bankroll_update_temper (default 0.1) tempers each region's
+# per-tick Bayes-factor vector (factors = factors ** t) after the existing
+# non-finite-factor check (3.3) and before the weight update, for every
+# UNPINNED region reaching that point. temper=1.0 (or any clamped-to-1.0
+# garbage value) is a true no-op -- see fair_value_anchor._bankroll_update_
+# temper and the module docstring "BANKROLL UPDATE TEMPERING" section.
+#
+# All tests below use wing_pricer_weight_pin=-1.0 (pin disabled) so tempering
+# is actually exercised on BOTH regions' own Bayes math, unless a test's
+# purpose is specifically the pin/temper interaction.
+
+
+def _temper_ladder():
+    """5-strike ladder spanning both regions (belly-classified interior,
+    wing-classified extremes via the tail-bucket rule), monotone throughout
+    so sanitized == raw and no cummin/band-clamp step engages."""
+    strikes = [1.0, 2.0, 3.0, 4.0, 5.0]
+    pricer = [0.95, 0.75, 0.55, 0.35, 0.15]
+    market0 = [0.6, 0.55, 0.5, 0.45, 0.4]
+    market1 = [0.75, 0.65, 0.53, 0.42, 0.32]  # drifts toward pricer on every strike
+    return strikes, pricer, market0, market1
+
+
+def _run_two_ticks(temper, pin=-1.0, start=(0.5, 0.5)):
+    strikes, pricer, market0, market1 = _temper_ladder()
+    cfg = MMConfig(wing_pricer_weight_pin=pin, bankroll_update_temper=temper)
+    states = _states(*start)
+    r1 = compute_fair_value(_snapshot(strikes, pricer), _mids(strikes, market0), states, cfg)
+    r2 = compute_fair_value(
+        _snapshot(strikes, pricer), _mids(strikes, market1), r1.bankroll_states, cfg,
+        prev_forecasts=r1.forecasts, prev_consensus=r1.consensus_bucket,
+    )
+    return r1, r2
+
+
+def test_temper_one_is_a_true_noop_vs_temper_disabled():
+    # temper=1.0 read from the config field must be indistinguishable from a
+    # world where tempering does not run at all (monkeypatch the resolver to
+    # unconditionally report 1.0, ignoring whatever the config says) -- this
+    # proves the factors**t step is genuinely skipped for temper=1.0, not
+    # merely numerically close (factors**1.0 == factors exactly, but the
+    # implementation short-circuits on `if temper < 1.0` so 1.0 never even
+    # reaches the ** operator).
+    import market_maker.fair_value_anchor as fva_mod
+
+    _, r2_field = _run_two_ticks(1.0)
+
+    class _NoTemperPatch:
+        def __enter__(self):
+            self._orig = fva_mod._bankroll_update_temper
+            fva_mod._bankroll_update_temper = lambda config: 1.0
+            return self
+
+        def __exit__(self, *a):
+            fva_mod._bankroll_update_temper = self._orig
+
+    with _NoTemperPatch():
+        _, r2_patched = _run_two_ticks(0.1)  # config says 0.1; resolver forced to 1.0
+
+    for region in (BELLY_REGION, WING_REGION):
+        assert r2_field.bankroll_states[region].bankrolls == pytest.approx(
+            r2_patched.bankroll_states[region].bankrolls, abs=0.0)
+
+
+def test_garbage_temper_clamps_to_legacy_unit_level():
+    assert fva._bankroll_update_temper(MMConfig(bankroll_update_temper=0.0)) == 1.0
+    assert fva._bankroll_update_temper(MMConfig(bankroll_update_temper=-1.0)) == 1.0
+    assert fva._bankroll_update_temper(MMConfig(bankroll_update_temper=float("nan"))) == 1.0
+    assert fva._bankroll_update_temper(MMConfig(bankroll_update_temper=1.5)) == 1.0
+
+    class _StrTemper:
+        bankroll_update_temper = "x"
+
+    assert fva._bankroll_update_temper(_StrTemper()) == 1.0
+
+    class _NoTemperAttr:
+        pass
+
+    assert fva._bankroll_update_temper(_NoTemperAttr()) == 1.0
+    # Valid values pass through unchanged.
+    assert fva._bankroll_update_temper(MMConfig(bankroll_update_temper=0.1)) == pytest.approx(0.1)
+    assert fva._bankroll_update_temper(MMConfig(bankroll_update_temper=1.0)) == 1.0
+
+
+def test_garbage_temper_integration_matches_untempered():
+    baseline_r1, baseline_r2 = _run_two_ticks(1.0)
+    for garbage in (0.0, -5.0, float("nan"), 2.0):
+        _, candidate_r2 = _run_two_ticks(garbage)
+        for region in (BELLY_REGION, WING_REGION):
+            assert candidate_r2.bankroll_states[region].bankrolls == pytest.approx(
+                baseline_r2.bankroll_states[region].bankrolls, abs=1e-12)
+
+
+def test_temper_slows_learning_same_direction_smaller_step():
+    # Each region's own direction (which model gains credibility) is a
+    # function of the bucket-mass dynamics, not a global "pricer always
+    # wins" rule -- belly and wing can (and here do) move opposite ways.
+    # The temper guarantee is PER REGION: same sign of movement, smaller
+    # magnitude -- not that both regions move the same way as each other.
+    _, untempered = _run_two_ticks(1.0)
+    _, tempered = _run_two_ticks(0.1)
+    for region in (BELLY_REGION, WING_REGION):
+        d_un = untempered.bankroll_states[region].bankrolls["pricer"] - 0.5
+        d_te = tempered.bankroll_states[region].bankrolls["pricer"] - 0.5
+        # same direction relative to the 0.5 start ...
+        assert d_un * d_te > 0
+        # ...but a strictly smaller step under tempering.
+        assert abs(d_te) < abs(d_un)
+
+
+def test_temper_default_config_value_matches_explicit_point_one():
+    # MMConfig()'s default (0.1) must actually be threaded through -- not
+    # just the explicit-field path.
+    strikes, pricer, market0, market1 = _temper_ladder()
+    cfg_default = MMConfig(wing_pricer_weight_pin=-1.0)  # temper defaults to 0.1
+    cfg_explicit = MMConfig(wing_pricer_weight_pin=-1.0, bankroll_update_temper=0.1)
+    assert cfg_default.bankroll_update_temper == pytest.approx(0.1)
+
+    states_a = _states(0.5, 0.5)
+    r1a = compute_fair_value(_snapshot(strikes, pricer), _mids(strikes, market0), states_a, cfg_default)
+    r2a = compute_fair_value(
+        _snapshot(strikes, pricer), _mids(strikes, market1), r1a.bankroll_states, cfg_default,
+        prev_forecasts=r1a.forecasts, prev_consensus=r1a.consensus_bucket,
+    )
+    states_b = _states(0.5, 0.5)
+    r1b = compute_fair_value(_snapshot(strikes, pricer), _mids(strikes, market0), states_b, cfg_explicit)
+    r2b = compute_fair_value(
+        _snapshot(strikes, pricer), _mids(strikes, market1), r1b.bankroll_states, cfg_explicit,
+        prev_forecasts=r1b.forecasts, prev_consensus=r1b.consensus_bucket,
+    )
+    for region in (BELLY_REGION, WING_REGION):
+        assert r2a.bankroll_states[region].bankrolls == pytest.approx(
+            r2b.bankroll_states[region].bankrolls, abs=1e-15)
+
+
+def test_floor_enforced_under_temper():
+    # Same scenario/shape as test_bankroll_floor_holds, but with tempering
+    # explicitly enabled (t=0.1) and 10x the ticks (matching the documented
+    # ~10x slower full-range convergence) -- the floor clip in `_apply_floor`
+    # is unconditional on every update, so it must never be violated at any
+    # tick along the way, AND it must still be reachable given enough ticks
+    # (tempering slows the approach, it does not disable the floor).
+    strikes = [1.0, 2.0, 3.0]
+    pricer = np.array([0.8, 0.5, 0.2])
+    market0 = np.array([0.55, 0.5, 0.45])
+    T = 600
+    cfg = MMConfig(wing_pricer_weight_pin=-1.0, bankroll_update_temper=0.1)
+    states = _states(0.5, 0.5)
+    prev_fc = None
+    prev_cons = None
+    for t in range(T):
+        frac = min(t / 100.0, 1.0)  # informative window scaled 10x vs the untempered test
+        market_t = market0 + frac * (pricer - market0)
+        res = compute_fair_value(
+            _snapshot(strikes, pricer), _mids(strikes, market_t), states, cfg,
+            prev_forecasts=prev_fc, prev_consensus=prev_cons,
+        )
+        states = res.bankroll_states
+        prev_fc = res.forecasts
+        prev_cons = res.consensus_bucket
+        for region in (BELLY_REGION, WING_REGION):
+            assert states[region].bankrolls["market"] >= DEFAULT_BANKROLL_FLOOR - 1e-9
+            assert states[region].bankrolls["pricer"] <= 1.0 - DEFAULT_BANKROLL_FLOOR + 1e-9
+    # Which model ends up at the floor is a function of the bucket-mass
+    # dynamics per region (belly and wing can converge to OPPOSITE corners --
+    # see test_temper_slows_learning_same_direction_smaller_step); the
+    # direction-agnostic invariant is that the LOSING model in each region
+    # has been driven all the way down to the floor by the end of this long
+    # a run, proving tempering slows but does not prevent reaching it.
+    for region in (BELLY_REGION, WING_REGION):
+        assert min(states[region].bankrolls.values()) == pytest.approx(
+            DEFAULT_BANKROLL_FLOOR, abs=1e-6)
+
+
+def test_skip_paths_unchanged_under_temper_empty_region():
+    # Empty-region skip (3.3): all-wing ladder -> belly owns zero buckets and
+    # must skip cleanly (unchanged weights/update_count), identically whether
+    # tempering is on or off (the skip `continue` precedes the temper line).
+    strikes = [1.0, 2.0, 3.0]
+    pricer = [0.97, 0.92, 0.83]
+    market0 = [0.95, 0.90, 0.85]
+    cfg = MMConfig(wing_pricer_weight_pin=-1.0, bankroll_update_temper=0.1)
+    states = _states(0.5, 0.5)
+    snap = _snapshot(strikes, pricer)
+
+    res1 = compute_fair_value(snap, _mids(strikes, market0), states, cfg)
+    belly_before = dict(res1.bankroll_states[BELLY_REGION].bankrolls)
+    belly_uc_before = res1.bankroll_states[BELLY_REGION].update_count
+    wing_uc_before = res1.bankroll_states[WING_REGION].update_count
+
+    market1 = [0.96, 0.94, 0.90]
+    res2 = compute_fair_value(
+        snap, _mids(strikes, market1), res1.bankroll_states, cfg,
+        prev_forecasts=res1.forecasts, prev_consensus=res1.consensus_bucket,
+    )
+    assert res2.bankroll_states[BELLY_REGION].bankrolls == pytest.approx(belly_before)
+    assert res2.bankroll_states[BELLY_REGION].update_count == belly_uc_before
+    assert res2.bankroll_states[BELLY_REGION].frozen is False
+    assert res2.bankroll_states[WING_REGION].frozen is False
+    # Wing (non-empty) DID update -- count advanced under tempering too.
+    assert res2.bankroll_states[WING_REGION].update_count == wing_uc_before + 1
+
+
+def test_skip_paths_unchanged_under_temper_degenerate_factor():
+    # Degenerate-factor skip (3.3): same construction as
+    # test_degenerate_factor_skip_wing_belly_still_updates, with tempering
+    # explicitly enabled -- wing's s_R == 0 skip and belly's normal update
+    # must both behave identically to the untempered case.
+    strikes = [1.0, 2.0, 3.0]
+    pricer = [1.0, 0.6, 0.0]
+    market0 = [0.75, 0.6, 0.25]  # all belly-classified
+    cfg = MMConfig(wing_pricer_weight_pin=-1.0, bankroll_update_temper=0.1)
+    states = {
+        BELLY_REGION: _bankrolls(1.0, 0.0),
+        WING_REGION: _bankrolls(0.5, 0.5),
+    }
+    snap = _snapshot(strikes, pricer)
+
+    res1 = compute_fair_value(snap, _mids(strikes, market0), states, cfg)
+    wing_before = dict(res1.bankroll_states[WING_REGION].bankrolls)
+    wing_uc_before = res1.bankroll_states[WING_REGION].update_count
+    belly_uc_before = res1.bankroll_states[BELLY_REGION].update_count
+
+    market1 = [0.7, 0.55, 0.3]
+    res2 = compute_fair_value(
+        snap, _mids(strikes, market1), res1.bankroll_states, cfg,
+        prev_forecasts=res1.forecasts, prev_consensus=res1.consensus_bucket,
+    )
+    assert res2.bankroll_states[WING_REGION].bankrolls == pytest.approx(wing_before)
+    assert res2.bankroll_states[WING_REGION].update_count == wing_uc_before  # still skipped
+    assert res2.bankroll_states[WING_REGION].frozen is False
+    assert res2.bankroll_states[BELLY_REGION].update_count == belly_uc_before + 1  # still updates
+    assert res2.bankroll_states[BELLY_REGION].frozen is False
+
+
+def test_pinned_wing_unaffected_by_temper():
+    # Wing pin (Fix 1) + tempering both default-on together (production
+    # config shape): the pinned wing `continue` precedes factor computation
+    # entirely, so tempering never gets a chance to touch it.
+    strikes, pricer, market = _mixed_region_inputs()
+    cfg = MMConfig(wing_pricer_weight_pin=0.5, bankroll_update_temper=0.1)
+    res1 = compute_fair_value(_snapshot(strikes, pricer), _mids(strikes, market), _pin_states(), cfg)
+    assert res1.bankroll_states[WING_REGION].bankrolls == pytest.approx(
+        {"pricer": 0.5, "market": 0.5})
+
+    market2 = [0.91, 0.68, 0.52, 0.31, 0.11]
+    res2 = compute_fair_value(
+        _snapshot(strikes, pricer), _mids(strikes, market2), res1.bankroll_states, cfg,
+        prev_forecasts=res1.forecasts, prev_consensus=res1.consensus_bucket,
+    )
+    assert res2.bankroll_states[WING_REGION].bankrolls == pytest.approx(
+        {"pricer": 0.5, "market": 0.5})
+    assert res2.bankroll_states[WING_REGION].update_count == res1.bankroll_states[WING_REGION].update_count
+    # Belly (unpinned) did move under tempering -- contrast to prove temper
+    # is actually wired for the region that isn't pin-shielded.
+    assert res2.bankroll_states[BELLY_REGION].update_count == res1.bankroll_states[BELLY_REGION].update_count + 1

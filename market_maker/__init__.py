@@ -64,6 +64,7 @@ from market_maker.quote_engine import (
     glft_side_deltas,
     make_quote,
     make_quote_from_config,
+    per_share_skew_x,
 )
 from market_maker.fair_value_anchor import (
     AnchorResult,
@@ -167,6 +168,7 @@ __all__ = [
     "make_quote_from_config",
     "glft_side_deltas",
     "estimate_sigma_b",
+    "per_share_skew_x",
     # fair-value anchor
     "compute_fair_value",
     "AnchorResult",

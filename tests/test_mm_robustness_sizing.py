@@ -1099,3 +1099,262 @@ def test_gate_arm5_slow_toxic_attempted_above_min():
                           mk_slow_avg=-0.02, mk_slow_n=25)
     assert gate is False
     assert bid == 0.0
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-10 skew-fix wave item 2 (temp/mm_skew_fix_plan.md): Stage 6b
+# skew-aware entry cap. unit_skew_x is the per-share reservation shift
+# (ContractSizingInput additive field, 0.0 = unwired/disabled); the stage
+# caps q_skew_max = skew_q_headroom_mult * config.skew_x_cap / unit_skew_x on
+# the side that GROWS |q| (bid when q>=0, ask when q<0).
+# ---------------------------------------------------------------------------
+
+
+def _skew_cfg(**overrides):
+    kwargs = dict(presence_frac=0.0, fractional_kelly_c=1.0,
+                  skew_x_cap=1.0, skew_q_headroom_mult=1.5)
+    kwargs.update(overrides)
+    return MMConfig(**kwargs)
+
+
+def test_skew_cap_binds_add_side_only_long_q():
+    # Incident numbers: unit_skew_x=0.65, mult=1.5, cap=1.0 -> q_skew_max ~
+    # 2.31 shares. q=10 (long, well past q_skew_max) -> the bid/YES leg (the
+    # ADD side for q>0) is driven all the way to ZERO (max(0, 2.31-10)),
+    # while the ask/NO leg (the REDUCE side) keeps a strictly positive bound
+    # (q_skew_max + q = 12.31) -- the formula's own asymmetry, no
+    # reduce-side special-case needed.
+    cfg = _skew_cfg()
+    c = ContractSizingInput(
+        "m0", p_hat=0.5, bid_price=0.3, ask_price=0.7, strike=100000.0,
+        unit_skew_x=0.65,
+    )
+    inv = _inv({"m0": (10.0, 1_000_000.0)})
+    dec, audit = size_ladder(
+        [c], _snap(0.0), bankroll=1_000_000.0, ts=TS, config=cfg,
+        per_expiry_cap_frac=0.9, bankroll_util_cap=0.9, inventory=inv,
+    )
+    q_skew_max = 1.5 * 1.0 / 0.65
+    d = dec["m0"]
+    assert d.bid_size == 0.0
+    assert abs(d.ask_size - (q_skew_max + 10.0)) < 1e-6
+    assert SizingCap.SKEW in d.caps_applied
+    skew_stage = next(s for s in audit["stages"] if s["stage"] == "skew_entry_cap")
+    bid_entry = next(e for e in skew_stage["legs"] if e["is_yes"])
+    ask_entry = next(e for e in skew_stage["legs"] if not e["is_yes"])
+    assert abs(bid_entry["bound"] - 0.0) < 1e-9
+    assert abs(ask_entry["bound"] - (q_skew_max + 10.0)) < 1e-6
+
+
+def test_skew_cap_binds_add_side_only_short_q():
+    # Symmetric: q=-10 (net short YES / long NO) -> the ask/NO leg is the
+    # ADD side (driven to 0) and the bid/YES leg is the REDUCE side (bound
+    # q_skew_max + |q| = 12.31, strictly positive).
+    cfg = _skew_cfg()
+    c = ContractSizingInput(
+        "m0", p_hat=0.5, bid_price=0.3, ask_price=0.7, strike=100000.0,
+        unit_skew_x=0.65,
+    )
+    inv = _inv({"m0": (-10.0, 1_000_000.0)})
+    dec, audit = size_ladder(
+        [c], _snap(0.0), bankroll=1_000_000.0, ts=TS, config=cfg,
+        per_expiry_cap_frac=0.9, bankroll_util_cap=0.9, inventory=inv,
+    )
+    q_skew_max = 1.5 * 1.0 / 0.65
+    d = dec["m0"]
+    assert d.ask_size == 0.0
+    assert abs(d.bid_size - (q_skew_max + 10.0)) < 1e-6
+    assert SizingCap.SKEW in d.caps_applied
+
+
+def test_skew_cap_arithmetic_incident_numbers():
+    # q=0 (no existing position): bound == q_skew_max exactly == 1.5*1.0/0.65
+    # ~= 2.3077 shares -- the incident replay number from the plan (13-17
+    # share bids collapse to ~2.3 shares in that regime).
+    cfg = _skew_cfg()
+    c = ContractSizingInput(
+        "m0", p_hat=0.99, bid_price=0.5, ask_price=0.5, strike=100000.0,
+        unit_skew_x=0.65,
+    )
+    inv = _inv({"m0": (0.0, 1_000_000.0)})
+    dec, audit = size_ladder(
+        [c], _snap(0.0), bankroll=1_000_000.0, ts=TS, config=cfg,
+        per_expiry_cap_frac=0.9, bankroll_util_cap=0.9, inventory=inv,
+    )
+    expected = 1.5 * 1.0 / 0.65
+    assert abs(expected - 2.3077) < 1e-3  # sanity: matches the plan's stated ~2.3
+    assert abs(dec["m0"].bid_size - expected) < 1e-6
+    skew_stage = next(s for s in audit["stages"] if s["stage"] == "skew_entry_cap")
+    bid_entry = next(e for e in skew_stage["legs"] if e["is_yes"])
+    assert abs(bid_entry["q_skew_max"] - expected) < 1e-9
+
+
+def test_skew_cap_arithmetic_calm_numbers():
+    # Calm regime: gamma=0.1 (MMConfig default), sigma_b=0.9, tte=1.08 ->
+    # unit_skew_x ~= 0.0875 (the plan's "~0.088") -> q_skew_max ~= 17 shares
+    # -- no over-throttle in normal conditions. Uses quote_engine's own
+    # helper to derive unit_skew_x so the test's expected value is defined by
+    # the SAME formula the harness threads (cross-module agreement, not a
+    # hardcoded duplicate).
+    from market_maker.quote_engine import per_share_skew_x
+
+    cfg = _skew_cfg(gamma=0.1)
+    unit_skew = per_share_skew_x("dalen", 0.9, cfg.gamma, cfg.k_arrival, cfg.arrival_scale_A, 1.08)
+    assert abs(unit_skew - 0.0875) < 1e-3
+    c = ContractSizingInput(
+        "m0", p_hat=0.99, bid_price=0.5, ask_price=0.5, strike=100000.0,
+        unit_skew_x=unit_skew,
+    )
+    inv = _inv({"m0": (0.0, 1_000_000.0)})
+    dec, audit = size_ladder(
+        [c], _snap(0.0), bankroll=1_000_000.0, ts=TS, config=cfg,
+        per_expiry_cap_frac=0.9, bankroll_util_cap=0.9, inventory=inv,
+    )
+    expected = 1.5 * 1.0 / unit_skew
+    assert abs(expected - 17.0) < 1.0  # sanity: matches the plan's stated ~17
+    assert abs(dec["m0"].bid_size - expected) < 1e-6
+
+
+def test_skew_cap_inert_when_unit_skew_x_zero():
+    # unit_skew_x defaults to 0.0 (unwired) -> Stage 6b is inert for this
+    # leg even though config.skew_x_cap is ON (default 1.0): max_add_yes/no
+    # keep exactly the Stage-6 inventory-headroom values, and SizingCap.SKEW
+    # never appears.
+    cfg = _skew_cfg()
+    c = ContractSizingInput("m0", p_hat=0.9, bid_price=0.5, ask_price=0.5, strike=100000.0)
+    inv = _inv({"m0": (3.0, 5.0)})  # q=3, q_max=5 -> headroom_bid=2, headroom_ask=8
+    dec, audit = size_ladder(
+        [c], _snap(0.0), bankroll=100000.0, ts=TS, config=cfg,
+        per_expiry_cap_frac=0.9, bankroll_util_cap=0.9, inventory=inv,
+    )
+    d = dec["m0"]
+    assert d.max_add_yes == 2.0
+    assert d.max_add_no == 8.0
+    assert SizingCap.SKEW not in d.caps_applied
+    skew_stage = next(s for s in audit["stages"] if s["stage"] == "skew_entry_cap")
+    assert skew_stage["legs"] == []
+
+
+def test_skew_cap_inert_when_config_kill_switch_disabled():
+    # config.skew_x_cap <= 0 is the paired kill switch (mirrors the
+    # quote-engine clamp's own <= 0 disable) -- stage inert regardless of a
+    # nonzero per-contract unit_skew_x. bid_size reflects ONLY the Stage-6
+    # inventory headroom (990), not the (would-be) skew bound (~2.3).
+    cfg = _skew_cfg(skew_x_cap=0.0)
+    c = ContractSizingInput(
+        "m0", p_hat=0.99, bid_price=0.5, ask_price=0.5, strike=100000.0,
+        unit_skew_x=0.65,
+    )
+    inv = _inv({"m0": (10.0, 1000.0)})  # headroom_bid = 990
+    dec, audit = size_ladder(
+        [c], _snap(0.0), bankroll=1_000_000.0, ts=TS, config=cfg,
+        per_expiry_cap_frac=0.9, bankroll_util_cap=0.9, inventory=inv,
+    )
+    d = dec["m0"]
+    assert SizingCap.SKEW not in d.caps_applied
+    assert SizingCap.INVENTORY in d.caps_applied
+    assert abs(d.bid_size - 990.0) < 1e-3
+    skew_stage = next(s for s in audit["stages"] if s["stage"] == "skew_entry_cap")
+    assert skew_stage["legs"] == []
+    assert skew_stage["skew_x_cap"] == 0.0
+
+
+def test_skew_cap_registered_in_journal_when_binding():
+    # Direct proof of _CAP_ORDER registration: caps_applied filters through
+    # _CAP_ORDER, so an unregistered SizingCap member would silently vanish
+    # from every journal row even when the stage binds (see the module
+    # docstring / plan round-1 minor 5). Re-uses the incident scenario, where
+    # the skew cap unambiguously binds.
+    cfg = _skew_cfg()
+    c = ContractSizingInput(
+        "m0", p_hat=0.99, bid_price=0.5, ask_price=0.5, strike=100000.0,
+        unit_skew_x=0.65,
+    )
+    inv = _inv({"m0": (0.0, 1_000_000.0)})
+    dec, _audit = size_ladder(
+        [c], _snap(0.0), bankroll=1_000_000.0, ts=TS, config=cfg,
+        per_expiry_cap_frac=0.9, bankroll_util_cap=0.9, inventory=inv,
+    )
+    assert SizingCap.SKEW in dec["m0"].caps_applied
+
+
+def test_skew_cap_interplay_inventory_headroom_wins_when_tighter():
+    # Inventory headroom (0.5) is TIGHTER than the skew bound (~2.31 at q=0)
+    # -> final size is the headroom value; SKEW is not tagged (Stage 6b sees
+    # shares already at/below its own bound and does not re-clip).
+    cfg = _skew_cfg()
+    c = ContractSizingInput(
+        "m0", p_hat=0.99, bid_price=0.5, ask_price=0.5, strike=100000.0,
+        unit_skew_x=0.65,
+    )
+    inv = _inv({"m0": (0.0, 0.5)})  # q_max=0.5 -> headroom_bid=0.5, tighter than ~2.31
+    dec, _audit = size_ladder(
+        [c], _snap(0.0), bankroll=1_000_000.0, ts=TS, config=cfg,
+        per_expiry_cap_frac=0.9, bankroll_util_cap=0.9, inventory=inv,
+    )
+    d = dec["m0"]
+    assert abs(d.bid_size - 0.5) < 1e-9
+    assert SizingCap.INVENTORY in d.caps_applied
+    assert SizingCap.SKEW not in d.caps_applied
+
+
+def test_skew_cap_interplay_skew_wins_when_tighter():
+    # Inventory headroom (1000, from q_max=1000) is LOOSER than both the raw
+    # Kelly demand pre-Stage-6 (~29.7 shares at this bankroll) and the skew
+    # bound (~2.31 at q=0) -> INVENTORY does not bind (nothing to clip at
+    # 1000), SKEW does, and the final size is the skew bound.
+    cfg = _skew_cfg()
+    c = ContractSizingInput(
+        "m0", p_hat=0.99, bid_price=0.5, ask_price=0.5, strike=100000.0,
+        unit_skew_x=0.65,
+    )
+    inv = _inv({"m0": (0.0, 1000.0)})
+    dec, _audit = size_ladder(
+        [c], _snap(0.0), bankroll=100.0, ts=TS, config=cfg,
+        per_expiry_cap_frac=0.9, bankroll_util_cap=0.9, inventory=inv,
+    )
+    d = dec["m0"]
+    expected = 1.5 * 1.0 / 0.65
+    assert abs(d.bid_size - expected) < 1e-6
+    assert SizingCap.SKEW in d.caps_applied
+    assert SizingCap.INVENTORY not in d.caps_applied
+
+
+def test_skew_cap_no_floor_back_below_venue_min():
+    # A large per-share displacement makes q_skew_max (0.15) fall below
+    # config.depth_cap_floor_shares (1.0 default) -- Stage 6b does NOT floor
+    # back up (it is a risk cap, not a presence mechanism): the leg stays at
+    # 0.15, i.e. below the venue-min proxy, and would become a no-quote via
+    # the existing order_lifecycle min-size rule (not exercised here).
+    cfg = _skew_cfg()
+    c = ContractSizingInput(
+        "m0", p_hat=0.99, bid_price=0.5, ask_price=0.5, strike=100000.0,
+        unit_skew_x=10.0,
+    )
+    inv = _inv({"m0": (0.0, 1_000_000.0)})
+    dec, _audit = size_ladder(
+        [c], _snap(0.0), bankroll=1_000_000.0, ts=TS, config=cfg,
+        per_expiry_cap_frac=0.9, bankroll_util_cap=0.9, inventory=inv,
+    )
+    q_skew_max = 1.5 * 1.0 / 10.0
+    d = dec["m0"]
+    assert q_skew_max < MMConfig().depth_cap_floor_shares
+    assert abs(d.bid_size - q_skew_max) < 1e-9
+    assert SizingCap.SKEW in d.caps_applied
+
+
+def test_skew_cap_inert_when_inventory_not_passed():
+    # No InventoryState at all -> Stage 6b cannot resolve q, so it is inert
+    # (same discipline as Stage 6): unbounded except by the other caps.
+    cfg = _skew_cfg()
+    c = ContractSizingInput(
+        "m0", p_hat=0.9, bid_price=0.5, ask_price=0.55, strike=100000.0,
+        unit_skew_x=0.65,
+    )
+    dec, audit = size_ladder(
+        [c], _snap(0.0), bankroll=1000.0, ts=TS, config=cfg,
+        per_expiry_cap_frac=0.9, bankroll_util_cap=0.9,
+    )
+    assert SizingCap.SKEW not in dec["m0"].caps_applied
+    skew_stage = next(s for s in audit["stages"] if s["stage"] == "skew_entry_cap")
+    assert skew_stage["legs"] == []

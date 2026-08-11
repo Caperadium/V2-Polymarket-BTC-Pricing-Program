@@ -526,6 +526,125 @@ def test_harness_wires_inventory_and_posted_prices_and_strike_into_size_ladder(s
         assert c.ask_price == pytest.approx(qs.ask_price)
 
 
+# ---------------------------------------------------------------------------
+# 2026-08-10 skew-fix wave item 2 (temp/mm_skew_fix_plan.md): the harness
+# threads ContractSizingInput.unit_skew_x via quote_engine.per_share_skew_x,
+# using the SAME sigma_b the tick's QuoteProposal carries -- the sizing cap
+# and the quote-engine skew_x_cap clamp must agree on the bind point.
+# ---------------------------------------------------------------------------
+
+
+def test_harness_threads_unit_skew_x_matching_proposal_sigma_b_dalen(store):
+    from market_maker.quote_engine import per_share_skew_x
+    import market_maker.harness as harness_mod
+
+    cfg = MMConfig(gamma=0.5, k_arrival=1.0)
+    loop = PaperTradingLoop(
+        store=store, expiry_key=EXPIRY, markets=MARKETS, engine_fn=_engine(),
+        config=cfg, clock=SimClock(START), vol_gate_fn=_vol_gate(),
+    )
+    assert loop.quote_variant == "dalen"
+
+    captured = {}
+    orig_size_ladder = harness_mod.size_ladder
+
+    def spy(*args, **kwargs):
+        captured["contracts"] = args[0]
+        return orig_size_ladder(*args, **kwargs)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(harness_mod, "size_ladder", spy)
+        loop.tick({m: _snapshot_msg(0.5) for m, _k in MARKETS})
+
+    contracts = captured.get("contracts")
+    assert contracts, "expected at least one ContractSizingInput"
+    tte = max(loop.last_snapshot.tte_days, 0.0)
+    for c in contracts:
+        prop = loop.last_proposals[c.market_id]
+        expected = per_share_skew_x(
+            loop.quote_variant, prop.sigma_b, cfg.gamma, cfg.k_arrival,
+            cfg.arrival_scale_A, tte,
+        )
+        assert c.unit_skew_x == pytest.approx(expected)
+        assert c.unit_skew_x > 0.0  # sigma_b/gamma/tte all positive here
+
+
+def test_harness_threads_unit_skew_x_matching_proposal_sigma_b_glft(store):
+    from market_maker.quote_engine import per_share_skew_x
+    import market_maker.harness as harness_mod
+
+    cfg = MMConfig(gamma=0.5, k_arrival=1.0, arrival_scale_A=1.0)
+    loop = PaperTradingLoop(
+        store=store, expiry_key=EXPIRY, markets=MARKETS, engine_fn=_engine(),
+        config=cfg, clock=SimClock(START), vol_gate_fn=_vol_gate(),
+        quote_variant="glft",
+    )
+    assert loop.quote_variant == "glft"
+
+    captured = {}
+    orig_size_ladder = harness_mod.size_ladder
+
+    def spy(*args, **kwargs):
+        captured["contracts"] = args[0]
+        return orig_size_ladder(*args, **kwargs)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(harness_mod, "size_ladder", spy)
+        loop.tick({m: _snapshot_msg(0.5) for m, _k in MARKETS})
+
+    contracts = captured.get("contracts")
+    assert contracts, "expected at least one ContractSizingInput"
+    tte = max(loop.last_snapshot.tte_days, 0.0)
+    for c in contracts:
+        prop = loop.last_proposals[c.market_id]
+        expected = per_share_skew_x(
+            loop.quote_variant, prop.sigma_b, cfg.gamma, cfg.k_arrival,
+            cfg.arrival_scale_A, tte,
+        )
+        assert c.unit_skew_x == pytest.approx(expected)
+        assert c.unit_skew_x > 0.0
+        # GLFT's per-share skew has no tte term (module docstring) -- prove
+        # the harness is NOT silently using the dalen formula for this leg.
+        dalen_value = cfg.gamma * (prop.sigma_b ** 2) * tte
+        assert c.unit_skew_x != pytest.approx(dalen_value)
+
+
+def test_harness_calls_per_share_skew_x_with_expected_args(store):
+    """Call-args proof (plan: 'a unit test on the helper call args via
+    monkeypatch'): the harness calls the SHARED quote_engine.per_share_skew_x
+    helper -- not an inline reimplementation -- with the tick's variant,
+    per-market sigma_b (matching the QuoteProposal), and config's
+    gamma/k_arrival/arrival_scale_A/tte."""
+    import market_maker.harness as harness_mod
+
+    cfg = MMConfig(gamma=0.5, k_arrival=1.0, arrival_scale_A=1.0)
+    loop = PaperTradingLoop(
+        store=store, expiry_key=EXPIRY, markets=MARKETS, engine_fn=_engine(),
+        config=cfg, clock=SimClock(START), vol_gate_fn=_vol_gate(),
+    )
+
+    orig = harness_mod.per_share_skew_x
+    calls = []
+
+    def spy(variant, sigma_b, gamma, k, A, tte_days):
+        calls.append((variant, sigma_b, gamma, k, A, tte_days))
+        return orig(variant, sigma_b, gamma, k, A, tte_days)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(harness_mod, "per_share_skew_x", spy)
+        loop.tick({m: _snapshot_msg(0.5) for m, _k in MARKETS})
+
+    assert len(calls) == len(MARKETS)  # once per market, same tick
+    tte = max(loop.last_snapshot.tte_days, 0.0)
+    for (variant, sigma_b, gamma, k, A, tte_days), (m, _k) in zip(calls, loop.markets):
+        assert variant == "dalen"
+        assert sigma_b == pytest.approx(loop.last_proposals[m].sigma_b)
+        assert gamma == cfg.gamma
+        assert k == cfg.k_arrival
+        assert A == cfg.arrival_scale_A
+        assert tte_days == pytest.approx(tte)
+
+
 def test_markout_provider_called_once_per_tick(store):
     calls = {"n": 0}
 

@@ -89,7 +89,11 @@ from market_maker.order_lifecycle import OrderLifecycleManager, PaperVenueAdapte
 from market_maker.paper_fill_sim import PaperFillSimulator
 from market_maker.pnl_report import markout_stats, markout_stats_side, tte_bucket_label
 from market_maker.pricer_adapter import build_snapshot
-from market_maker.quote_engine import estimate_sigma_b, make_quote_from_config
+from market_maker.quote_engine import (
+    estimate_sigma_b,
+    make_quote_from_config,
+    per_share_skew_x,
+)
 from market_maker.risk_controller import InvBreach, RiskController
 from market_maker.robustness_sizing import ContractSizingInput, size_ladder
 from market_maker.settlement_handler import (
@@ -559,6 +563,16 @@ class PaperTradingLoop:
             sigma_b = estimate_sigma_b(
                 hist, sample_dt_days, cfg.sigma_b_floor, cfg.sigma_b_cap
             )
+            # 2026-08-10 skew-fix wave item 2 (temp/mm_skew_fix_plan.md): the
+            # per-share reservation shift this tick's proposal will carry --
+            # SAME code path, SAME sigma_b/gamma/k/A/tte as make_quote_from_config
+            # just below, so robustness_sizing's skew-aware entry cap (Stage 6b)
+            # agrees with the quote engine's skew_x_cap clamp on the exact bind
+            # point, under both variants. Threaded into ContractSizingInput below.
+            unit_skew_x = per_share_skew_x(
+                self.quote_variant, sigma_b, cfg.gamma, cfg.k_arrival,
+                cfg.arrival_scale_A, tte,
+            )
             q = inventory.per_contract[m].q
             prop = make_quote_from_config(
                 cfg, m, float(fv.consensus_x[k]), q, tte, sigma_b, variant=self.quote_variant, ts=now
@@ -727,7 +741,8 @@ class PaperTradingLoop:
                                     bid_price=posted_bid, ask_price=posted_ask,
                                     strike=float(k), mk_avg=mk_avg, mk_var=mk_var,
                                     mk_n=mk_n, mk_n_attempted=mk_n_attempted,
-                                    mk_slow_avg=mk_slow_avg, mk_slow_n=mk_slow_n)
+                                    mk_slow_avg=mk_slow_avg, mk_slow_n=mk_slow_n,
+                                    unit_skew_x=unit_skew_x)
             )
         self.last_proposals = proposals
 

@@ -295,6 +295,49 @@ class MMConfig:
     # and every market latches wing forever.
     sizing_region_hysteresis_p: float = 0.02
 
+    # --- inventory-skew displacement cap (2026-08-10 skew-explosion fix) ---
+    # The AS/GLFT reservation shift skew_x = -q*gamma*sigma_b^2*tte is
+    # UNBOUNDED in q. VPS incident 2026-08-10: a 13.4-share belly fill at
+    # sigma_b 2.46 produced skew_x = -8.8 log-odds -- reservation pinned at
+    # the p_clamp floor (r_x = logit(0.001)) and the bot liquidated a winning
+    # position ~55c under fair (-7.4 realized). Cap the RESERVATION SHIFT at
+    # this many x-units: |skew_x| <= skew_x_cap. 1.0 x-unit shifts p at most
+    # ~0.5 -> 0.73 (less near the extremes) -- still a strong unload lean,
+    # never a fire-sale. <= 0 disables (legacy unbounded).
+    skew_x_cap: float = 1.0
+
+    # --- skew-aware entry cap (2026-08-10 skew-fix wave item 2) ---
+    # With skew_x_cap binding, additional inventory no longer moves the
+    # reservation -- the bot's main inventory-control channel saturates.
+    # robustness_sizing.size_ladder (Agent C follow-up) caps the ADD side so
+    # the position cannot outrun the skew channel's authority: position may
+    # exceed the skew_x_cap clamp-bind quantity by this fraction (some
+    # saturation tolerated; fills are the calibration source and the
+    # venue-min floor must stay reachable). This cap is a RISK cap and is
+    # NOT floored back up to depth_cap_floor_shares (caps dominate floors);
+    # a side capped below venue min is a no-quote via the existing
+    # order_lifecycle min-size rule. Field only here; unwired until Agent C
+    # threads it (0 shares of effect until then).
+    skew_q_headroom_mult: float = 1.5
+
+    # --- bankroll update tempering (2026-08-10 skew-fix wave item 3) ---
+    # Per-tick Bayes factors at 15s cadence flip a region's weights full
+    # range (0.02 <-> 0.98) within hours -- far more weight movement than one
+    # tick of mid movement can justify, and the pricer-rich phases create
+    # the rich bids + phantom Kelly edges behind the 2026-08-10 incident.
+    # Factors are tempered: factor**bankroll_update_temper before the
+    # weight update (1.0 = legacy untampered; 0 < t < 1 slows learning; the
+    # floor/normalization pipeline is unchanged; factors are non-negative by
+    # construction -- ladder_to_buckets clips at 0 -- so factor**t is always
+    # real and a zero factor stays zero). 0.1 makes a full-range flip take
+    # ~10x as many ticks (~5-7.5h of consistent evidence instead of
+    # ~30-45min), clearing the 6h acceptance bar. Tempering changes the
+    # RATE, not the attractor -- the 0.98/0.02 corner is still where the
+    # self-confirmation dynamic points; this bounds the damage rate. Field
+    # only here; unwired until Agent B threads it into fair_value_anchor
+    # (no effect until then).
+    bankroll_update_temper: float = 0.1
+
 
 def in_belly_band(p: float, belly_band: Tuple[float, float]) -> bool:
     """Inclusive belly-band membership: belly_lo <= p <= belly_hi.

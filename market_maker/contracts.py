@@ -98,6 +98,7 @@ class SizingCap(Enum):
     RUIN = "RUIN"
     BANKROLL = "BANKROLL"
     INVENTORY = "INVENTORY"  # per-side headroom cap (plan C2)
+    SKEW = "SKEW"  # skew-aware entry cap (2026-08-10 skew-fix wave item 2)
     DEPTH = "DEPTH"
     FRACTIONAL_C = "FRACTIONAL_C"
 
