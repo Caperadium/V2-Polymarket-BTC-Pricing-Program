@@ -25,6 +25,7 @@ The pricing engine itself is NEVER modified by this module. This module:
 from __future__ import annotations
 
 import logging
+import threading
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional
 
@@ -100,6 +101,87 @@ def _real_posterior_bands(*args: Any, **kwargs: Any) -> dict:
 # so one compute per posterior_refresh_s is enough (decision D2).
 _wing_posterior_cache: Dict[Any, Any] = {}
 
+# Background-refresh machinery (2026-08-11 tick-blocking fix). The posterior
+# fit takes minutes; computing it synchronously on cache expiry froze the
+# quote loop for ~2.5 min per refresh (observed live 2026-08-10 14:03-14:12,
+# slowing the skew-incident recovery). Refreshes now run in a daemon thread
+# (single-flight per cache key) while the STALE value keeps being served --
+# the posterior moves on parameter-estimation timescales, so a stale band is
+# strictly better than a frozen tick loop. COLD START (no cached entry at
+# all) stays SYNCHRONOUS: it only happens on a ladder's first price during
+# warmup, where a slow tick is expected, and it keeps the documented
+# "returns {} on failure" contract observable to callers. A failed
+# background refresh re-caches the stale value with a short retry TTL so a
+# broken posterior cannot spawn a thread per tick.
+_POSTERIOR_ASYNC: bool = True  # module seam; tests may flip for sync semantics
+_POSTERIOR_FAIL_RETRY_S: float = 300.0
+_wing_posterior_lock = threading.Lock()
+_wing_posterior_threads: Dict[Any, threading.Thread] = {}
+
+
+def _join_posterior_refresh(timeout: float = 5.0) -> None:
+    """TEST HELPER: block until outstanding background posterior refreshes
+    finish (joins each thread up to `timeout`). Production code never calls
+    this -- the whole point is that the tick loop does not wait."""
+    with _wing_posterior_lock:
+        threads = list(_wing_posterior_threads.values())
+    for t in threads:
+        t.join(timeout)
+
+
+def _posterior_bands_to_sigma2(
+    bands: dict, wing_strikes: List[float]
+) -> Dict[float, float]:
+    """Credible band -> per-strike variance: sigma ~= (q95 - q05) / 3.29
+    (normal-equivalent width of a 90% interval)."""
+    out: Dict[float, float] = {}
+    for k in wing_strikes:
+        band = bands.get(k) or bands.get(float(k))
+        if not isinstance(band, dict):
+            continue
+        q_hi = band.get("q95")
+        q_lo = band.get("q05")
+        if q_hi is None or q_lo is None:
+            continue
+        sigma = (float(q_hi) - float(q_lo)) / 3.29
+        if sigma > 0.0:
+            out[k] = sigma * sigma
+    return out
+
+
+def _posterior_refresh_worker(
+    key: Any,
+    wing_strikes: List[float],
+    hours_to_expiry: float,
+    expiry_key: str,
+    expires_at: datetime,
+    fail_expires_at: datetime,
+    posterior_fn: Callable[..., dict],
+    pb_kwargs: Dict[str, Any],
+    stale_out: Dict[float, float],
+) -> None:
+    """Daemon-thread body for a background posterior refresh. Expiry stamps
+    are precomputed by the scheduler from the caller's clock (SimClock-safe:
+    no wall-clock reads in here). On failure the STALE value is re-cached
+    with the short retry TTL -- serving it is the documented degrade path,
+    and the retry TTL bounds thread-spawn rate for a persistently broken
+    posterior."""
+    try:
+        bands = posterior_fn(wing_strikes, hours_to_expiry, **pb_kwargs)
+        out = _posterior_bands_to_sigma2(bands, wing_strikes)
+        with _wing_posterior_lock:
+            _wing_posterior_cache[key] = (expires_at, dict(out))
+    except Exception:
+        logger.warning(
+            "PARAM_POSTERIOR background refresh failed for %s; keeping stale "
+            "bands until retry", expiry_key, exc_info=True,
+        )
+        with _wing_posterior_lock:
+            _wing_posterior_cache[key] = (fail_expires_at, dict(stale_out))
+    finally:
+        with _wing_posterior_lock:
+            _wing_posterior_threads.pop(key, None)
+
 
 def _wing_sigma2_from_posterior(
     wing_strikes: List[float],
@@ -115,31 +197,52 @@ def _wing_sigma2_from_posterior(
     Variance from the credible band: sigma ~= (q95 - q05) / 3.29 (the
     normal-equivalent width of a 90% interval). Returns {} on any failure --
     quoting must never block on the slow channel (falls back to MC sigma2).
-    """
+
+    Refresh discipline (2026-08-11): a FRESH cache entry is served as-is; an
+    EXPIRED entry is served STALE while a single-flight daemon thread
+    recomputes (the tick loop never blocks on a refresh); only a COLD START
+    (no entry at all, first price of a ladder during warmup) computes
+    synchronously. `_POSTERIOR_ASYNC = False` restores fully synchronous
+    refreshes (test seam)."""
     key = (expiry_key, tuple(round(k, 8) for k in wing_strikes))
     cached = _wing_posterior_cache.get(key)
     if cached is not None and now_dt < cached[0]:
         return dict(cached[1])
+
+    pb_kwargs: Dict[str, Any] = {}
+    for fwd in ("hourly_df", "hourly_csv"):
+        if fwd in engine_kwargs:
+            pb_kwargs[fwd] = engine_kwargs[fwd]
+    expires = now_dt + timedelta(seconds=float(cfg.posterior_refresh_s))
+    fail_expires = now_dt + timedelta(
+        seconds=min(_POSTERIOR_FAIL_RETRY_S, float(cfg.posterior_refresh_s))
+    )
+
+    if _POSTERIOR_ASYNC and cached is not None:
+        # Expired-with-stale: serve the stale bands NOW, refresh in the
+        # background (single-flight per key -- a second caller while the
+        # worker runs just re-serves stale).
+        stale_out = dict(cached[1])
+        with _wing_posterior_lock:
+            if key not in _wing_posterior_threads:
+                t = threading.Thread(
+                    target=_posterior_refresh_worker,
+                    args=(key, list(wing_strikes), hours_to_expiry, expiry_key,
+                          expires, fail_expires, posterior_fn, pb_kwargs,
+                          stale_out),
+                    daemon=True,
+                    name="mm-posterior-refresh",
+                )
+                _wing_posterior_threads[key] = t
+                t.start()
+        return stale_out
+
+    # Cold start (or async disabled): synchronous legacy path.
     try:
-        pb_kwargs: Dict[str, Any] = {}
-        for fwd in ("hourly_df", "hourly_csv"):
-            if fwd in engine_kwargs:
-                pb_kwargs[fwd] = engine_kwargs[fwd]
         bands = posterior_fn(wing_strikes, hours_to_expiry, **pb_kwargs)
-        out: Dict[float, float] = {}
-        for k in wing_strikes:
-            band = bands.get(k) or bands.get(float(k))
-            if not isinstance(band, dict):
-                continue
-            q_hi = band.get("q95")
-            q_lo = band.get("q05")
-            if q_hi is None or q_lo is None:
-                continue
-            sigma = (float(q_hi) - float(q_lo)) / 3.29
-            if sigma > 0.0:
-                out[k] = sigma * sigma
-        expires = now_dt + timedelta(seconds=float(cfg.posterior_refresh_s))
-        _wing_posterior_cache[key] = (expires, dict(out))
+        out = _posterior_bands_to_sigma2(bands, wing_strikes)
+        with _wing_posterior_lock:
+            _wing_posterior_cache[key] = (expires, dict(out))
         return out
     except Exception:
         logger.warning(

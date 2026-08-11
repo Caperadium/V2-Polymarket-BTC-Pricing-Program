@@ -105,16 +105,33 @@ def write_heartbeat(tick):
     # A one-shot heartbeat leaves RUNNING observable for only 3*tick_s
     # before engine_status flips to STALLED -- a flaky 3s window under
     # load (observed ~1-in-8 full-suite failures before this).
+    # os.replace is RETRIED: on Windows it raises PermissionError when a
+    # reader (engine_status, or the test itself) has heartbeat.json open
+    # at that instant, and an unhandled error here KILLS the dummy
+    # mid-loop -- which was the true root cause of every "flaky" failure
+    # in this suite (dead pid + leftover pid/stop files). Linux os.replace
+    # never conflicts, which is why the flake was platform-dependent.
+    # A missed heartbeat after retries is tolerable (next tick rewrites).
     hb_tmp.write_text(
         json.dumps({"ts_utc": datetime.now(timezone.utc).isoformat(),
                     "tick": tick, "tick_s": tick_s}),
         encoding="utf-8",
     )
-    os.replace(str(hb_tmp), str(hb_path))
+    for _ in range(20):
+        try:
+            os.replace(str(hb_tmp), str(hb_path))
+            return
+        except OSError:
+            time.sleep(0.02)
 
 
 tick = 0
-deadline = time.time() + 30.0
+# 120s self-deadline (was 30s): the deadline only exists so an orphaned
+# dummy cannot outlive a crashed test run. 30s was load-sensitive -- under
+# a busy box (parallel suite runs) spawn + RUNNING-wait + assertions could
+# approach it, and the dummy exiting mid-test read as a flaky pid_alive
+# failure. pytest never waits on this deadline (stop is explicit).
+deadline = time.time() + 120.0
 while time.time() < deadline:
     tick += 1
     write_heartbeat(tick)
@@ -135,11 +152,21 @@ while time.time() < deadline:
             break
     time.sleep(0.05)
 
+# Cleanup with retries: on Windows, unlink raises PermissionError (a
+# sharing violation) if the test's status poller happens to hold the file
+# open for read at that instant -- a single swallowed attempt left the
+# stop file behind FOREVER, which was the true cause of the "flaky"
+# stop-file assertions (Linux unlink never conflicts, hence the
+# platform-dependent flake rate).
 for p in (pid_path, stop_path):
-    try:
-        p.unlink()
-    except OSError:
-        pass
+    for _ in range(40):
+        try:
+            p.unlink()
+            break
+        except FileNotFoundError:
+            break
+        except OSError:
+            time.sleep(0.05)
 '''
 
 
@@ -229,8 +256,12 @@ def test_start_running_then_stop(tmp_path, cleanup_real_run_dirs):
 
     status = _wait_state(control_dir, "STOPPED")
     assert status.state == "STOPPED", status.detail
-    assert not (control_dir / run_control.PID_FILE).exists()
-    assert not (control_dir / run_control.STOP_FILE).exists()
+    # Poll rather than point-assert: the dummy unlinks the PID file first
+    # and the stop file second, and STOPPED becomes observable between the
+    # two unlinks -- an instant assert on the stop file raced that gap
+    # (observed flaky ~1-in-3 under load).
+    assert _poll_until(lambda: not (control_dir / run_control.PID_FILE).exists())
+    assert _poll_until(lambda: not (control_dir / run_control.STOP_FILE).exists())
 
 
 # ---------------------------------------------------------------------------
@@ -326,7 +357,30 @@ def test_stop_file_mismatched_pid_is_ignored(tmp_path, cleanup_real_run_dirs):
     stop_path = control_dir / run_control.STOP_FILE
     stop_path.write_text(str(real_pid + 1) + "\n2026-01-01T00:00:00+00:00\n", encoding="ascii")
 
-    time.sleep(1.0)
+    # Prove the dummy KEEPS RUNNING despite the mismatched stop file by
+    # watching its heartbeat tick advance -- stronger and less
+    # load-sensitive than a fixed sleep + instant pid_alive check (the
+    # old form failed spuriously when a busy box delayed the dummy's
+    # scheduling; observed as rare solo failures).
+    hb_path = Path(out_dir) / "heartbeat.json"
+
+    def _tick():
+        try:
+            import json as _json
+            return _json.loads(hb_path.read_text(encoding="utf-8")).get("tick", 0)
+        except (OSError, ValueError):
+            return 0
+
+    t0 = _tick()
+    advanced = _poll_until(lambda: _tick() > t0, deadline_s=POLL_DEADLINE_S)
+    assert advanced, (
+        "dummy stopped ticking after mismatched-pid stop file; "
+        "pid_alive=%s pid_file=%s stop_file=%r" % (
+            run_control.pid_alive(real_pid),
+            (control_dir / run_control.PID_FILE).exists(),
+            stop_path.exists() and stop_path.read_text(encoding="utf-8")[:40],
+        )
+    )
     assert run_control.pid_alive(real_pid) is True
     assert (control_dir / run_control.PID_FILE).exists()
 

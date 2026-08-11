@@ -271,7 +271,130 @@ def test_wing_posterior_cache_ttl():
         engine_fn=stub, posterior_fn=counting, config=cfg,
         ts=NOW + timedelta(seconds=7200), now=NOW + timedelta(seconds=7200),
     )
-    assert len(calls) == 2  # recomputed after TTL
+    # 2026-08-11 tick-blocking fix: the post-TTL call serves the STALE bands
+    # and recomputes in a background thread -- join it before asserting the
+    # recompute happened.
+    pa._join_posterior_refresh()
+    assert len(calls) == 2  # recomputed after TTL (in the background)
+
+
+def test_wing_posterior_expired_serves_stale_then_upgrades():
+    """2026-08-11 tick-blocking fix: an EXPIRED cache entry is served STALE
+    while a background thread recomputes; the next call after the refresh
+    lands serves the NEW value. Cold start stays synchronous."""
+    import market_maker.pricer_adapter as pa
+    pa._wing_posterior_cache.clear()
+    stub = _linear_stub(n_sims=15000)
+    cfg = MMConfig(use_param_posterior_wings=True, posterior_refresh_s=3600.0)
+
+    # Cold start: synchronous, width 0.10 applied immediately.
+    snap1 = build_snapshot(
+        [90000.0, 110000.0], "2026-07-25", hours_to_expiry=336.0,
+        engine_fn=stub, posterior_fn=_band_posterior(0.10), config=cfg,
+        ts=NOW, now=NOW,
+    )
+    old_sigma2 = (0.10 / 3.29) ** 2
+    assert snap1.sigma2[90000.0] == pytest.approx(old_sigma2)
+
+    # Past TTL with a WIDER posterior: the call itself must serve the stale
+    # (old) value; the refresh happens in the background.
+    later = NOW + timedelta(seconds=7200)
+    snap2 = build_snapshot(
+        [90000.0, 110000.0], "2026-07-25", hours_to_expiry=336.0,
+        engine_fn=stub, posterior_fn=_band_posterior(0.20), config=cfg,
+        ts=later, now=later,
+    )
+    assert snap2.sigma2[90000.0] == pytest.approx(old_sigma2)  # stale served
+
+    pa._join_posterior_refresh()
+    snap3 = build_snapshot(
+        [90000.0, 110000.0], "2026-07-25", hours_to_expiry=336.0,
+        engine_fn=stub, posterior_fn=_band_posterior(0.20), config=cfg,
+        ts=later, now=later,
+    )
+    assert snap3.sigma2[90000.0] == pytest.approx((0.20 / 3.29) ** 2)  # upgraded
+
+
+def test_wing_posterior_refresh_single_flight():
+    """Only ONE background refresh runs per cache key while it is in flight;
+    concurrent expired calls keep serving stale without spawning more."""
+    import threading as _threading
+    import market_maker.pricer_adapter as pa
+    pa._wing_posterior_cache.clear()
+    stub = _linear_stub(n_sims=15000)
+    cfg = MMConfig(use_param_posterior_wings=True, posterior_refresh_s=3600.0)
+    build_snapshot(  # cold start primes the cache synchronously
+        [90000.0, 110000.0], "2026-07-26", hours_to_expiry=336.0,
+        engine_fn=stub, posterior_fn=_band_posterior(0.10), config=cfg,
+        ts=NOW, now=NOW,
+    )
+
+    gate = _threading.Event()
+    calls = []
+
+    def blocking(strikes, hours_to_expiry, **kwargs):
+        calls.append(1)
+        gate.wait(5.0)
+        return _band_posterior(0.20)(strikes, hours_to_expiry, **kwargs)
+
+    later = NOW + timedelta(seconds=7200)
+    for _ in range(3):  # three expired calls while the worker is blocked
+        snap = build_snapshot(
+            [90000.0, 110000.0], "2026-07-26", hours_to_expiry=336.0,
+            engine_fn=stub, posterior_fn=blocking, config=cfg,
+            ts=later, now=later,
+        )
+        assert snap.sigma2[90000.0] == pytest.approx((0.10 / 3.29) ** 2)
+    gate.set()
+    pa._join_posterior_refresh()
+    assert len(calls) == 1  # single-flight
+
+
+def test_wing_posterior_background_failure_keeps_stale_with_retry_ttl():
+    """A FAILED background refresh re-caches the stale value with the short
+    retry TTL: stale keeps being served, and a later call past the retry TTL
+    schedules another attempt (no thread-per-tick spam, no lost bands)."""
+    import market_maker.pricer_adapter as pa
+    pa._wing_posterior_cache.clear()
+    stub = _linear_stub(n_sims=15000)
+    cfg = MMConfig(use_param_posterior_wings=True, posterior_refresh_s=3600.0)
+    build_snapshot(
+        [90000.0, 110000.0], "2026-07-27", hours_to_expiry=336.0,
+        engine_fn=stub, posterior_fn=_band_posterior(0.10), config=cfg,
+        ts=NOW, now=NOW,
+    )
+    old_sigma2 = (0.10 / 3.29) ** 2
+    fails = []
+
+    def broken(strikes, hours_to_expiry, **kwargs):
+        fails.append(1)
+        raise RuntimeError("posterior exploded in background")
+
+    later = NOW + timedelta(seconds=7200)
+    snap = build_snapshot(
+        [90000.0, 110000.0], "2026-07-27", hours_to_expiry=336.0,
+        engine_fn=stub, posterior_fn=broken, config=cfg, ts=later, now=later,
+    )
+    assert snap.sigma2[90000.0] == pytest.approx(old_sigma2)  # stale served
+    pa._join_posterior_refresh()
+    assert len(fails) == 1
+    # Within the retry TTL: stale served, NO new attempt scheduled.
+    within = later + timedelta(seconds=60)
+    snap = build_snapshot(
+        [90000.0, 110000.0], "2026-07-27", hours_to_expiry=336.0,
+        engine_fn=stub, posterior_fn=broken, config=cfg, ts=within, now=within,
+    )
+    assert snap.sigma2[90000.0] == pytest.approx(old_sigma2)
+    pa._join_posterior_refresh()
+    assert len(fails) == 1
+    # Past the retry TTL: another background attempt fires.
+    past = later + timedelta(seconds=pa._POSTERIOR_FAIL_RETRY_S + 60)
+    build_snapshot(
+        [90000.0, 110000.0], "2026-07-27", hours_to_expiry=336.0,
+        engine_fn=stub, posterior_fn=broken, config=cfg, ts=past, now=past,
+    )
+    pa._join_posterior_refresh()
+    assert len(fails) == 2
 
 
 def test_wing_posterior_disabled_by_config():
