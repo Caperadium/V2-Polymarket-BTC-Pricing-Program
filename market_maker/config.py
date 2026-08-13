@@ -259,22 +259,26 @@ class MMConfig:
     # slow fields).
     markout_slow_horizon_s: float = 21600.0
 
-    # --- belly sizing markout epoch (2026-08-08 wing-bleed fix) ---
-    # Fills BEFORE this UTC instant are invisible to the SIZING markout
-    # report, which the harness consults for BELLY-region markets only (wing
-    # sizing keeps the full 28d window: the wing 600s cells are currently
-    # measured-toxic -- n=21/22/27 at -12.7/-4.0/-2.7c, VPS 2026-08-08 -- and
-    # clearing them would revert wing sizing to the optimistic m_prior path).
-    # The spread-widening (term 7) / monitor / telegram report also keeps the
-    # full window -- widening is unconditionally protective. Rationale: the
-    # live window held 289 pre- vs 40 post-restart fills (belly 1-2d n=38 >
-    # 40 post-restart fills TOTAL), so the belly stayed Kelly-clamped for
-    # pre-fix burst sins until ~Aug 23. Set to the 2026-07-27 bleed-fix
-    # restart (start of the current quoting regime). OPERATOR RULE: bump at
-    # any deploy that materially changes quoting behavior. Empty string
-    # disables. Runner-only: paper_runner parses it (CLI --markout-epoch
+    # --- markout epoch (2026-08-08 wing-bleed fix; scope widened
+    # 2026-08-13) ---
+    # Fills BEFORE this UTC instant are invisible to the EPOCH (sizing)
+    # markout report, which feeds (a) BELLY-region sizing (wing sizing
+    # keeps the full 28d window -- its measured-toxic verdicts are
+    # protective) and, since 2026-08-13, (b) spread term 7's side-widening
+    # for ALL markets (the original "term 7 keeps the full window" choice
+    # assumed old fills are genuine pick-off evidence; the 2026-08-10
+    # skew-incident's own fire-sale fills -- predominantly self-inflicted
+    # -- cap-bound the term at 0.12/side and stalled the book for 2 days).
+    # Set to the 2026-08-11 skew-fix deploy (start of the current quoting
+    # regime; the missed application of the operator rule at that deploy
+    # is what caused the stall). OPERATOR RULE: bump at any deploy that
+    # materially changes quoting behavior -- but SPARINGLY: every bump
+    # also resets the belly slow-channel (21600s) backstop, which needs 6h
+    # maturity + 20 fills per cell to re-arm; habitual bumps would keep it
+    # permanently unarmed. Empty string disables (sizing view == full
+    # view). Runner-only: paper_runner parses it (CLI --markout-epoch
     # overrides); harness/quoting never read it.
-    markout_epoch_utc: str = "2026-07-27T15:48:00+00:00"
+    markout_epoch_utc: str = "2026-08-11T03:21:00+00:00"
 
     # --- sizing-region basis + hysteresis (2026-08-08 wing-bleed fix) ---
     # Basis for the per-market SIZING-region classification.

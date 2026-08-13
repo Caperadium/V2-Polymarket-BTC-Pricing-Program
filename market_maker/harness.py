@@ -665,16 +665,28 @@ class PaperTradingLoop:
             # term 7 (package E): markout-fed widening, resolved per side off
             # the SIDE-SPLIT markout report (BUY_YES -> bid, BUY_NO -> ask) at
             # cfg.markout_widen_horizon_s (60s, deliberately different from
-            # sizing's cfg.markout_horizon_s below). A cold/unwired provider
-            # (report is None) degrades both sides to 0.0 widening, same as
-            # the sizing markout fields below.
-            if report is not None:
+            # sizing's cfg.markout_horizon_s below). SOURCE = the EPOCH
+            # (sizing_report) view since 2026-08-13, ONE source for all
+            # markets (not the per-market sizing_src): the full-window choice
+            # (wing-wave rev-1 B5) assumed old fills are genuine pick-off
+            # evidence, but the 2026-08-10 incident's own fire-sale fills
+            # (predominantly self-inflicted -- the first rich bid was
+            # Bayes-driven) cap-bound the term at 0.12/side and stalled the
+            # book for 2 days; the epoch is the operator's declared regime
+            # break and the intra-epoch 28d decay is preserved. Region basis
+            # UNCHANGED (consensus-basis `region` -- this changed the WINDOW,
+            # not the basis). Fallback semantics: an UNWIRED provider
+            # degrades sizing_report to `report` (full view); a wired-but-
+            # cold provider yields None -> 0.0 widening, which is safe
+            # because the runner assigns both holder entries together, so
+            # the full view is empty in exactly that case.
+            if sizing_report is not None:
                 mk_avg_bid_side, _mk_n_bid_side = markout_stats_side(
-                    report, region, tte_bucket, cfg.markout_widen_horizon_s,
+                    sizing_report, region, tte_bucket, cfg.markout_widen_horizon_s,
                     Side.BUY_YES, cfg.markout_min_n,
                 )
                 mk_avg_ask_side, _mk_n_ask_side = markout_stats_side(
-                    report, region, tte_bucket, cfg.markout_widen_horizon_s,
+                    sizing_report, region, tte_bucket, cfg.markout_widen_horizon_s,
                     Side.BUY_NO, cfg.markout_min_n,
                 )
             else:

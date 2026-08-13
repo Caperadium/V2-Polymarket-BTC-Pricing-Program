@@ -1405,7 +1405,10 @@ def test_beta_hedge_flag_on_calls_beta_hedges_with_placeholder_sigma_b(store, mo
 # Package E (2026-07-15): markout-fed spread widening (spread term 7) --
 # harness wiring (_compose_quote_sets resolves markout_stats_side per market
 # BEFORE the single compute_posted_prices call, region computed from
-# consensus_p_k moved above that call).
+# consensus_p_k moved above that call). Since 2026-08-13 term 7's SOURCE is
+# the epoch (sizing_report) view, not the full report -- tests here that
+# wire only markout_provider still exercise term 7 because an unwired
+# sizing provider degrades to the full report.
 # ---------------------------------------------------------------------------
 
 
@@ -2210,10 +2213,12 @@ def _two_view_reports(cfg, tte_bucket):
     return full, sizing
 
 
-def test_two_report_routing_belly_sizing_wing_full_term7_full(store):
+def test_two_report_routing_belly_sizing_wing_full_term7_sizing(store):
     """Belly market (mid 0.5) resolves its sizing cell from the SIZING view
     (-0.06); wing market (mid ~0.047) from the FULL view (-0.05); every
-    term-7 markout_stats_side call reads the FULL report object."""
+    term-7 markout_stats_side call reads the SIZING (epoch) view since the
+    2026-08-13 un-stall fix (the incident's own fire-sale fills cap-bound
+    the full-window widening at 0.12/side and stalled the book)."""
     import market_maker.harness as harness_mod
     from market_maker.pnl_report import tte_bucket_label
 
@@ -2254,7 +2259,59 @@ def test_two_report_routing_belly_sizing_wing_full_term7_full(store):
     assert by_market["m-100k"].mk_avg == pytest.approx(-0.06)  # sizing view
     assert by_market["m-106k"].mk_avg == pytest.approx(-0.05)  # full view
     assert side_reports  # term 7 ran
-    assert all(r is holder["report"] for r in side_reports)  # full view only
+    assert all(r is holder["sizing"] for r in side_reports)  # epoch view only
+
+
+def test_term7_epoch_view_unsticks_widening_from_stale_full_window(store):
+    """The 2026-08-13 un-stall regression: full report side-toxic at the
+    widening horizon (would bind term 7 at the cap), sizing (epoch) view
+    CLEAN -> posted spread carries ZERO markout widening. Pins that term 7
+    reads the epoch view, not the full window."""
+    import market_maker.harness as harness_mod
+    from market_maker.pnl_report import tte_bucket_label
+
+    cfg = MMConfig(gamma=0.5, k_arrival=1.0)
+    markets = [("m-100k", 100000.0)]
+    holder: dict = {"report": None, "sizing": None}
+    loop = PaperTradingLoop(
+        store=store, expiry_key=EXPIRY, markets=markets, engine_fn=_engine(),
+        config=cfg, clock=SimClock(START), vol_gate_fn=_vol_gate(),
+        markout_provider=lambda: holder["report"],
+        sizing_markout_provider=lambda: holder["sizing"],
+    )
+    books = {m: _snapshot_msg(_p_of_strike(k)) for m, k in markets}
+    loop.tick(books)
+    tte_bucket = tte_bucket_label(max(loop.last_snapshot.tte_days, 0.0))
+
+    def _side_cells(mk):
+        sides = {
+            "BUY_YES": {"n": 30, "n_attempted": 30, "mk_avg": mk, "mk_var": 0.0},
+            "BUY_NO": {"n": 30, "n_attempted": 30, "mk_avg": mk, "mk_var": 0.0},
+        }
+        cell = {"region": "belly", "tte_bucket": tte_bucket,
+                "horizon_s": cfg.markout_widen_horizon_s, "n": 60,
+                "n_attempted": 60, "mk_avg": mk, "mk_var": 0.0, "sides": sides}
+        return {"cells": [cell], "by_region": {}, "by_expiry": {}}
+
+    holder["report"] = _side_cells(-0.30)   # incident-poisoned full window
+    holder["sizing"] = _side_cells(0.0)     # clean epoch view
+
+    widen_calls = []
+    orig_widen = harness_mod.markout_widen
+
+    def widen_spy(mk_avg, scale, cap):
+        out = orig_widen(mk_avg, scale, cap)
+        widen_calls.append((mk_avg, out))
+        return out
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(harness_mod, "markout_widen", widen_spy)
+        loop.tick(books)
+
+    assert widen_calls
+    # Every term-7 widening input came from the CLEAN epoch view: zero
+    # widening despite the toxic full window.
+    assert all(out == 0.0 for _mk, out in widen_calls)
 
 
 def test_sizing_provider_none_falls_back_to_markout_provider(store):
