@@ -146,12 +146,16 @@ NO bet at our ask -- the capital actually at risk per share if filled):
        ask_shares <= max(0.0, q_skew_max + q)   # NO/ask  = add side when q<0
 
      unit_skew_x (ContractSizingInput, additive) is the per-share reservation
-     shift for this market this tick, resolved by the harness via
+     shift for this market this tick, resolved by the harness as
      quote_engine.per_share_skew_x(quote_variant, sigma_b, gamma, k_arrival,
-     arrival_scale_A, tte) -- the SAME code path and the SAME sigma_b the
-     quote engine used to build this tick's proposal, so the sizing cap and
-     the quote clamp agree on the bind point under both variants (this
-     module never imports quote_engine -- the field arrives pre-computed).
+     arrival_scale_A, tte) / config.skew_q_norm (2026-08-13 bleed-2 fix item
+     1, temp/mm_bleed2_fix_plan.md -- the harness normalizes the config unit
+     the quote engine was always documented to expect) -- the SAME code
+     path, the SAME sigma_b the quote engine used to build this tick's
+     proposal, and the SAME skew_q_norm divisor applied to the quote
+     engine's own q, so the sizing cap and the quote clamp agree on the bind
+     point under both variants (this module never imports quote_engine --
+     the field arrives pre-computed and pre-normalized).
      0.0 (default) = unwired/disabled for that leg -> stage inert for it.
      config.skew_x_cap <= 0 is the paired kill switch (also stage inert,
      mirrors the quote-engine clamp's own disable). Gated on `inventory is

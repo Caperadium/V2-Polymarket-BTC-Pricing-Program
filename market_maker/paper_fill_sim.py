@@ -44,6 +44,20 @@ Fill-model assumptions (6.3), implemented verbatim:
      TOP-OF-BOOK fallback (trade_through_only=True) fills ONLY on a print STRICTLY
      through our level, queue assumed infinite at our exact price.
 
+Resting-crossed orders (2026-08-13 bleed-2 fix note, temp/mm_bleed2_fix_plan.md):
+a resting bid above the venue's best ask (or a resting ask below the venue's
+best bid) is modelled PESSIMISTICALLY by rules 1/3 above -- it fills at OUR OWN
+crossed price with queue_ahead=0, as soon as any qualifying print arrives. Two
+real-venue behaviors this does NOT capture: an ordinary (non-post-only) crossing
+limit order would instead have taken immediately at the touch price, not sat
+resting at our crossed price; and LIVE intent is POST-ONLY maker orders, so a
+real post-only order priced to cross would have been rejected or repriced by
+the venue before ever reaching the book. `spread_builder.post_only_clamp`
+(harness.tick, market_maker/config.py's `post_only_margin_ticks`) removes the
+crossing from the desired ladder before it reaches this simulator; this module
+is unchanged and needs no code here, since it already fills whatever QuoteSet
+it is handed.
+
 Deterministic: identical input streams produce identical fills. stdlib + numpy.
 """
 from __future__ import annotations

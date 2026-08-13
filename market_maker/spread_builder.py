@@ -76,6 +76,24 @@ seven terms, then enforces floor/clamp/quantize/no-cross, in that order:
    `ladder_hedger.py` (out of scope for package E), not something this
    module works around.
 
+   UPDATE (2026-08-13 bleed-2 fix, item 2): the post-only book clamp
+   (`post_only_clamp`, applied by the harness AFTER this restoration, per
+   quote/per market) can move a repaired ladder's prices further OUTWARD
+   (bid down, ask up) to stay off the venue's opposite touch. This can
+   reintroduce an ASK-ladder monotonicity violation (a lower-strike ask
+   clamped up past a higher-strike ask left untouched) but can NEVER create
+   the exploitable `ask_K < bid_{K+1}` crossing: per strike, bid < ask
+   always holds, and both the post-clamp bid and ask move outward (bid down
+   or unchanged, ask up or unchanged) from their already-repaired values, so
+   `bid_{K+1}^new <= bid_{K+1}^old < ask_K^old <= ask_K^new`. "Full no-arb
+   RESTORATION (LadderHedger.check().ok == True after one repair() pass)"
+   above therefore describes the ladder as `_compose_quote_sets` +
+   `LadderHedger.repair()` hand it off, not necessarily the final ladder
+   that reaches the lifecycle -- `QuoteSet.noarb_checked` documents this
+   distinction (contracts.py) and the clamp is never re-checked against
+   `LadderHedger.check()` (a harmless post-clamp violation would otherwise
+   pollute the very signal `noarb_checked` protects).
+
 Terms 2, 4, 5, 6, 7 are symmetric-per-side (term 7 asymmetric between bid and
 ask, but each side's amount is applied independently, same as the others);
 terms 1 and 3 are audit-only (already embedded in the proposal's x_bid/x_ask,
@@ -115,7 +133,9 @@ referenced from harness._compose_quote_sets):
 """
 from __future__ import annotations
 
+import logging
 import math
+from dataclasses import replace
 from datetime import datetime
 from typing import Dict, Optional, Tuple
 
@@ -132,6 +152,8 @@ from market_maker.contracts import (
     VenueDescriptor,
 )
 from market_maker.logodds import floor_half_spread, half_spread_p_exact, sigmoid
+
+logger = logging.getLogger("mm.spread_builder")
 
 # Module defaults for terms 4/5 (plan 2.5: "add module defaults if MMConfig
 # lacks fields; keep configurable" -- overridable per call to build_quote_set).
@@ -380,4 +402,169 @@ def build_quote_set(
         risk_mode=directive.mode,
         noarb_checked=False,
         source_seq=source_seq,
+    )
+
+
+def _usable_ref(v: Optional[float]) -> bool:
+    """True iff `v` is usable as a post-only clamp reference: a finite float
+    strictly inside the open unit interval (0, 1). Mirrors the None/NaN-safe
+    EXPLICIT-check style of `paper_fill_sim._is_num` (never bare `min`/`max`
+    against a possibly-NaN value -- that is argument-order-dependent), but
+    is intentionally stricter: a clamp reference must be a legal, usable
+    price, not merely "not NaN". Deliberately NOT `harness._market_mid`,
+    which has no NaN guard of its own.
+    """
+    if v is None or isinstance(v, bool):
+        return False
+    if not isinstance(v, (int, float)):
+        return False
+    fv = float(v)
+    return math.isfinite(fv) and 0.0 < fv < 1.0
+
+
+def _round_grid_outward(price: float, tick: float, floor: bool) -> float:
+    """Snap `price` outward onto the tick grid: floor for the bid side,
+    ceil for the ask side, so the crossing-repair arithmetic in
+    `post_only_clamp` never leaves float residue that re-opens the crossing
+    it just removed. Deliberately local and separate from
+    `ladder_hedger._quantize` (rounds to the NEAREST tick, fixed [0,1] band)
+    and this module's own `_quantize` (rounds toward center with its own
+    implicit no-cross repair) -- neither matches the outward-only, explicit-
+    band semantics this function needs, and `post_only_clamp` handles its
+    own band clamp and degenerate-size check as separate, later steps.
+    """
+    if tick <= 0.0:
+        return price
+    eps = 1e-9
+    if floor:
+        return math.floor(price / tick + eps) * tick
+    return math.ceil(price / tick - eps) * tick
+
+
+def post_only_clamp(
+    qs: QuoteSet,
+    best_bid: Optional[float],
+    best_ask: Optional[float],
+    tick: float,
+    band: Tuple[float, float],
+    margin_ticks: int,
+) -> QuoteSet:
+    """Post-only book clamp (2026-08-13 bleed-2 fix, item 2, structural
+    backstop for both bleed-2 faucets -- temp/mm_bleed2_fix_plan.md). Bounds
+    EACH side of `qs` to stay `margin_ticks` ticks inside the OPPOSITE venue
+    touch: `bid <= best_ask - margin*tick`, `ask >= best_bid + margin*tick`.
+    This emulates venue post-only semantics with the minimum behavioral
+    delta: LIVE intent is post-only maker orders, and a real post-only order
+    that would cross is rejected/repriced by the venue -- but
+    `paper_fill_sim` fills a resting-crossed order at OUR OWN crossed price
+    with `queue_ahead=0` (see that module's docstring note). This clamp
+    removes the crossing before the QuoteSet ever reaches the fill sim.
+
+    Guarantee scope: DESIRED-ladder only. With `requote_price_tol` (a
+    1-tick deadband) a resting order may lag this freshly-clamped desired
+    price by up to one tick and be crossed INTO by a subsequent book move --
+    that is normal maker behavior, matching `order_lifecycle`'s existing
+    resting-vs-desired language, not a gap in this clamp.
+
+    Deep-wing note: a venue book whose best_ask sits at the minimum tick
+    (e.g. a 1c-wide wing book) forces the post-round, post-band-clamp bid
+    below `max(tick, band_lo)` for any positive margin -- the bid side is
+    then zeroed (rule 5 below). This is CORRECT, not a bug: there is no
+    legal maker bid below the venue's price floor.
+
+    One-sided-book hole (known, recorded, NOT fixed here): when the
+    OPPOSITE touch is absent/None/NaN/non-finite/outside (0, 1)
+    (`_usable_ref` fails), that side is left UNCLAMPED, by design -- there
+    is nothing to cross against. Unbounded-vs-mid exposure therefore
+    persists exactly on thin, one-sided wing books; a `post_only_join`
+    (join-the-touch) variant is the recorded follow-up (see
+    `MMConfig.post_only_margin_ticks`) if the belly-consensus-divergence
+    faucet (explicitly out of scope this wave) keeps arming that hole.
+
+    Pure and idempotent: `post_only_clamp(post_only_clamp(qs, ...), ...) ==
+    post_only_clamp(qs, ...)`. Returns the SAME `qs` object (identity) when
+    neither side needs adjustment. NEVER touches size except the rule-5
+    degenerate zeroing below, and NEVER resurrects a side whose size is
+    already 0 (rule 6) -- both sides are evaluated independently off `qs`'s
+    ORIGINAL bid_size/ask_size, and a directive-suppressed or min-size-
+    zeroed side is skipped entirely.
+
+    Per-side rules, in order, mirrored for bid/ask:
+      1. reference guard (`_usable_ref`, above).
+      2. `new_bid = min(bid_price, best_ask - margin*tick)` (only if
+         `bid_size > 0` and `best_ask` usable); mirror for the ask side.
+      3. outward grid rounding (`_round_grid_outward`, above).
+      4. band clamp into `[band_lo, band_hi]`.
+      5. degenerate check on the FINAL value: if the clamped bid is below
+         `max(tick, band_lo)`, the side is unquotable as a maker ->
+         `bid_size = 0.0`, price left at its OLD valid value (mirror: ask
+         above `min(1 - tick, band_hi)` -> `ask_size = 0.0`). The "both
+         sides crossed" case is unreachable by construction (both moves are
+         outward from an already bid < ask pair) -- logged at debug only,
+         no dedicated test budget.
+      6. never resurrect (see above).
+      7. journal: when a side's price actually moves, the returned
+         QuoteSet's `terms` gains `"post_only_bid"` (= old_bid - new_bid,
+         always > 0) and/or `"post_only_ask"` (= new_ask - old_ask, always
+         > 0), present ONLY when nonzero.
+
+    Forensic decomposition identity: this is applied AFTER `build_quote_set`
+    (not inside `compute_posted_prices`), so the module docstring's
+    reconstruction identity (`bid = sigmoid(x_bid) - sum(spread terms)`)
+    must now ALSO subtract `post_only_bid` when present (mirror: `ask =
+    sigmoid(x_ask) + sum(spread terms) + post_only_ask`), or the
+    reconstructed price will not match the journaled one.
+
+    `band` is the venue price band (`config.p_clamp`), passed explicitly by
+    the caller (`harness.tick`) -- not re-derived from `qs`.
+    """
+    band_lo, band_hi = band
+    margin = margin_ticks * tick
+
+    bid_price, bid_size = qs.bid_price, qs.bid_size
+    ask_price, ask_size = qs.ask_price, qs.ask_size
+    post_only_bid = 0.0
+    post_only_ask = 0.0
+
+    if qs.bid_size > 0.0 and _usable_ref(best_ask):
+        candidate = min(qs.bid_price, float(best_ask) - margin)
+        candidate = _round_grid_outward(candidate, tick, floor=True)
+        candidate = min(max(candidate, band_lo), band_hi)
+        if candidate < max(tick, band_lo):
+            bid_size = 0.0  # unquotable as a maker; price left at old valid value
+        elif candidate < qs.bid_price:
+            post_only_bid = qs.bid_price - candidate
+            bid_price = candidate
+
+    if qs.ask_size > 0.0 and _usable_ref(best_bid):
+        candidate = max(qs.ask_price, float(best_bid) + margin)
+        candidate = _round_grid_outward(candidate, tick, floor=False)
+        candidate = min(max(candidate, band_lo), band_hi)
+        if candidate > min(1.0 - tick, band_hi):
+            ask_size = 0.0  # unquotable as a maker; price left at old valid value
+        elif candidate > qs.ask_price:
+            post_only_ask = candidate - qs.ask_price
+            ask_price = candidate
+
+    if bid_price >= ask_price and bid_size > 0.0 and ask_size > 0.0:
+        # Unreachable given both moves are outward from an already
+        # bid < ask pair (module docstring proof above) -- debug-log only.
+        logger.debug(
+            "post_only_clamp: unexpected crossing market_id=%s bid=%.6g ask=%.6g",
+            qs.market_id, bid_price, ask_price,
+        )
+
+    if (bid_price == qs.bid_price and ask_price == qs.ask_price
+            and bid_size == qs.bid_size and ask_size == qs.ask_size):
+        return qs
+
+    terms = dict(qs.terms)
+    if post_only_bid > 0.0:
+        terms["post_only_bid"] = post_only_bid
+    if post_only_ask > 0.0:
+        terms["post_only_ask"] = post_only_ask
+
+    return replace(
+        qs, bid_price=bid_price, ask_price=ask_price,
+        bid_size=bid_size, ask_size=ask_size, terms=terms,
     )

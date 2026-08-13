@@ -130,6 +130,8 @@ pull + restart, no config-file change needed.
 |------|------|------|
 | `skew_x_cap` (1.0) | Caps the AS/GLFT reservation displacement `skew_x` at this many x-units in `quote_engine.make_quote` (Market Making 6.3) | `<= 0` restores legacy unbounded `skew_x` exactly |
 | `skew_q_headroom_mult` (1.5) | Sizing-side entry cap (`robustness_sizing` Stage 6b, Market Making 8.2): add-side shares capped at `skew_q_headroom_mult * skew_x_cap / unit_skew_x` | raise to loosen; the stage is already inert whenever `skew_x_cap <= 0` |
+| `skew_q_norm` (20.0) | Normalizes inventory shares into skew units: the harness passes `q / skew_q_norm` to the quote engine and divides `unit_skew_x` the same way (2026-08-13 bleed-2 fix -- raw shares pinned the skew cap with 3-5 shares) | `1.0` restores legacy raw-share skew exactly |
+| `post_only_margin_ticks` (1) | Post-only book clamp (`spread_builder.post_only_clamp`, applied post-PAV): desired bid capped at `best_ask - N*tick`, desired ask floored at `best_bid + N*tick`; clamp displacement journaled as `post_only_bid`/`post_only_ask` terms keys | `<= 0` disables the clamp exactly (0 is deliberately disabled -- margin 0 would match/take) |
 | `bankroll_update_temper` (0.1) | Tempers each region's per-tick Bayes factor (`factors ** t`) before the bankroll weight update in `fair_value_anchor.compute_fair_value` (Market Making 4.7) | `1.0` restores legacy (untempered) Bayes speed |
 
 ## Checking status

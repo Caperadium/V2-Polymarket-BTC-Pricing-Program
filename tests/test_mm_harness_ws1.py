@@ -561,10 +561,14 @@ def test_harness_threads_unit_skew_x_matching_proposal_sigma_b_dalen(store):
     tte = max(loop.last_snapshot.tte_days, 0.0)
     for c in contracts:
         prop = loop.last_proposals[c.market_id]
+        # 2026-08-13 bleed-2 fix item 1: the harness now divides the raw
+        # per_share_skew_x by MMConfig.skew_q_norm (default 20.0) before
+        # threading it into ContractSizingInput -- see
+        # test_mm_skew_q_norm.py for the dedicated q-normalization coverage.
         expected = per_share_skew_x(
             loop.quote_variant, prop.sigma_b, cfg.gamma, cfg.k_arrival,
             cfg.arrival_scale_A, tte,
-        )
+        ) / cfg.skew_q_norm
         assert c.unit_skew_x == pytest.approx(expected)
         assert c.unit_skew_x > 0.0  # sigma_b/gamma/tte all positive here
 
@@ -573,7 +577,12 @@ def test_harness_threads_unit_skew_x_matching_proposal_sigma_b_glft(store):
     from market_maker.quote_engine import per_share_skew_x
     import market_maker.harness as harness_mod
 
-    cfg = MMConfig(gamma=0.5, k_arrival=1.0, arrival_scale_A=1.0)
+    # skew_q_norm pinned to 1.0 (legacy raw-share kill switch, 2026-08-13
+    # bleed-2 fix item 1): this variant keeps a byte-exact
+    # unit_skew_x == per_share_skew_x(...) assertion so at least one of the
+    # two threading tests still proves legacy-exactness under the kill
+    # switch; the dalen sibling above covers the default-normalized path.
+    cfg = MMConfig(gamma=0.5, k_arrival=1.0, arrival_scale_A=1.0, skew_q_norm=1.0)
     loop = PaperTradingLoop(
         store=store, expiry_key=EXPIRY, markets=MARKETS, engine_fn=_engine(),
         config=cfg, clock=SimClock(START), vol_gate_fn=_vol_gate(),

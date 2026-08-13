@@ -18,7 +18,9 @@ back to probability via the logodds layer. Two variants:
         r_x     = x_fair - q * C          skew_x = -q * C
         delta_x = base + 0.5 * C          (inventory-independent)
 
-Units: tte in DAYS; q is a float (caller normalizes shares by a config unit).
+Units: tte in DAYS; q is a float (caller normalizes shares by a config unit --
+`MMConfig.skew_q_norm`, wired by the harness since 2026-08-13: q_eff =
+q_shares / skew_q_norm, see temp/mm_bleed2_fix_plan.md item 1).
 sigma_b is per-sqrt-day belief vol of the log-odds series and is taken as an
 ARGUMENT so the estimator (`estimate_sigma_b`) is separable from the quote math.
 

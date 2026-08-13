@@ -586,7 +586,15 @@ ordinary fill into a catastrophic quote.
 
 The same per-share displacement formula (`per_share_skew_x`, shared by both
 quoting and sizing) also feeds a sizing-side entry cap (Section 8.2), so
-quoting and sizing agree on where inventory growth should slow. At 1.0
+quoting and sizing agree on where inventory growth should slow. Since
+2026-08-13 (bleed-2 fix) the harness divides BOTH the q it passes to the
+quote engine and this per-share unit by `MMConfig.skew_q_norm` (20.0, ~ the
+live `q_max` scale; 1.0 = legacy raw shares) -- the config-unit
+normalization the quote-engine contract always specified. Raw shares as q
+made the per-share displacement ~0.15-0.45 x-units, so 3-5 shares pinned
+the cap and displaced quotes 15-24c through a calm book (the 2026-08-13
+buy-high/sell-low oscillation); normalized, a 5-share position shades
+~1-2.5c and the cap is a catastrophe backstop again. At 1.0
 x-unit the cap still leans the quote hard -- roughly p 0.5 -> 0.73 at the
 center, less near the extremes -- but it can no longer pin the reservation
 at the clamp floor the way an unbounded term can.
@@ -996,10 +1004,16 @@ in this order:
   ```
 
   `unit_skew_x` is the per-share reservation displacement for this market
-  this tick, computed by the harness via `quote_engine.per_share_skew_x` --
+  this tick, computed by the harness via `quote_engine.per_share_skew_x`
+  divided by `MMConfig.skew_q_norm` (2026-08-13 -- the same normalization
+  applied to the quote engine's q, so cap and clamp still agree) --
   the same formula, the same `sigma_b`, and the same quote variant the
   quote engine itself used to build the tick's proposal, so the sizing cap
-  and the quote-engine clamp agree on exactly where the skew channel binds
+  and the quote-engine clamp agree on exactly where the skew channel binds.
+  With the default `skew_q_norm` = 20 the cap cannot bind in the observed
+  sigma_b regime (it scales up 20x; still binds at extreme sigma, e.g.
+  sigma_b 5 / tte 4d -> 3 shares) -- the operating per-strike bound is
+  `q_max` plus the per-tick flow caps
   under either variant. `skew_q_headroom_mult` (default 1.5) lets a
   position run 50% past the clamp-bind quantity before the add side starts
   shrinking -- fills remain the calibration source, and the venue-minimum

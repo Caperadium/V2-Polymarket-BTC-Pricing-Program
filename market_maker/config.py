@@ -278,7 +278,7 @@ class MMConfig:
     # permanently unarmed. Empty string disables (sizing view == full
     # view). Runner-only: paper_runner parses it (CLI --markout-epoch
     # overrides); harness/quoting never read it.
-    markout_epoch_utc: str = "2026-08-11T03:21:00+00:00"
+    markout_epoch_utc: str = "2026-08-13T23:45:00+00:00"
 
     # --- sizing-region basis + hysteresis (2026-08-08 wing-bleed fix) ---
     # Basis for the per-market SIZING-region classification.
@@ -309,6 +309,71 @@ class MMConfig:
     # ~0.5 -> 0.73 (less near the extremes) -- still a strong unload lean,
     # never a fire-sale. <= 0 disables (legacy unbounded).
     skew_x_cap: float = 1.0
+
+    # --- skew q-normalization (2026-08-13 bleed-2 fix, item 1) ---
+    # The AS/GLFT skew term skew_x = -q*gamma*sigma_b^2*tte takes q in RAW
+    # SHARES; quote_engine.py's module docstring always specified "q is a
+    # float (caller normalizes shares by a config unit)" but no caller ever
+    # did -- the 2026-08-10 incident (13.4-share fill, sigma_b 2.46 ->
+    # skew_x -8.8, fire-sale) is that gap armed. The harness now divides both
+    # the quote-engine q and the Stage 6b unit_skew_x by this many shares
+    # before the skew term is computed -- a deliberate 20x cut of the skew
+    # GAIN (algebraically a skew-only gamma/20; gamma itself is shared with
+    # the half-spread and is NOT cut, see temp/mm_bleed2_fix_plan.md).
+    # (a) Value rationale: 20 ~ observed live q_max scale (19-22 shares
+    #     ATM) -- a full-inventory ATM position lands near 1 skew-unit.
+    # (b) Magnitudes at defaults post-normalization: per-share shade =
+    #     gamma*sigma_b^2*tte/20 ~ 0.007-0.022 x ~ 0.2-0.5c at belly
+    #     (sigma_b 1.2-1.7, tte 1-3d); 5 shares ~ 1-2.5c; MAX lean at full
+    #     q_max (25 ATM, calm sigma_b 0.9, tte 1d) is ~0.10 x ~ 2.5c.
+    # (c) FIXED norm, not dynamic: q_max ranges ~25 ATM to ~5 deep wing
+    #     (q_max_scale*S'), so a full-inventory wing position leans 4-5x
+    #     less than a full-inventory ATM one under this fixed unit. The
+    #     dimensionless alternative q/q_max (dynamic norm) is the known
+    #     follow-up, deferred -- dynamic q_max has prior stranding history
+    #     and is out of scope for this wave.
+    # (d) Inventory control therefore shifts from the pricing channel to the
+    #     caps/hedge channel: skew_x_cap now binds only in extreme-sigma
+    #     states (e.g. sigma_b_cap=5.0, tte 4d) -- a catastrophe backstop
+    #     again, not the everyday operating regime it was pre-normalization.
+    # Semantics: shares per skew-unit. 1.0 = exact legacy raw-share behavior
+    # (kill switch). <= 0 (incl. NaN via the `> 0` test) is invalid ->
+    # resolved to 1.0 with ONE warning at harness __init__ (precedent:
+    # sizing_region_basis validation, harness.py ~265-271).
+    skew_q_norm: float = 20.0
+
+    # --- post-only book clamp (2026-08-13 bleed-2 fix, item 2) ---
+    # VPS diagnosis (temp/mm_bleed2_fix_plan.md, faucet 1's sibling): a
+    # resting bid ABOVE the venue's best ask (or a resting ask BELOW the
+    # venue's best bid) is modelled by paper_fill_sim as filling at OUR OWN
+    # crossed price with queue_ahead=0 -- a real POST-ONLY maker order would
+    # instead be rejected/repriced by the venue. LIVE INTENT IS post-only
+    # maker orders, so this clamp is that emulation, not a new strategy
+    # layer: spread_builder.post_only_clamp bounds each side of the desired
+    # ladder to stay inside the opposite venue touch by at least this many
+    # ticks, applied in harness.tick BEFORE the QuoteSet is journaled/sent
+    # to the lifecycle (and before the size-skew stage).
+    # Sentinel convention (house style, cf. skew_x_cap <= 0): >= 1 is
+    # ACTIVE -- ticks of clearance kept inside the opposite touch; <= 0
+    # DISABLES the clamp (legacy, byte-identical QuoteSets). 0 is
+    # deliberately in the disabled range, NOT "quote exactly at the touch":
+    # bid == best_ask would match/take immediately, so the minimum
+    # maker-safe margin is 1 tick.
+    # Variant decision: the clamp target is the AGGRESSIVE bound
+    # (best_ask - margin*tick / best_bid + margin*tick) -- price
+    # improvement up to margin ticks inside the opposite touch is still
+    # allowed -- NOT join-the-touch (min(bid, best_bid)), which would
+    # additionally forbid ALL book improvement everywhere and silently turn
+    # the strategy join-only (a strategy decision, out of scope for this
+    # safety fix).
+    # Known hole (recorded, not fixed here): a ONE-SIDED book (the opposite
+    # touch absent/NaN/non-finite/outside (0,1)) leaves that side UNCLAMPED
+    # by design -- nothing to cross against -- so unbounded-vs-mid exposure
+    # persists exactly on thin, one-sided wing books. Follow-up knob idea:
+    # `post_only_join` -- a join-the-touch variant covering that hole, if
+    # the belly-consensus-divergence faucet (explicitly out of scope this
+    # wave) keeps arming it.
+    post_only_margin_ticks: int = 1
 
     # --- skew-aware entry cap (2026-08-10 skew-fix wave item 2) ---
     # With skew_x_cap binding, additional inventory no longer moves the

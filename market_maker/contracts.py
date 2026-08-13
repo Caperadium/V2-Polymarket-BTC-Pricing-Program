@@ -276,6 +276,18 @@ class QuoteSet:
     ask_size: float
     terms: Dict[str, float]  # markup, eps, skew, robust (prob units)
     risk_mode: QuoteMode
+    # Semantic (2026-08-13 bleed-2 fix, item 2 -- spread_builder.py:65 "no-arb
+    # RESTORATION" note): "PAV repair ran on the desired ladder", NOT "the
+    # ladder as sent still passes check().ok". The post-only book clamp
+    # (spread_builder.post_only_clamp, applied by the harness AFTER
+    # LadderHedger.repair() stamps this field) can move prices further
+    # OUTWARD afterward -- harmless per the bid<ask outward argument (never
+    # creates the exploitable ask_K < bid_{K+1}) but can reintroduce an
+    # ask-ladder monotonicity wobble that this flag does not reflect. A
+    # per-quote clamp footprint is visible via the terms["post_only_bid"] /
+    # terms["post_only_ask"] keys (present only when that side moved) --
+    # forensics distinguishing "repaired" from "repaired AND clamped" reads
+    # those, not this field.
     noarb_checked: bool
     source_seq: int
 

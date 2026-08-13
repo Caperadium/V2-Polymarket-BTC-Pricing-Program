@@ -102,7 +102,12 @@ from market_maker.settlement_handler import (
     SettlementHandler,
     settlement_instant_utc,
 )
-from market_maker.spread_builder import build_quote_set, compute_posted_prices, markout_widen
+from market_maker.spread_builder import (
+    build_quote_set,
+    compute_posted_prices,
+    markout_widen,
+    post_only_clamp,
+)
 from market_maker.state_store import MMStateStore
 
 logger = logging.getLogger("mm.harness")
@@ -269,6 +274,27 @@ class PaperTradingLoop:
             logger.warning("unknown sizing_region_basis %r; defaulting to 'mid'", basis)
             basis = "mid"
         self._sizing_region_basis = basis
+        # 2026-08-13 bleed-2 fix item 1: skew q-normalization, validated ONCE
+        # here (same one-time-warning discipline as sizing_region_basis
+        # above). `> 0` also rejects NaN (NaN > 0 is False). Invalid ->
+        # resolved to 1.0 (legacy raw-share behavior), warned once, never in
+        # the hot per-market loop.
+        cfg_skew_q_norm = getattr(self.config, "skew_q_norm", 20.0)
+        if not (cfg_skew_q_norm > 0):
+            logger.warning("invalid skew_q_norm %r; defaulting to 1.0", cfg_skew_q_norm)
+            cfg_skew_q_norm = 1.0
+        self._skew_q_norm = float(cfg_skew_q_norm)
+        # 2026-08-13 bleed-2 fix item 2: post-only book clamp resolved state,
+        # logged ONCE here (not per-tick, same discipline as skew_q_norm
+        # above). Review V2-10: an operator typing 0 expecting "quote at the
+        # touch" must SEE it land in the disabled sentinel range instead --
+        # 0 is not maker-safe (bid == best_ask would match/take), so the
+        # minimum active margin is 1 tick; <= 0 disables (legacy).
+        post_only_margin = int(getattr(self.config, "post_only_margin_ticks", 0) or 0)
+        if post_only_margin >= 1:
+            logger.info("post-only clamp ACTIVE (margin=%d ticks)", post_only_margin)
+        else:
+            logger.info("post-only clamp DISABLED")
         self.bankroll = bankroll
         self.tick_dt_s = tick_dt_s
         self.quote_variant = quote_variant
@@ -514,6 +540,23 @@ class PaperTradingLoop:
         THEN `build_quote_set(..., posted=...)` so the QuoteSet's prices are
         exactly the ones sizing used -- never recomputed.
 
+        CAVEAT (2026-08-13 bleed-2 fix item 2): that invariant is now only
+        true of THIS function's output. `tick()` runs the returned QuoteSets
+        through `LadderHedger.repair()` and then, when
+        `cfg.post_only_margin_ticks >= 1`, `spread_builder.post_only_clamp`
+        -- which CAN move a side's price further outward AFTER sizing ran.
+        This is deliberately sizing-conservative, not sizing-stale, on both
+        legs: the YES leg's Kelly edge prices at `bid_price` (this
+        function's posted bid, before any clamp) -- a clamp that moves the
+        bid DOWN means the eventual QuoteSet risks LESS capital than sizing
+        assumed, i.e. sizing's edge is a floor, not a target. The NO leg
+        prices at `1 - ask_price` -- a clamp that moves the ask UP means `1 -
+        ask_price` falls, again less capital at risk than sizing assumed.
+        Per-tick flow/bucket caps (which sum `size * price`-shaped
+        quantities) therefore OVER-estimate worst-case loss post-clamp, never
+        under-estimate it. See `spread_builder.post_only_clamp`'s docstring
+        for the clamp itself and the terms-decomposition identity it adds.
+
         2026-08-08 wing-bleed fix: the SIZING lookups (600s + the
         `cfg.markout_slow_horizon_s` slow channel) resolve against
         `sizing_src` on `sizing_region` -- a per-market MID-BASIS region
@@ -569,13 +612,27 @@ class PaperTradingLoop:
             # just below, so robustness_sizing's skew-aware entry cap (Stage 6b)
             # agrees with the quote engine's skew_x_cap clamp on the exact bind
             # point, under both variants. Threaded into ContractSizingInput below.
+            #
+            # 2026-08-13 bleed-2 fix item 1 (temp/mm_bleed2_fix_plan.md): both
+            # unit_skew_x here AND the q passed to make_quote_from_config
+            # below are now divided by MMConfig.skew_q_norm (validated once
+            # in __init__ as self._skew_q_norm) -- the config-unit
+            # normalization quote_engine's module docstring always specified
+            # but no caller implemented until now. Dividing both by the same
+            # constant keeps Stage 6b's q_skew_max = skew_q_headroom_mult *
+            # skew_x_cap / unit_skew_x and the quote engine's skew_x agreeing
+            # on the exact same per-share displacement -- normalizing only
+            # one side would desync the cap from the clamp it is supposed to
+            # mirror. Raw q is unchanged everywhere else (inventory, hedging,
+            # risk-rule sign basis, sizing headrooms, reduce-side floor).
             unit_skew_x = per_share_skew_x(
                 self.quote_variant, sigma_b, cfg.gamma, cfg.k_arrival,
                 cfg.arrival_scale_A, tte,
-            )
+            ) / self._skew_q_norm
             q = inventory.per_contract[m].q
             prop = make_quote_from_config(
-                cfg, m, float(fv.consensus_x[k]), q, tte, sigma_b, variant=self.quote_variant, ts=now
+                cfg, m, float(fv.consensus_x[k]), q / self._skew_q_norm, tte, sigma_b,
+                variant=self.quote_variant, ts=now
             )
             proposals[m] = prop
 
@@ -1061,6 +1118,27 @@ class PaperTradingLoop:
 
         checked = self.hedger.repair(qs_list, strikes_sorted, model_cdf, expiry_key=self.expiry_key)
         if checked is not None:
+            # 2026-08-13 bleed-2 fix item 2: post-only book clamp, applied to
+            # the just-repaired ladder BEFORE the size-skew stage so every
+            # downstream consumer (size-skew, last_quote_sets, checked_ladders
+            # journaling, order routing) sees clamped prices. Gated on the
+            # sentinel (>= 1 active, <= 0 disables -- legacy byte-identical,
+            # the pure function is never even called). `market_states` is
+            # this tick's step-1 dict; a market missing from it (should not
+            # happen -- every market in the ladder gets an entry -- but
+            # guarded defensively) passes (None, None), which leaves BOTH
+            # sides unclamped (the one-sided-book hole, by design).
+            margin_ticks = int(getattr(self.config, "post_only_margin_ticks", 0) or 0)
+            if margin_ticks >= 1:
+                clamped = []
+                for qs in checked:
+                    ms = market_states.get(qs.market_id)
+                    bb = ms.best_bid if ms is not None else None
+                    ba = ms.best_ask if ms is not None else None
+                    clamped.append(
+                        post_only_clamp(qs, bb, ba, self.tick_size, self.config.p_clamp, margin_ticks)
+                    )
+                checked = clamped
             # W2.2/W2.2b: apply the PREVIOUS tick's hedge recommendations as a
             # size-skew on this tick's just-repaired ladder, BEFORE it is
             # journaled/persisted/sent to the lifecycle -- the replaced
