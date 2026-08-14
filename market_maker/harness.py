@@ -75,10 +75,13 @@ from market_maker.contracts import (
 )
 from market_maker.fair_value_anchor import (
     BELLY_REGION,
+    DEFAULT_BANKROLL_FLOOR,
     MARKET_MODEL_ID,
     PRICER_MODEL_ID,
     REGIONS,
     WING_REGION,
+    advance_weights,
+    buckets_to_ladder,
     compute_fair_value,
 )
 from market_maker.inventory_manager import InventoryManager
@@ -108,7 +111,7 @@ from market_maker.spread_builder import (
     markout_widen,
     post_only_clamp,
 )
-from market_maker.state_store import MMStateStore
+from market_maker.state_store import BayesScoreRow, MMStateStore
 
 logger = logging.getLogger("mm.harness")
 
@@ -274,6 +277,17 @@ class PaperTradingLoop:
             logger.warning("unknown sizing_region_basis %r; defaulting to 'mid'", basis)
             basis = "mid"
         self._sizing_region_basis = basis
+        # C1 belly drift-anchored Bayes scoring (2026-08-13, temp/mm_c1_
+        # belly_drift_plan.md v3, Part B), validated ONCE here (same one-
+        # time-warning discipline as sizing_region_basis above). The anchor
+        # module itself (fair_value_anchor._resolve_belly_score_mode)
+        # silently falls back to "legacy" for any unrecognized string --
+        # this is the operator-visible warning layer on top of that.
+        belly_mode = str(getattr(self.config, "belly_score_mode", "legacy") or "legacy")
+        if belly_mode not in ("legacy", "shadow", "live"):
+            logger.warning("unknown belly_score_mode %r; defaulting to 'legacy'", belly_mode)
+            belly_mode = "legacy"
+        self._belly_score_mode = belly_mode
         # 2026-08-13 bleed-2 fix item 1: skew q-normalization, validated ONCE
         # here (same one-time-warning discipline as sizing_region_basis
         # above). `> 0` also rejects NaN (NaN > 0 is False). Invalid ->
@@ -362,6 +376,25 @@ class PaperTradingLoop:
         }
         self.prev_forecasts: Optional[Dict[str, np.ndarray]] = None
         self.prev_consensus: Optional[np.ndarray] = None
+
+        # C1 belly drift-anchored Bayes scoring (2026-08-13, temp/mm_c1_
+        # belly_drift_plan.md v3, Part B): harness-owned lag-h buffer +
+        # scoring-event cadence gate feeding compute_fair_value's belly_
+        # lag_* kwargs. In-memory only (plan: "restart pauses drift scoring
+        # for the first h") -- never persisted, so a fresh construction
+        # naturally starts paused.
+        self._belly_lag_buffer: deque = deque()  # (ts, forecasts_dict, consensus_bucket)
+        self._belly_last_score_ts: Optional[datetime] = None
+        # C1 review NEW-4 (BINDING): these two hypothetical-trajectory
+        # states must NEVER enter self.bankroll_states -- the block below
+        # reassigns self.bankroll_states from the anchor's 2-key result
+        # every recompute and would silently drop any extra keys stored
+        # there (and the REGIONS persist loops below would not persist
+        # them either). Kept as their own attributes; None here (fresh
+        # loop -- lazily seeded to 0.5/0.5 on first advance) and reloaded
+        # explicitly via _load_belly_score_states() on both restart paths.
+        self._belly_shadow_state: Optional[BankrollState] = None
+        self._belly_control_state: Optional[BankrollState] = None
         self._x_hist: Dict[str, List[float]] = {m: [] for m, _ in self.markets}
         # Fix 3 (2026-07-26): per-market trailing (ts, mid) history for the
         # ladder mid-velocity pull (risk rule h). Bounded by the
@@ -921,6 +954,313 @@ class PaperTradingLoop:
         ci = self.inv.snapshot(now).per_contract[fill.market_id]
         self.store.record_fill_and_update_inventory(fill, ci)
 
+    # -- C1 belly drift-anchored Bayes scoring (Part B) --------------------
+    # temp/mm_c1_belly_drift_plan.md v3. Wiring and sequencing only -- the
+    # math (drift/control factors, s_tail_frac, advance_weights) all lives
+    # in fair_value_anchor.py (Part A); these helpers just own the harness-
+    # side lag buffer, the scoring-event cadence gate, the two hypothetical
+    # trajectories, and the bayes_score_log journal.
+
+    def _resolve_belly_drift_temper(self) -> float:
+        """Mirrors fair_value_anchor._belly_drift_temper's defensive clamp
+        (module docstring "C1" section) so the harness-owned shadow/control
+        trajectories advance at the identical temper a live-mode belly
+        update itself would use. Kept as a local copy rather than importing
+        the anchor's underscore-prefixed helper across the module boundary;
+        same contract: missing attribute, non-numeric, non-finite, <=0, or
+        >1 all fall back to 1.0 (untempered)."""
+        raw = getattr(self.config, "belly_drift_temper", 1.0)
+        try:
+            t = float(raw)
+        except (TypeError, ValueError):
+            return 1.0
+        if not np.isfinite(t) or t <= 0.0 or t > 1.0:
+            return 1.0
+        return t
+
+    def _belly_lag_buffer_append(self, now: datetime, result) -> None:
+        """Append (ts, forecasts, consensus_bucket) ONLY on a genuine BEUOY
+        recompute. DELIBERATE divergence from the lag-1 channel in tick()
+        (self.prev_forecasts/self.prev_consensus), which is threaded
+        unconditionally including on a FIXED_BLEND_FALLBACK tick -- the
+        lag-1 channel feeds a RELATIVE update (a 0.5-blend fallback
+        consensus is still comparable as "the previous state" for that
+        purpose) while this lag-h buffer feeds an ABSOLUTE drift score (a
+        fallback consensus is not a genuine market signal worth scoring
+        against later). Comment intentionally duplicated at both sites --
+        do not "fix" either to match the other.
+
+        Defensive shape check (plan S4): the market set is fixed at loop
+        construction (self.markets, __init__) and there is no live-reshape
+        path, so a mismatch here would only ever indicate a bug -- drop the
+        WHOLE buffer rather than risk mixing entry shapes (logged at debug;
+        no need to hunt for a reshape path)."""
+        if result.fair_value.anchor_method != AnchorMethod.BEUOY:
+            return
+        expected_n = len(self.strikes) + 1
+        consensus = result.consensus_bucket
+        forecasts = result.forecasts
+        if consensus.shape != (expected_n,) or any(
+            arr.shape != (expected_n,) for arr in forecasts.values()
+        ):
+            logger.debug(
+                "C1 belly lag buffer: shape mismatch vs ladder width %d; dropping buffer",
+                expected_n,
+            )
+            self._belly_lag_buffer.clear()
+            return
+        self._belly_lag_buffer.append((now, forecasts, consensus))
+
+    def _belly_lag_buffer_evict(self, now: datetime) -> None:
+        """Drop entries older than horizon + slack -- beyond that age no
+        future scoring-gate check could ever pick them (plan "Cadence, lag
+        buffer, temper" section)."""
+        horizon_s = float(getattr(self.config, "belly_drift_horizon_s", 3600.0))
+        slack_s = float(getattr(self.config, "belly_drift_max_slack_s", 900.0))
+        max_age = timedelta(seconds=horizon_s + slack_s)
+        while self._belly_lag_buffer and (now - self._belly_lag_buffer[0][0]) > max_age:
+            self._belly_lag_buffer.popleft()
+
+    def _oldest_qualifying_belly_lag_entry(
+        self, now: datetime,
+    ) -> Optional[Tuple[datetime, Dict[str, np.ndarray], np.ndarray]]:
+        """Oldest buffer entry with age in [horizon, horizon + slack], or
+        None. The buffer is append-right (newest at the end), so a plain
+        left-to-right scan naturally visits the oldest entry first."""
+        horizon_s = float(getattr(self.config, "belly_drift_horizon_s", 3600.0))
+        slack_s = float(getattr(self.config, "belly_drift_max_slack_s", 900.0))
+        lo = timedelta(seconds=horizon_s)
+        hi = timedelta(seconds=horizon_s + slack_s)
+        for entry in self._belly_lag_buffer:
+            age = now - entry[0]
+            if lo <= age <= hi:
+                return entry
+        return None
+
+    def _belly_scoring_gate(
+        self, now: datetime,
+    ) -> Tuple[Dict[str, Any], Optional[datetime], Optional[str]]:
+        """C1 (Part B) scoring-event gate (plan "Cadence, lag buffer,
+        temper" section): at most one attempt per belly_drift_interval_s,
+        REGARDLESS of whether a qualifying lag entry is found on that
+        attempt -- this bounds the harness to the plan's fixed ~96
+        events/day cadence instead of retrying (and journaling a skip row)
+        on every single tick during a cold-start or fallback-recovery
+        window before the buffer has anything in range; an engineering
+        reading of the plan's "regardless of skip outcome ... a skipped
+        event still consumed its slot" extended to the harness's own gate
+        miss, not only the anchor's internal skip.
+
+        Returns (kwargs to thread into compute_fair_value -- empty on no
+        attempt or a gate miss, the picked entry's lag ts or None, a
+        harness-level miss reason "no_lag"/"stale_lag" or None). Always
+        ({}, None, None) in "legacy" mode."""
+        if self._belly_score_mode == "legacy":
+            return {}, None, None
+        interval_s = float(getattr(self.config, "belly_drift_interval_s", 900.0))
+        interval_elapsed = (
+            self._belly_last_score_ts is None
+            or (now - self._belly_last_score_ts).total_seconds() >= interval_s
+        )
+        if not interval_elapsed:
+            return {}, None, None
+        entry = self._oldest_qualifying_belly_lag_entry(now)
+        if entry is None:
+            reason = "no_lag" if not self._belly_lag_buffer else "stale_lag"
+            return {}, None, reason
+        lag_ts, lag_forecasts, lag_consensus = entry
+        kwargs = dict(
+            belly_lag_forecasts=lag_forecasts,
+            belly_lag_consensus=lag_consensus,
+            belly_lag_ts=lag_ts,
+        )
+        return kwargs, lag_ts, None
+
+    def _advance_one_belly_track(
+        self, state: BankrollState, factors: Dict[str, float], model_ids: List[str],
+        temper: float, floor: float, now: datetime, region: str,
+    ) -> BankrollState:
+        """One shared-helper advance (fair_value_anchor.advance_weights,
+        review NEW-7) for a harness-owned hypothetical trajectory, then
+        durably persist it under its region key. A degenerate advance
+        (None return) leaves the state unchanged -- matches advance_
+        weights' own contract for the applied loop."""
+        w_pre = np.array([state.bankrolls.get(mid, 0.0) for mid in model_ids], dtype=float)
+        f = np.array([factors[mid] for mid in model_ids], dtype=float)
+        w_upd = advance_weights(w_pre, f, temper, floor)
+        if w_upd is None:
+            return state
+        new_state = BankrollState(
+            model_ids=list(model_ids),
+            bankrolls={mid: float(w_upd[i]) for i, mid in enumerate(model_ids)},
+            last_update=now,
+            update_count=state.update_count + 1,
+            frozen=False,
+        )
+        self.store.append_bankroll_state(self.expiry_key, new_state, region=region)
+        return new_state
+
+    def _advance_belly_trajectories(self, now: datetime, result) -> None:
+        """Advance the two harness-owned hypothetical BankrollStates
+        (drift track / rate-matched control track) -- "shadow" mode ONLY
+        (plan NEW-8 collapse rule: in "live" mode the drift track IS the
+        applied belly state, so a second copy here would disagree on
+        update_count with the persisted bankrolls rows). Only called when
+        result.belly_drift_factors is not None (a successful scoring
+        event) -- callers must check that first."""
+        if self._belly_score_mode != "shadow" or result.belly_drift_factors is None:
+            return
+        model_ids = list(self.bankroll_states[BELLY_REGION].model_ids)
+        temper = self._resolve_belly_drift_temper()
+        floor = float(getattr(self.config, "bankroll_floor", DEFAULT_BANKROLL_FLOOR))
+        if self._belly_shadow_state is None:
+            self._belly_shadow_state = _initial_bankroll_state(now)
+        if self._belly_control_state is None:
+            self._belly_control_state = _initial_bankroll_state(now)
+        self._belly_shadow_state = self._advance_one_belly_track(
+            self._belly_shadow_state, result.belly_drift_factors, model_ids,
+            temper, floor, now, region="belly_drift_shadow",
+        )
+        self._belly_control_state = self._advance_one_belly_track(
+            self._belly_control_state, result.belly_control_factors, model_ids,
+            temper, floor, now, region="belly_legacy_control",
+        )
+
+    def _belly_divergence_and_snapshot(self, result) -> Tuple[Optional[float], list]:
+        """C1 (Part B, plan review NEW-6): SANITIZED ladders reconstructed
+        from THIS refresh's result.forecasts via buckets_to_ladder -- the
+        same round-trip the consensus pipeline itself runs on, never the
+        raw pre-sanitization inputs. belly_divergence = mean(consensus_p -
+        market_san) over belly strikes (None if none this tick);
+        belly_snapshot = [[strike, pricer_san, market_san], ...] for the
+        same strikes (JSON-serialized by the store)."""
+        market_san = buckets_to_ladder(result.forecasts[MARKET_MODEL_ID])
+        pricer_san = buckets_to_ladder(result.forecasts[PRICER_MODEL_ID])
+        belly_band = self.config.belly_band
+        consensus_p = result.fair_value.consensus_p
+        diffs: List[float] = []
+        snapshot: List[List[float]] = []
+        for i, k in enumerate(self.strikes):
+            if in_belly_band(float(market_san[i]), belly_band):
+                diffs.append(float(consensus_p[k]) - float(market_san[i]))
+                snapshot.append([k, float(pricer_san[i]), float(market_san[i])])
+        divergence = float(np.mean(diffs)) if diffs else None
+        return divergence, snapshot
+
+    def _journal_belly_score_event(
+        self, now: datetime, result, lag_ts: Optional[datetime],
+    ) -> None:
+        """C1 (Part B) JOURNALING for a gate-fired attempt (event key =
+        (ts, expiry_key), state_store review NEW-3): a SUCCESS
+        (result.belly_drift_factors is not None) writes one row per
+        model_id; an anchor-level skip (result.belly_score_skip) writes
+        exactly ONE row with model_id=''."""
+        belly_divergence, belly_snapshot = self._belly_divergence_and_snapshot(result)
+        anchor_method = result.fair_value.anchor_method.value
+        lag_s = (now - lag_ts).total_seconds() if lag_ts is not None else None
+        weight_applied_after = float(
+            result.bankroll_states[BELLY_REGION].bankrolls.get(PRICER_MODEL_ID, 0.5)
+        )
+        mode = self._belly_score_mode
+
+        if result.belly_drift_factors is not None:
+            if mode == "live":
+                # NEW-8 collapse: the drift track IS the applied belly
+                # state in live mode; the control track is not maintained.
+                weight_drift_after: Optional[float] = weight_applied_after
+                weight_control_after: Optional[float] = None
+            else:
+                weight_drift_after = (
+                    self._belly_shadow_state.bankrolls.get(PRICER_MODEL_ID)
+                    if self._belly_shadow_state is not None else None
+                )
+                weight_control_after = (
+                    self._belly_control_state.bankrolls.get(PRICER_MODEL_ID)
+                    if self._belly_control_state is not None else None
+                )
+            model_ids = list(self.bankroll_states[BELLY_REGION].model_ids)
+            rows = [
+                BayesScoreRow(
+                    ts=now, expiry_key=self.expiry_key, mode=mode, model_id=mid,
+                    # factor_legacy: the anchor does not expose the applied
+                    # lag-1 factors it used for the legacy per-refresh
+                    # update; no acceptance criterion consumes this field.
+                    factor_legacy=None,
+                    factor_drift=float(result.belly_drift_factors[mid]),
+                    factor_control=float(result.belly_control_factors[mid]),
+                    skip_reason=None,
+                    anchor_method=anchor_method,
+                    lag_s=lag_s,
+                    belly_divergence=belly_divergence,
+                    s_tail_frac=result.belly_s_tail_frac,
+                    belly_snapshot=belly_snapshot,
+                    weight_applied_after=weight_applied_after,
+                    weight_drift_after=weight_drift_after,
+                    weight_control_after=weight_control_after,
+                )
+                for mid in model_ids
+            ]
+        else:
+            rows = [
+                BayesScoreRow(
+                    ts=now, expiry_key=self.expiry_key, mode=mode, model_id="",
+                    factor_legacy=None, factor_drift=None, factor_control=None,
+                    skip_reason=result.belly_score_skip,
+                    anchor_method=anchor_method,
+                    lag_s=lag_s,
+                    belly_divergence=belly_divergence,
+                    s_tail_frac=result.belly_s_tail_frac,
+                    belly_snapshot=belly_snapshot,
+                    weight_applied_after=weight_applied_after,
+                    weight_drift_after=None,
+                    weight_control_after=None,
+                )
+            ]
+        self.store.append_bayes_scores(rows)
+
+    def _journal_belly_gate_skip(self, now: datetime, reason: str, result) -> None:
+        """C1 (Part B) JOURNALING for a HARNESS-level gate miss (the
+        interval elapsed but no qualifying lag entry was found -- the
+        anchor's own C1 branch never ran this tick). ONE row, model_id='',
+        skip_reason "no_lag" (buffer empty) or "stale_lag" (buffer
+        non-empty but nothing in [horizon, horizon+slack]) -- distinct
+        from the anchor's own "no_lag" (kwargs absent), which this gate
+        miss also produces internally but is superseded here by the more
+        precise harness-level reason."""
+        belly_divergence, belly_snapshot = self._belly_divergence_and_snapshot(result)
+        weight_applied_after = float(
+            result.bankroll_states[BELLY_REGION].bankrolls.get(PRICER_MODEL_ID, 0.5)
+        )
+        row = BayesScoreRow(
+            ts=now, expiry_key=self.expiry_key, mode=self._belly_score_mode, model_id="",
+            factor_legacy=None, factor_drift=None, factor_control=None,
+            skip_reason=reason,
+            anchor_method=result.fair_value.anchor_method.value,
+            lag_s=None,
+            belly_divergence=belly_divergence,
+            s_tail_frac=None,
+            belly_snapshot=belly_snapshot,
+            weight_applied_after=weight_applied_after,
+            weight_drift_after=None,
+            weight_control_after=None,
+        )
+        self.store.append_bayes_scores([row])
+
+    def _load_belly_score_states(self, now: datetime) -> None:
+        """C1 (Part B) restart loader for the two harness-owned
+        hypothetical-trajectory states -- called from BOTH restart paths
+        (restart() and resume_attach()), ALONGSIDE (never inside)
+        _resume_bankroll_states: review NEW-4 is binding, these states
+        must never be merged into self.bankroll_states. Missing rows ->
+        fresh 0.5/0.5 (matches _initial_bankroll_state). Only meaningful
+        in mode "shadow" (live collapses the drift track into the applied
+        belly state, NEW-8; legacy never advances either track) -- harmless
+        to call regardless of mode."""
+        shadow = self.store.get_latest_bankroll_state(self.expiry_key, region="belly_drift_shadow")
+        control = self.store.get_latest_bankroll_state(self.expiry_key, region="belly_legacy_control")
+        self._belly_shadow_state = shadow if shadow is not None else _initial_bankroll_state(now)
+        self._belly_control_state = control if control is not None else _initial_bankroll_state(now)
+
     # -- one tick ---------------------------------------------------------
 
     def tick(
@@ -1027,9 +1367,17 @@ class PaperTradingLoop:
         # last_fair_value retains a stale BEUOY method on non-recompute ticks.
         self._fv_recomputed_this_tick = len(mids) == len(self.markets)
         if self._fv_recomputed_this_tick:
+            # C1 (Part B, temp/mm_c1_belly_drift_plan.md): scoring-event
+            # gate, computed BEFORE the anchor call so a fired attempt's
+            # lag kwargs can be threaded straight into compute_fair_value
+            # this same tick. No-ops ({}, None, None) in "legacy" mode.
+            belly_lag_kwargs, belly_lag_ts, belly_gate_miss_reason = (
+                self._belly_scoring_gate(now)
+            )
             result = compute_fair_value(
                 snap, mids, self.bankroll_states, self.config, market_ts=now,
                 prev_forecasts=self.prev_forecasts, prev_consensus=self.prev_consensus, ts=now,
+                **belly_lag_kwargs,
             )
             self.bankroll_states = result.bankroll_states
             self.prev_forecasts = result.forecasts
@@ -1040,6 +1388,21 @@ class PaperTradingLoop:
                 self.store.append_bankroll_state(
                     self.expiry_key, self.bankroll_states[region], region=region,
                 )
+
+            # C1 (Part B): lag-h buffer bookkeeping + scoring-event
+            # trajectories/journaling -- no-op entirely in "legacy" mode
+            # (quoting-neutral by construction: nothing here ever touches
+            # self.bankroll_states or fv).
+            if self._belly_score_mode != "legacy":
+                self._belly_lag_buffer_append(now, result)
+                self._belly_lag_buffer_evict(now)
+                if belly_lag_kwargs or belly_gate_miss_reason is not None:
+                    self._belly_last_score_ts = now
+                    if belly_lag_kwargs:
+                        self._advance_belly_trajectories(now, result)
+                        self._journal_belly_score_event(now, result, belly_lag_ts)
+                    else:
+                        self._journal_belly_gate_skip(now, belly_gate_miss_reason, result)
 
             # W1.3: bankroll auto-unfreeze streak. Resets to 0 on any
             # recomputed tick whose anchor is non-BEUOY (fallback fired);
@@ -1392,6 +1755,7 @@ class PaperTradingLoop:
                 replayed += 1
 
         self.bankroll_states = _resume_bankroll_states(self.store, self.expiry_key, now)
+        self._load_belly_score_states(now)
         return replayed
 
     def restart(self, now: Optional[datetime] = None):
@@ -1412,4 +1776,5 @@ class PaperTradingLoop:
         recon = self.lifecycle.restart_reconcile()
 
         self.bankroll_states = _resume_bankroll_states(self.store, self.expiry_key, now)
+        self._load_belly_score_states(now)
         return recon

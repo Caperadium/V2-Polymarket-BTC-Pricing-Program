@@ -130,7 +130,7 @@ from market_maker.shadow_runner import (
     resolve_events_multi,
     resolve_next_event,
 )
-from market_maker.state_store import MMStateStore
+from market_maker.state_store import BAYES_SCORE_RETENTION_S, MMStateStore
 
 logger = logging.getLogger("mm.paper")
 
@@ -1071,6 +1071,15 @@ def run(argv: Optional[List[str]] = None) -> int:
                         store.prune_trade_prints(now - timedelta(seconds=orch.config.quotes_retention_s))
                     except Exception:
                         logger.warning("prune_trade_prints failed at tick %d", tick_n, exc_info=True)
+
+                    # C1 (2026-08-13, temp/mm_c1_belly_drift_plan.md): prune
+                    # bayes_score_log on the same cadence, its own 28d
+                    # retention (deliberately != quotes_retention_s -- this
+                    # table is the shadow-mode acceptance dataset).
+                    try:
+                        store.prune_bayes_score_log(now - timedelta(seconds=BAYES_SCORE_RETENTION_S))
+                    except Exception:
+                        logger.warning("prune_bayes_score_log failed at tick %d", tick_n, exc_info=True)
 
                     # W1.1: persist per-market LiquidityState per slot.
                     for s in orch.slots.values():

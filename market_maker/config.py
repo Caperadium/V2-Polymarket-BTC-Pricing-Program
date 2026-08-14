@@ -407,6 +407,81 @@ class MMConfig:
     # (no effect until then).
     bankroll_update_temper: float = 0.1
 
+    # --- C1 belly drift-anchored Bayes scoring (2026-08-13,
+    # temp/mm_c1_belly_drift_plan.md v3) ---
+    # Evidence: fair_value_anchor.py's belly Bayes update is a self-
+    # confirmation loop (factors score a model's previous forecast against a
+    # consensus built from that model's OWN pre-update weights,
+    # fair_value_anchor.py ~line 505); measured
+    # (temp/mm_belly_divergence_experiment.md, 7d/66k ticks) a RICH belly
+    # consensus loses to the mid at settlement in EVERY divergence bucket
+    # (Brier gap +0.034 -> +0.116) and the mid drifts AWAY from fair at
+    # 5-20c divergence (frac-toward 0.38-0.41).
+    #
+    # Update law (fair_value_anchor.py module docstring "C1" section carries
+    # the full derivation): with d = M_lag - P_lag, c_lag = M_lag - w_p*d,
+    # target M_now = M_lag - alpha*d + e (alpha = fraction of the lagged
+    # divergence closed toward the pricer by market_now; e = martingale
+    # noise):
+    #     factor_market - factor_pricer = (w_p - alpha)*S + sum_j(e_j*d_j/c_lag_j)
+    #     S = sum_j(d_j^2 / c_lag_j) >= 0
+    # Martingale data (alpha=0, e=0) always favors the market by construction
+    # (the old belly-SUBSET factor's failure mode -- crediting the pricer on
+    # pure martingale data -- is impossible over this FULL-support form,
+    # since both bucket vectors sum to 1 and the subset's drift-independent
+    # bias dMass_R is then identically 0). The pricer gains weight only when
+    # alpha > w_p: the update's INTERIOR FIXED POINT is the S-WEIGHTED
+    # average fractional divergence-close -- NOT assumed equal to the raw
+    # experiment's frac-toward composition; with a tail-dominated S the
+    # equilibrium composition must be MEASURED in shadow before any flip
+    # (`s_tail_frac`, acceptance criterion 5 below). Per-event noise runs
+    # ~2x the drift signal but accumulates linearly in n vs noise's sqrt(n)
+    # (daily SNR ~5 at ~96 events/day): the resulting belly pricer weight is
+    # a mean-reverting walk AROUND the fixed point, not a convergent
+    # constant -- shadow tracks its realized stdev (acceptance criterion 6).
+    #
+    # Tail-dominance caveat: on a realistic ladder with the model's known
+    # OTM upper-tail richness, most of S can sit in the two open-tail
+    # buckets (0 and n) -- `s_tail_frac` is their share of S. If shadow
+    # shows this is PERSISTENT (median s_tail_frac > 0.6), C1 is measuring
+    # tail richness, not belly drift -- do NOT flip; the recorded fallback
+    # design is LADDER-SPACE belly scoring (score p-space distances on
+    # belly strikes directly -- no bucket transform, so no tail leakage),
+    # NOT implemented this wave.
+    #
+    # Speed law (days to move Dlogit of belly pricer weight):
+    #     days_to_move ~ Dlogit / (t * E[(w_p - alpha) * S] * events_per_day)
+    # Worked example (S ~ 0.069 at uniform 10c divergence, w_p 0.7, alpha
+    # 0.4, t 0.3, 96 events/day): ~0.59 logit/day -> belly weight 0.9 -> 0.4
+    # in ~4-5 days. Speed levers IN ORDER (do not skip straight to cadence):
+    # temper up toward 1.0 FIRST (3.3x headroom from this 0.3 placeholder --
+    # `advance_weights`'s temper<1.0 gate means it can never exceed 1.0),
+    # THEN cadence (belly_drift_interval_s).
+    #
+    # Flip procedure: belly_score_mode "shadow" -> "live" is ONE config
+    # line, normal push flow, gated on >= 7 days of VPS shadow clearing all
+    # 6 acceptance criteria in the plan's "Acceptance criteria" section.
+    # Expected side effects recorded there (belly credibility widening
+    # scales with (1 - w_p); belly update_count steps at scoring-event
+    # cadence, ~96/day, instead of per-refresh, ~5760/day) are anticipated,
+    # not alarming on their own.
+    #
+    # If the wing pricer weight pin (wing_pricer_weight_pin) is ever
+    # retired, this full-support scoring is NOT automatically safe to reuse
+    # for the wing region as-is -- the correct per-region form is
+    # CONDITIONAL RENORMALIZATION (renormalize the target, lagged
+    # forecasts, and divisor over the region's own bucket idxs); recorded,
+    # not implemented -- do not extend this scheme to wing without it.
+    #
+    # C2 (recorded, out of scope this wave): settlement-anchored scoring --
+    # the persisted `belly_snapshot` history in state_store.bayes_score_log
+    # accumulates exactly the forecast history it would need.
+    belly_score_mode: str = "shadow"  # "legacy" | "shadow" | "live"
+    belly_drift_horizon_s: float = 3600.0  # h: matches the experiment's signal horizon
+    belly_drift_interval_s: float = 900.0  # scoring-event cadence (harness-owned event gate)
+    belly_drift_max_slack_s: float = 900.0  # max staleness of a lag-h buffer entry still accepted as an event
+    belly_drift_temper: float = 0.3  # EXPLICIT PLACEHOLDER pending shadow calibration; see speed law above
+
 
 def in_belly_band(p: float, belly_band: Tuple[float, float]) -> bool:
     """Inclusive belly-band membership: belly_lo <= p <= belly_hi.

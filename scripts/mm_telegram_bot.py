@@ -9,8 +9,13 @@ this bot ANSWERS operator queries about current engine metrics.
 Commands
 --------
   /status     engine state (run_control), tick, feed health, per-expiry lines
+              + compact C1 shadow belly pricer weights when shadow rows exist
   /bankroll   initial bankroll + current equity (latest pnl TOTAL row)
               + rebates accrued (est, maker-rebate accounting layer)
+              + C1 belly pricer weight per expiry (applied/shadow/control,
+                bankrolls regions belly / belly_drift_shadow /
+                belly_legacy_control -- shadow rows exist only while
+                MMConfig.belly_score_mode == "shadow")
   /pnl        realized / unrealized / settlement breakdown of the TOTAL row
   /fills      fill counts (maker/taker/settlement, last 24h) + last fill
   /inventory  open positions (q != 0) with strike/expiry
@@ -228,6 +233,36 @@ def _hb(status: Any) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+_C1_REGIONS = ("belly", "belly_drift_shadow", "belly_legacy_control")
+
+
+def _c1_belly_weights(src: MetricsSource) -> Dict[str, Dict[str, Tuple[float, int]]]:
+    """Latest belly pricer weight per (expiry, region) from the bankrolls
+    table: {expiry_key: {region: (pricer_weight, update_count)}}. Empty dict
+    when no C1 shadow rows exist (mode legacy/live, or no db) -- callers skip
+    their section entirely then. Weight = pricer bankroll / sum (rows are
+    stored normalized; the division is a defensive no-op)."""
+    rows = src.query(
+        "SELECT b.expiry_key, b.region, b.bankrolls, b.update_count "
+        "FROM bankrolls b JOIN (SELECT expiry_key, region, MAX(id) AS mid "
+        "  FROM bankrolls WHERE region IN (?, ?, ?) GROUP BY expiry_key, region) m "
+        "ON b.id = m.mid", _C1_REGIONS)
+    out: Dict[str, Dict[str, Tuple[float, int]]] = {}
+    for ek, region, bk_json, n_upd in rows or []:
+        try:
+            bk = json.loads(bk_json)
+            total = sum(float(v) for v in bk.values())
+            w = float(bk.get("pricer", 0.0)) / total if total > 0 else float("nan")
+        except (ValueError, TypeError, AttributeError):
+            continue
+        out.setdefault(str(ek), {})[str(region)] = (w, int(n_upd or 0))
+    # Only report when at least one SHADOW row exists -- the plain 'belly'
+    # region always has rows and alone is not C1 information.
+    if not any("belly_drift_shadow" in regions for regions in out.values()):
+        return {}
+    return out
+
+
 def cmd_status(src: MetricsSource) -> str:
     status = src.status()
     hb = _hb(status)
@@ -255,6 +290,15 @@ def cmd_status(src: MetricsSource) -> str:
         run_info = status.run_info if isinstance(status.run_info, dict) else {}
         if run_info.get("exit_reason"):
             lines.append("last exit_reason: %s" % run_info.get("exit_reason"))
+    c1 = _c1_belly_weights(src)
+    if c1:
+        parts = []
+        for ek in sorted(c1):
+            sh = c1[ek].get("belly_drift_shadow")
+            if sh is not None:
+                parts.append("%s %.2f(n%d)" % (ek[5:], sh[0], sh[1]))
+        if parts:
+            lines.append("C1 shadow belly w: %s" % ", ".join(parts))
     return "\n".join(lines)
 
 
@@ -292,6 +336,20 @@ def cmd_bankroll(src: MetricsSource) -> str:
         lines.append("rebates accrued (est, not in equity): %s" % _money(reb[0][0]))
     if _hb(status).get("bankroll_frozen"):
         lines.append("WARNING: Beuoy bankroll FROZEN (fixed-blend fallback)")
+    c1 = _c1_belly_weights(src)
+    if c1:
+        lines.append("C1 belly pricer w (applied/shadow/control):")
+        for ek in sorted(c1):
+            regions = c1[ek]
+
+            def _fmt(region: str) -> str:
+                v = regions.get(region)
+                return "%.2f" % v[0] if v is not None else "-"
+
+            sh = regions.get("belly_drift_shadow")
+            lines.append("  %s: %s / %s / %s (events %d)" % (
+                ek, _fmt("belly"), _fmt("belly_drift_shadow"),
+                _fmt("belly_legacy_control"), sh[1] if sh else 0))
     return "\n".join(lines)
 
 

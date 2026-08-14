@@ -73,6 +73,13 @@ DEFAULT_DB_PATH = os.path.join("market_maker", "mm_state.db")
 # VenueAdapter boundary); kept local to the store.
 ORDER_STATUSES = ("PENDING", "LIVE", "CANCELLED", "FILLED", "UNKNOWN")
 
+# C1 belly drift-anchored Bayes scoring (2026-08-13, temp/mm_c1_belly_
+# drift_plan.md): bayes_score_log retention. Deliberately != quotes_
+# retention_s (14d) -- this table is the shadow-mode acceptance dataset
+# (>= 7 days of VPS shadow required, plan "Acceptance criteria" section),
+# so it needs more headroom than the routine quote-history table.
+BAYES_SCORE_RETENTION_S = 28 * 86400.0
+
 
 # ---------------------------------------------------------------------------
 # Small local record types for tables with no Section-4 contract dataclass.
@@ -135,6 +142,40 @@ class PnlSnapshot:
     unrealized_mid: float
     settlement_pnl: float
     bankroll_utilization: float
+
+
+@dataclass
+class BayesScoreRow:
+    """One `bayes_score_log` row (C1 belly drift-anchored Bayes scoring,
+    temp/mm_c1_belly_drift_plan.md; market_maker.fair_value_anchor module
+    docstring "C1" section).
+
+    Event identity (review NEW-3): `(ts, expiry_key)` IS the event key -- a
+    successful scoring event writes one row per model_id; a SKIPPED event
+    writes exactly ONE row with `model_id=''`. Every per-event rate in the
+    plan's acceptance criteria is computed over DISTINCT (ts, expiry_key)
+    events, never raw rows.
+    """
+    ts: datetime
+    expiry_key: str
+    mode: str
+    model_id: str
+    factor_legacy: Optional[float]  # NULL on skip
+    factor_drift: Optional[float]  # NULL on skip
+    factor_control: Optional[float]  # NULL on skip
+    skip_reason: Optional[str]  # None on success; else one of no_lag|
+    # stale_lag|shape_mismatch|frozen|non_finite|s_le_0|fallback
+    anchor_method: str
+    lag_s: Optional[float]
+    belly_divergence: Optional[float]  # mean(consensus_p - mid) over belly strikes
+    s_tail_frac: Optional[float]  # share of S from buckets 0 and n (review NEW-1)
+    # JSON-able [[strike, pricer_p_SANITIZED, mid_p_SANITIZED], ...] (review
+    # NEW-6: the sanitized `recon` ladders the consensus pipeline actually
+    # runs on, NOT the raw pre-sanitization inputs).
+    belly_snapshot: Optional[Any]
+    weight_applied_after: Optional[float]
+    weight_drift_after: Optional[float]
+    weight_control_after: Optional[float]
 
 
 # ---------------------------------------------------------------------------
@@ -492,6 +533,48 @@ class MMStateStore:
             # prune_trade_prints filters on ts alone (mirrors idx_mid_log_ts).
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_trade_prints_ts ON trade_prints(ts)"
+            )
+            # C1 belly drift-anchored Bayes scoring (2026-08-13, temp/
+            # mm_c1_belly_drift_plan.md): the shadow-mode acceptance
+            # dataset. CREATE TABLE IF NOT EXISTS auto-migrates a pre-
+            # existing db on next open (fill_markouts precedent -- this is
+            # a brand-new table, not a new column on an existing one, so no
+            # ALTER TABLE is needed). Event identity (review NEW-3): (ts,
+            # expiry_key) is the event key -- a successful event writes one
+            # row per model_id; a skipped event writes ONE row with
+            # model_id=''.
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS bayes_score_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts TEXT NOT NULL,
+                    expiry_key TEXT NOT NULL,
+                    mode TEXT NOT NULL,
+                    model_id TEXT NOT NULL,
+                    factor_legacy REAL,
+                    factor_drift REAL,
+                    factor_control REAL,
+                    skip_reason TEXT,
+                    anchor_method TEXT NOT NULL,
+                    lag_s REAL,
+                    belly_divergence REAL,
+                    s_tail_frac REAL,
+                    belly_snapshot TEXT,
+                    weight_applied_after REAL,
+                    weight_drift_after REAL,
+                    weight_control_after REAL
+                )
+                """
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_bayes_score_log_ts ON bayes_score_log(ts)"
+            )
+            # Composite index for per-expiry event-history reads (mirrors
+            # idx_bankrolls_expiry_region); prune_bayes_score_log itself
+            # only needs the ts-only index above.
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_bayes_score_log_expiry_ts "
+                "ON bayes_score_log(expiry_key, ts)"
             )
 
     # ------------------------------------------------------------------
@@ -1370,5 +1453,89 @@ class MMStateStore:
         with self._conn:
             cur = self._conn.execute(
                 "DELETE FROM trade_prints WHERE ts < ?", (_dt_to_iso(older_than),)
+            )
+        return cur.rowcount
+
+    # ------------------------------------------------------------------
+    # bayes_score_log (C1 belly drift-anchored Bayes scoring, 2026-08-13:
+    # temp/mm_c1_belly_drift_plan.md -- the shadow-mode acceptance dataset)
+    # ------------------------------------------------------------------
+
+    def append_bayes_scores(self, rows: List[BayesScoreRow]) -> int:
+        """Durably log one scoring event's full row set (one row per model
+        on success, exactly ONE row with model_id='' on a skip -- event
+        identity is (ts, expiry_key), never a single row in isolation).
+        Plain INSERT via executemany (mirrors `append_trade_prints`, not
+        the INSERT-OR-IGNORE `append_fill_markouts` -- there is no natural
+        conflict target here). No-op on an empty list; returns len(rows)."""
+        if not rows:
+            return 0
+        with self._conn:
+            self._conn.executemany(
+                """
+                INSERT INTO bayes_score_log
+                    (ts, expiry_key, mode, model_id, factor_legacy, factor_drift,
+                     factor_control, skip_reason, anchor_method, lag_s,
+                     belly_divergence, s_tail_frac, belly_snapshot,
+                     weight_applied_after, weight_drift_after, weight_control_after)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        _dt_to_iso(r.ts), r.expiry_key, r.mode, r.model_id,
+                        r.factor_legacy, r.factor_drift, r.factor_control,
+                        r.skip_reason, r.anchor_method, r.lag_s,
+                        r.belly_divergence, r.s_tail_frac,
+                        _to_json(r.belly_snapshot) if r.belly_snapshot is not None else None,
+                        r.weight_applied_after, r.weight_drift_after, r.weight_control_after,
+                    )
+                    for r in rows
+                ],
+            )
+        return len(rows)
+
+    def _bayes_score_from_row(self, row: sqlite3.Row) -> BayesScoreRow:
+        return BayesScoreRow(
+            ts=_iso_to_dt(row["ts"]),
+            expiry_key=row["expiry_key"],
+            mode=row["mode"],
+            model_id=row["model_id"],
+            factor_legacy=row["factor_legacy"],
+            factor_drift=row["factor_drift"],
+            factor_control=row["factor_control"],
+            skip_reason=row["skip_reason"],
+            anchor_method=row["anchor_method"],
+            lag_s=row["lag_s"],
+            belly_divergence=row["belly_divergence"],
+            s_tail_frac=row["s_tail_frac"],
+            belly_snapshot=_from_json(row["belly_snapshot"], None),
+            weight_applied_after=row["weight_applied_after"],
+            weight_drift_after=row["weight_drift_after"],
+            weight_control_after=row["weight_control_after"],
+        )
+
+    def get_bayes_scores(self, since_ts: Optional[datetime] = None) -> List[BayesScoreRow]:
+        """All `bayes_score_log` rows, optionally restricted to `ts >=
+        since_ts` (inclusive), ordered by insertion (id ASC)."""
+        if since_ts is None:
+            rows = self._conn.execute(
+                "SELECT * FROM bayes_score_log ORDER BY id ASC"
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM bayes_score_log WHERE ts >= ? ORDER BY id ASC",
+                (_dt_to_iso(since_ts),),
+            ).fetchall()
+        return [self._bayes_score_from_row(r) for r in rows]
+
+    def prune_bayes_score_log(self, cutoff_ts: datetime) -> int:
+        """Delete `bayes_score_log` rows strictly older than `cutoff_ts`
+        (module constant BAYES_SCORE_RETENTION_S = 28d, deliberately !=
+        quotes_retention_s's 14d -- this table is the C1 shadow-mode
+        acceptance dataset). Mirrors `prune_quotes`/`prune_mid_log`.
+        Returns the number of rows deleted."""
+        with self._conn:
+            cur = self._conn.execute(
+                "DELETE FROM bayes_score_log WHERE ts < ?", (_dt_to_iso(cutoff_ts),)
             )
         return cur.rowcount

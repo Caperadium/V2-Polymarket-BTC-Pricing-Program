@@ -120,6 +120,100 @@ changes the RATE, not the attractor -- the 0.98/0.02 self-confirmation corner
 is still where the dynamic points; this only bounds the damage rate. The
 skip rules (3.3), floor, normalization, and update_count semantics are all
 unchanged by tempering -- it only shrinks the per-tick step size.
+
+C1 -- BELLY DRIFT-ANCHORED BAYES SCORING (2026-08-13, temp/mm_c1_belly_
+drift_plan.md v3). The legacy belly Bayes update above is a self-
+confirmation loop: factors score a model's PREVIOUS forecast against a
+consensus built from that SAME model's own PRE-update weights, so the
+dominant model keeps winning (measured, temp/mm_belly_divergence_
+experiment.md, 7d/66k ticks: a RICH belly consensus loses to the mid at
+settlement in EVERY divergence bucket, Brier gap +0.034 -> +0.116, and the
+mid drifts AWAY from fair at 5-20c divergence, frac-toward 0.38-0.41). C1
+replaces that target, for the belly weight only, with the CURRENT
+sanitized market ladder some `belly_drift_horizon_s` (h, default 3600s)
+LATER than the scored forecasts -- a FULL-SUPPORT (all n+1 buckets, not a
+belly-only subset) drift factor:
+
+    factor_i = sum_j( market_now_bucket[j] * p_i_lag[j] / c_lag[j] )
+
+Why full support: a belly-only SUBSET factor cannot see a pure LEVEL
+divergence (the measured faucet) -- it lives in the always-wing tail
+buckets 0/n (`ladder_to_buckets` makes interior bucket j = p[j-1]-p[j], so
+a uniform level shift cancels there identically) -- and it carries a
+drift-independent static bias on pure martingale data. Over full support
+both bucket vectors sum to 1, so that bias vanishes identically.
+
+Update law (with d = M_lag - P_lag, c_lag = M_lag - w_p*d, target
+M_now = M_lag - alpha*d + e; alpha = fraction of the lagged divergence
+closed toward the pricer by market_now; e = martingale noise):
+
+    factor_market - factor_pricer = (w_p - alpha)*S + sum_j(e_j*d_j/c_lag_j)
+    S = sum_j( d_j^2 / c_lag_j ) >= 0
+
+Martingale data (alpha=0, e=0) always favors the market by construction --
+the legacy subset factor's failure mode (crediting the pricer on pure
+martingale data) is impossible here. The pricer gains weight only when
+alpha > w_p: the update's fixed point is the S-WEIGHTED average fractional
+divergence-close, NOT assumed equal to the raw experiment's frac-toward
+composition -- with a tail-dominated S (see `s_tail_frac` below) the
+equilibrium composition must be MEASURED in shadow before any flip. Noise
+runs ~2x the per-event drift signal but accumulates linearly in n vs
+noise's sqrt(n) (daily SNR ~5 at ~96 events/day): the belly pricer weight
+is therefore a mean-reverting walk AROUND the fixed point under live mode,
+not a convergent constant.
+
+HONEST NAME: this is LADDER-WIDE drift scoring applied to the belly
+weight. On a realistic ladder with the model's known OTM upper-tail
+richness, most of the signal mass S can sit in the two open-tail buckets
+(0 and n) -- `s_tail_frac` is their share of S. If shadow measurement
+shows this is PERSISTENT (median s_tail_frac > 0.6), C1 is measuring tail
+richness, not belly drift -- the recorded fallback design is LADDER-SPACE
+belly scoring (score p-space distances on belly strikes directly, no
+bucket transform, no tail leakage), NOT implemented this wave.
+
+If the wing pricer weight pin is ever retired, this full-support form is
+not automatically safe to extend to the wing region as-is -- the correct
+per-region form is CONDITIONAL RENORMALIZATION (renormalize the target,
+lagged forecasts, and divisor over the region's own bucket idxs);
+recorded, not implemented.
+
+MODES (`MMConfig.belly_score_mode`; the harness, Part B, validates once at
+__init__ and warns; this module itself treats anything not in
+{"shadow","live"} as "legacy" silently, `_resolve_belly_score_mode`):
+  - "legacy": today's behavior exactly; `belly_lag_*` kwargs ignored.
+  - "shadow" (default this wave): the applied belly update stays legacy,
+    on its normal per-refresh cadence -- byte-identical to legacy. The
+    drift factor above, plus a RATE-MATCHED CONTROL factor (identical
+    formula, target = consensus_new_bucket -- the PRE-update whole-ladder
+    consensus -- instead of market_now_bucket; isolates precisely the one
+    variable C1 changes) and `s_tail_frac`, are computed and returned on
+    `AnchorResult` whenever `belly_lag_forecasts`/`belly_lag_consensus`
+    are supplied and pass their own precondition (shape (n+1,), all
+    finite -- independent of, and not gated by, the legacy update's lag-1
+    guard or shape gate).
+  - "live": the drift factor IS the belly update -- applied via the
+    shared `advance_weights()` helper with `belly_drift_temper`, at
+    scoring-event cadence only (a tick with no `belly_lag_*` supplied
+    skips the belly update entirely: weights/update_count unchanged; the
+    legacy per-refresh loop's own belly branch is unconditionally skipped
+    in this mode -- a new 3.3 gate reason -- so the two paths never both
+    write belly on the same tick). Wing is completely untouched by every
+    mode.
+
+`AnchorResult.belly_drift_factors` / `belly_control_factors` /
+`belly_s_tail_frac` are populated together on a successful score (mode
+shadow or live, valid lag inputs, and -- live mode only -- an unfrozen
+belly region with a non-degenerate `advance_weights()` result); on ANY
+skip (mode legacy, lag absent/malformed, a frozen belly in live mode, or a
+degenerate `advance_weights()` result -- or the whole-anchor `_fallback`)
+all three are None and `belly_score_skip` carries the reason (`no_lag` |
+`shape_mismatch` | `non_finite` | `frozen` | `s_le_0` | `fallback`) --
+matching the `bayes_score_log` "NULL on skip" convention (state_store.py)
+so a caller can journal these fields directly.
+
+C2 (recorded, out of scope this wave): settlement-anchored scoring -- the
+persisted `belly_snapshot` history in `state_store.bayes_score_log`
+accumulates exactly the forecast history it would need.
 """
 from __future__ import annotations
 
@@ -161,6 +255,22 @@ class AnchorResult:
     bankroll_states: Dict[str, BankrollState]  # keyed BELLY_REGION/WING_REGION
     forecasts: Dict[str, np.ndarray]  # per-model bucket vectors (feed as prev next)
     consensus_bucket: np.ndarray  # consensus bucket vector (feed as prev next)
+    # C1 belly drift-anchored Bayes scoring (2026-08-13, temp/
+    # mm_c1_belly_drift_plan.md; module docstring "C1" section). Additive,
+    # default None -- existing 4-positional-arg AnchorResult(...) call
+    # sites are unaffected. Populated together on a successful score (mode
+    # shadow or live, valid belly_lag_* inputs, and -- live mode only -- a
+    # non-degenerate advance_weights() result on an unfrozen belly region);
+    # all four are None on ANY skip (mode legacy, absent/malformed lag
+    # kwargs, a frozen belly in live mode, a degenerate advance_weights()
+    # result, or the whole-anchor fallback), with `belly_score_skip`
+    # carrying the reason -- matching the `bayes_score_log` "NULL on skip"
+    # convention (state_store.py) so a caller can journal these fields
+    # directly.
+    belly_drift_factors: Optional[Dict[str, float]] = None
+    belly_control_factors: Optional[Dict[str, float]] = None
+    belly_s_tail_frac: Optional[float] = None
+    belly_score_skip: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -262,6 +372,37 @@ def _apply_floor(weights: np.ndarray, floor: float) -> np.ndarray:
     return out
 
 
+def advance_weights(
+    w_pre: np.ndarray, factors: np.ndarray, temper: float, floor: float,
+) -> Optional[np.ndarray]:
+    """Shared Bayes weight-advance step (C1 review NEW-7): ONE
+    implementation for every path that turns (previous weights, Bayes
+    factors) into (new weights) -- the applied per-region loop below, the
+    C1 live-mode belly drift update, and (harness-owned, Part B) the
+    shadow drift/control hypothetical trajectories. One implementation, no
+    drift between disciplines.
+
+    `factors` must already be validated finite by the CALLER -- every call
+    site runs its own non-finite-factor check first; tempering here must
+    never mask that check (matches the pre-refactor applied-loop sequence
+    exactly, byte-identity instruction c). Applies `factors ** temper`
+    only when `temper < 1.0` (an exact `temper == 1.0` skips the `**`
+    entirely, matching the pre-refactor code rather than merely relying on
+    `x ** 1.0 == x`), multiplies onto `w_pre`, then floors+normalizes via
+    `_apply_floor`. Returns None on the s<=0/non-finite skip (3.3) -- the
+    caller's own weights/update_count are then left unchanged, exactly as
+    the pre-refactor applied loop's own `continue` did.
+    """
+    f = np.asarray(factors, dtype=float)
+    if temper < 1.0:
+        f = f ** temper
+    updated = np.asarray(w_pre, dtype=float) * f
+    s = updated.sum()
+    if not (s > 0.0 and np.isfinite(s)):
+        return None
+    return _apply_floor(updated / s, floor)
+
+
 def _weight_dict(w_arr: np.ndarray, model_ids: List[str]) -> Dict[str, float]:
     return {mid: float(w_arr[i]) for i, mid in enumerate(model_ids)}
 
@@ -333,6 +474,74 @@ def _ladder_space_consensus(
 
 
 # ---------------------------------------------------------------------------
+# C1 belly drift-anchored Bayes scoring helpers (module docstring "C1"
+# section; temp/mm_c1_belly_drift_plan.md)
+# ---------------------------------------------------------------------------
+
+
+def _resolve_belly_score_mode(config) -> str:
+    """Resolve `MMConfig.belly_score_mode`. Anything other than
+    "shadow"/"live" is treated as "legacy" silently (plan S7 -- the
+    harness, Part B, validates once at __init__ and warns; this module's
+    own fallback is silent by design)."""
+    mode = getattr(config, "belly_score_mode", "legacy")
+    return mode if mode in ("shadow", "live") else "legacy"
+
+
+def _belly_drift_temper(config) -> float:
+    """Resolve `MMConfig.belly_drift_temper` for the C1 live-mode belly
+    drift update. Same defensive contract as `_bankroll_update_temper`:
+    missing attribute, non-numeric, non-finite, <= 0, or > 1 all fall back
+    to 1.0 (untempered full-strength drift factors) rather than raising."""
+    raw = getattr(config, "belly_drift_temper", 1.0)
+    try:
+        t = float(raw)
+    except (TypeError, ValueError):
+        return 1.0
+    if not np.isfinite(t) or t <= 0.0 or t > 1.0:
+        return 1.0
+    return t
+
+
+def _belly_lag_precondition(
+    belly_lag_forecasts: Optional[Dict[str, np.ndarray]],
+    belly_lag_consensus: Optional[np.ndarray],
+    model_ids: List[str],
+    n: int,
+) -> Tuple[Optional[np.ndarray], Optional[Dict[str, np.ndarray]], Optional[str]]:
+    """C1's OWN precondition (S3, byte-identity instruction c) --
+    independent of, and NOT gated by, the legacy per-refresh update's lag-1
+    guard or its shape gate: `belly_lag_consensus.shape == (n+1,)`, each
+    `belly_lag_forecasts[mid].shape == (n+1,)`, all finite.
+
+    Returns `(c_lag, per_model_lag, skip_reason)`; `skip_reason` is None on
+    success, in which case the other two are non-None. Never mutates its
+    inputs -- `np.asarray(..., dtype=float)` may return the same object
+    when it is already a float64 array, but nothing here writes back into
+    it (byte-identity instruction b).
+    """
+    expected = (n + 1,)
+    c_lag = np.asarray(belly_lag_consensus, dtype=float)
+    if c_lag.shape != expected:
+        return None, None, "shape_mismatch"
+    per_model: Dict[str, np.ndarray] = {}
+    for mid in model_ids:
+        raw = belly_lag_forecasts.get(mid) if belly_lag_forecasts is not None else None
+        if raw is None:
+            return None, None, "shape_mismatch"
+        arr = np.asarray(raw, dtype=float)
+        if arr.shape != expected:
+            return None, None, "shape_mismatch"
+        per_model[mid] = arr
+    if not np.all(np.isfinite(c_lag)):
+        return None, None, "non_finite"
+    for arr in per_model.values():
+        if not np.all(np.isfinite(arr)):
+            return None, None, "non_finite"
+    return c_lag, per_model, None
+
+
+# ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
@@ -346,6 +555,9 @@ def compute_fair_value(
     prev_forecasts: Optional[Dict[str, np.ndarray]] = None,
     prev_consensus: Optional[np.ndarray] = None,
     ts: Optional[datetime] = None,
+    belly_lag_forecasts: Optional[Dict[str, np.ndarray]] = None,
+    belly_lag_consensus: Optional[np.ndarray] = None,
+    belly_lag_ts: Optional[datetime] = None,
 ) -> AnchorResult:
     """Compute the Beuoy consensus FairValue and updated per-region BankrollStates.
 
@@ -356,6 +568,15 @@ def compute_fair_value(
     consensus bucket vector (SHARED across regions -- forecasts are per-model,
     not per-region); when present (and a region is not frozen) that region's
     bankroll is marked to market before the final consensus is formed.
+    belly_lag_forecasts / belly_lag_consensus / belly_lag_ts: C1 belly
+    drift-anchored Bayes scoring (module docstring "C1" section; default
+    None = legacy). Harness-owned lag buffer entry from ~belly_
+    drift_horizon_s ago (per-model bucket vectors, the consensus bucket
+    vector, and its timestamp). Read only when `config.belly_score_mode`
+    resolves to "shadow"/"live" (`_resolve_belly_score_mode`); ignored
+    entirely otherwise. `belly_lag_ts` is accepted for call-site symmetry
+    with the harness's lag-buffer entry shape (ts, forecasts, consensus)
+    but is not itself consumed by this function's own math.
     """
     now = ts if ts is not None else datetime.now(timezone.utc)
     m_ts = market_ts if market_ts is not None else getattr(snapshot, "ts", now)
@@ -369,6 +590,11 @@ def compute_fair_value(
     pin_raw = float(getattr(config, "wing_pricer_weight_pin", -1.0))
     pinned = 0.0 <= pin_raw <= 1.0
     pin = min(max(pin_raw, floor), 1.0 - floor) if pinned else pin_raw
+    # C1 belly drift-anchored Bayes scoring mode (module docstring "C1"
+    # section). "legacy" (today's behavior) unless belly_score_mode
+    # resolves to "shadow"/"live".
+    score_mode = _resolve_belly_score_mode(config)
+    lag_provided = belly_lag_forecasts is not None or belly_lag_consensus is not None
 
     strikes = sorted(float(s) for s in snapshot.strikes)
     n = len(strikes)
@@ -407,6 +633,7 @@ def compute_fair_value(
         return _fallback(
             snapshot, strikes, raw_ladders, model_ids, bankroll_states,
             weights_by_region_arr, now, m_ts, reason="non-finite inputs or degenerate bankrolls",
+            score_mode=score_mode, lag_provided=lag_provided,
         )
     if pinned and wing_was_degenerate:
         # Self-healing must not be silent: degenerate STORED wing bankrolls
@@ -488,6 +715,17 @@ def compute_fair_value(
                     # Applies regardless of the frozen flag (carried through
                     # untouched either way).
                     continue
+                if region == BELLY_REGION and score_mode == "live":
+                    # C1 (2026-08-13): in live mode belly's applied update
+                    # comes exclusively from the SEPARATE drift block below
+                    # (scoring-event cadence, gated on the belly_lag_*
+                    # kwargs) -- skip here unconditionally (new 3.3 gate
+                    # reason) so the per-refresh legacy path and the
+                    # scoring-event drift path never both write belly on
+                    # the same tick. legacy/shadow never set score_mode to
+                    # "live", so this branch is dead there -- byte-identity
+                    # for those two modes is preserved.
+                    continue
                 state = bankroll_states[region]
                 if state.frozen:
                     continue
@@ -524,23 +762,102 @@ def compute_fair_value(
                 # construction (`ladder_to_buckets` clips at 0), so
                 # factor**t is always real and a zero factor stays zero;
                 # tempering changes the RATE of the weight update, not the
-                # attractor it converges toward.
-                if temper < 1.0:
-                    factors = factors ** temper
+                # attractor it converges toward. Delegates to the shared
+                # `advance_weights` helper (C1 review NEW-7) -- behavior-
+                # identical to the pre-refactor inline sequence (golden
+                # tests).
                 w_pre_arr = np.array([weight_dicts_pre[region][mid] for mid in model_ids])
-                updated = w_pre_arr * factors
-                s = updated.sum()
-                if not (s > 0.0 and np.isfinite(s)):
+                w_upd = advance_weights(w_pre_arr, factors, temper, floor)
+                if w_upd is None:
                     logger.debug(
                         "fair_value_anchor: region %s bankroll update skipped "
                         "(factor sum s_R <= 0 or non-finite)", region,
                     )
                     continue  # 3.3: s_R <= 0 or non-finite -> skip
-                w_upd = _apply_floor(updated / s, floor)
                 new_bankrolls = _weight_dict(w_upd, model_ids)
                 new_bankrolls_by_region[region] = new_bankrolls
                 weight_dicts_post[region] = new_bankrolls
                 update_counts[region] += 1
+
+    # --- C1 belly drift-anchored Bayes scoring (module docstring "C1"
+    # section; temp/mm_c1_belly_drift_plan.md). A SEPARATE block, after the
+    # per-region applied loop above, sharing none of its loop-local
+    # variables (byte-identity instruction a); no in-place numpy ops on
+    # `forecasts[...]` or the `belly_lag_*` arrays (instruction b); its own
+    # precondition below (S3, `_belly_lag_precondition`) -- NOT gated by
+    # the lag-1 guard just above or its shape check (instruction c), so a
+    # live-mode belly drift update can fire even with no lag-1 history
+    # (prev_forecasts/prev_consensus both None).
+    belly_drift_factors: Optional[Dict[str, float]] = None
+    belly_control_factors: Optional[Dict[str, float]] = None
+    belly_s_tail_frac: Optional[float] = None
+    belly_score_skip: Optional[str] = None
+    if score_mode in ("shadow", "live"):
+        if belly_lag_forecasts is None or belly_lag_consensus is None:
+            belly_score_skip = "no_lag"
+        else:
+            c_lag, lag_per_model, shape_reason = _belly_lag_precondition(
+                belly_lag_forecasts, belly_lag_consensus, model_ids, n,
+            )
+            if shape_reason is not None:
+                belly_score_skip = shape_reason
+            else:
+                market_now_bucket = forecasts[MARKET_MODEL_ID]
+                # PRE-update whole-ladder consensus (control track target,
+                # review NEW-2): its OWN computation here, deliberately not
+                # reusing the applied loop's `consensus_new_bucket` local
+                # (which may not even have run this tick) -- instruction a.
+                control_target = ladder_to_buckets(
+                    _ladder_space_consensus(weight_dicts_pre, region_of_strike, recon, model_ids)
+                )
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    drift_arr = np.array([
+                        float(np.sum(market_now_bucket * lag_per_model[mid] / c_lag))
+                        for mid in model_ids
+                    ])
+                    control_arr = np.array([
+                        float(np.sum(control_target * lag_per_model[mid] / c_lag))
+                        for mid in model_ids
+                    ])
+                if not (np.all(np.isfinite(drift_arr)) and np.all(np.isfinite(control_arr))):
+                    # A zero/degenerate c_lag entry naturally produces a
+                    # non-finite factor here (0/0 -> nan, x/0 -> inf), same
+                    # discipline as the legacy per-region loop above.
+                    belly_score_skip = "non_finite"
+                else:
+                    # s_tail_frac (review NEW-1): d_j = M_lag[j] - P_lag[j]
+                    # over the FULL lag pair (not this tick's market/
+                    # pricer); S = sum_j(d_j^2 / c_lag_j); share of S from
+                    # the two open-tail buckets (0 and n).
+                    d = lag_per_model[MARKET_MODEL_ID] - lag_per_model[PRICER_MODEL_ID]
+                    with np.errstate(divide="ignore", invalid="ignore"):
+                        s_terms = d * d / c_lag
+                    S = float(np.sum(s_terms))
+                    tail_frac = 0.0 if S == 0.0 else float((s_terms[0] + s_terms[-1]) / S)
+
+                    if score_mode == "live":
+                        belly_state_now = bankroll_states[BELLY_REGION]
+                        if belly_state_now.frozen:
+                            belly_score_skip = "frozen"
+                        else:
+                            w_pre_belly = np.array(
+                                [weight_dicts_pre[BELLY_REGION][mid] for mid in model_ids]
+                            )
+                            w_upd_belly = advance_weights(
+                                w_pre_belly, drift_arr, _belly_drift_temper(config), floor,
+                            )
+                            if w_upd_belly is None:
+                                belly_score_skip = "s_le_0"
+                            else:
+                                new_bankrolls = _weight_dict(w_upd_belly, model_ids)
+                                new_bankrolls_by_region[BELLY_REGION] = new_bankrolls
+                                weight_dicts_post[BELLY_REGION] = new_bankrolls
+                                update_counts[BELLY_REGION] += 1
+
+                    if belly_score_skip is None:
+                        belly_drift_factors = _weight_dict(drift_arr, model_ids)
+                        belly_control_factors = _weight_dict(control_arr, model_ids)
+                        belly_s_tail_frac = tail_frac
 
     # --- Step 3.5: FINAL consensus with POST-update weights (same pipeline). ---
     final_ladder = _ladder_space_consensus(weight_dicts_post, region_of_strike, recon, model_ids)
@@ -560,6 +877,7 @@ def compute_fair_value(
         return _fallback(
             snapshot, strikes, raw_ladders, model_ids, bankroll_states,
             weights_by_region_arr, now, m_ts, reason="per-strike sanity-bound violation",
+            score_mode=score_mode, lag_provided=lag_provided,
         )
 
     n_belly = sum(1 for r in region_of_strike if r == BELLY_REGION)
@@ -586,7 +904,13 @@ def compute_fair_value(
             frozen=wing_state.frozen,
         ),
     }
-    return AnchorResult(fv, new_states, forecasts, consensus_bucket)
+    return AnchorResult(
+        fv, new_states, forecasts, consensus_bucket,
+        belly_drift_factors=belly_drift_factors,
+        belly_control_factors=belly_control_factors,
+        belly_s_tail_frac=belly_s_tail_frac,
+        belly_score_skip=belly_score_skip,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -597,9 +921,18 @@ def compute_fair_value(
 def _fallback(
     snapshot, strikes, raw_ladders, model_ids, bankroll_states,
     weights_by_region, now, m_ts, reason,
+    score_mode: str = "legacy", lag_provided: bool = False,
 ) -> AnchorResult:
     """FIXED_BLEND w=0.5 per strike; freeze BOTH region bankrolls (fallback is
-    a whole-ladder event, plan step 8); warn (risk 8.8)."""
+    a whole-ladder event, plan step 8); warn (risk 8.8).
+
+    C1 (module docstring "C1" section): the new AnchorResult belly_drift_*/
+    belly_control_*/belly_s_tail_frac fields are always None here (the
+    whole-anchor fallback is not a belly-specific event); `belly_score_skip`
+    is "fallback" when the caller's belly_score_mode resolved to "shadow"/
+    "live" AND belly_lag_* kwargs were supplied this tick (score_mode/
+    lag_provided, threaded from the caller), else None (nothing was ever
+    requested to skip)."""
     logger.warning("fair_value_anchor degeneracy -> FIXED_BLEND_FALLBACK: %s", reason)
     pricer_p = raw_ladders[PRICER_MODEL_ID]
     market_p = raw_ladders[MARKET_MODEL_ID]
@@ -641,7 +974,11 @@ def _fallback(
         )
     n = len(strikes)
     forecasts = {m: ladder_to_buckets(raw_ladders.get(m, np.zeros(n))) for m in model_ids}
-    return AnchorResult(fv, frozen_states, forecasts, ladder_to_buckets(blend))
+    belly_score_skip = "fallback" if (score_mode in ("shadow", "live") and lag_provided) else None
+    return AnchorResult(
+        fv, frozen_states, forecasts, ladder_to_buckets(blend),
+        belly_score_skip=belly_score_skip,
+    )
 
 
 def _build_fair_value(

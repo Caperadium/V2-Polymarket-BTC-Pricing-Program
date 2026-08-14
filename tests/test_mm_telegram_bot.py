@@ -317,3 +317,52 @@ def test_reply_truncation(env, monkeypatch):
     reply = bot.handle_command("/status", src)
     assert len(reply) < 4096
     assert reply.endswith("[truncated]")
+
+
+# ---------------------------------------------------------------------------
+# C1 shadow belly weight lines (/status + /bankroll)
+# ---------------------------------------------------------------------------
+
+
+def _bankroll_state(w_pricer: float, n: int = 5):
+    from market_maker.contracts import BankrollState
+    return BankrollState(
+        model_ids=["pricer", "market"],
+        bankrolls={"pricer": w_pricer, "market": 1.0 - w_pricer},
+        last_update=NOW, update_count=n, frozen=False)
+
+
+def test_c1_lines_absent_without_shadow_rows(env):
+    src, store = env
+    # plain belly rows alone are not C1 information
+    store.append_bankroll_state("2026-07-13", _bankroll_state(0.9), region="belly")
+    assert "C1" not in bot.cmd_status(src)
+    assert "C1" not in bot.cmd_bankroll(src)
+
+
+def test_c1_lines_present_with_shadow_rows(env):
+    src, store = env
+    store.append_bankroll_state("2026-07-13", _bankroll_state(0.87, 100), region="belly")
+    store.append_bankroll_state("2026-07-13", _bankroll_state(0.52, 12),
+                                region="belly_drift_shadow")
+    store.append_bankroll_state("2026-07-13", _bankroll_state(0.55, 12),
+                                region="belly_legacy_control")
+    # stale earlier row must lose to the latest per (expiry, region)
+    store.append_bankroll_state("2026-07-13", _bankroll_state(0.48, 13),
+                                region="belly_drift_shadow")
+
+    status = bot.cmd_status(src)
+    assert "C1 shadow belly w:" in status
+    assert "07-13 0.48(n13)" in status
+
+    br = bot.cmd_bankroll(src)
+    assert "C1 belly pricer w (applied/shadow/control):" in br
+    assert "2026-07-13: 0.87 / 0.48 / 0.55 (events 13)" in br
+
+
+def test_c1_lines_missing_control_renders_dash(env):
+    src, store = env
+    store.append_bankroll_state("2026-07-13", _bankroll_state(0.52, 3),
+                                region="belly_drift_shadow")
+    br = bot.cmd_bankroll(src)
+    assert "2026-07-13: - / 0.52 / - (events 3)" in br

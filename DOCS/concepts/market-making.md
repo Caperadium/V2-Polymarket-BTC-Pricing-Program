@@ -445,6 +445,51 @@ The floor, normalization, and skip rules of Sections 4.3-4.4 are
 unaffected. `bankroll_update_temper = 1.0` is exact legacy (untempered)
 Bayes.
 
+### 4.8 C1: mid-drift-anchored belly scoring (2026-08-13, SHADOW)
+
+The attractor fix Section 4.7 could not deliver. The belly Bayes factor's
+target is swapped from the consensus echo to external reality: model
+forecasts from `belly_drift_horizon_s` (1h) ago are scored against the
+market's own sanitized bucket distribution *now*, over the FULL n+1 bucket
+vector:
+
+```
+factor_i = sum_j( market_now_bucket[j] * p_i_lag[j] / c_lag[j] )
+```
+
+Full support matters twice over: interior buckets are ladder *differences*,
+so a level divergence (the measured faucet -- consensus 0.35 vs mid
+0.21-0.29, temp/mm_belly_divergence_experiment.md) is visible only in the
+tail buckets; and over full support the drift-independent mass bias cancels
+identically, so on martingale data the market model always wins. The clean
+law (d = lagged market-minus-pricer buckets, alpha = fraction of the
+divergence the mid closes toward the pricer over h, e = martingale noise):
+
+```
+factor_market - factor_pricer = (w_p - alpha) * S + noise,
+S = sum_j( d_j^2 / c_lag_j ) >= 0
+```
+
+The pricer gains iff `alpha > w_p`: the dynamic has an **interior fixed
+point** at the S-weighted average close -- the attractor moves off the
+0.98/0.02 corner for the first time. Honesty note: on realistic ladders
+~80% of S sits in the two tail buckets (the known OTM richness), so this is
+*ladder-wide* drift scoring applied to the belly weight; the journaled
+`s_tail_frac` measures whether that composition is acceptable, and
+ladder-space belly scoring is the recorded fallback design if it is not.
+
+Rollout is shadow-first (`MMConfig.belly_score_mode`, default `"shadow"`):
+the applied belly update stays legacy; scoring events (every
+`belly_drift_interval_s` = 900s, lag within [h, h+slack]) journal drift
+factors plus a rate-matched control (legacy target on the *same* lag-h
+pair -- isolates exactly the target swap) into the `bayes_score_log` table,
+and two hypothetical bankroll trajectories persist under region keys
+`belly_drift_shadow` / `belly_legacy_control`. Six quantified acceptance
+criteria (temp/mm_c1_belly_drift_plan.md) gate the one-line flip to
+`"live"`; `"legacy"` is the exact kill switch. The wing pin (4.6) is
+untouched; retiring it would require conditional renormalization of the
+factor within regions (recorded, not built).
+
 ---
 
 ## 5. A change of coordinates: log-odds space

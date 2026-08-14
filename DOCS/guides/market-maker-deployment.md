@@ -133,6 +133,9 @@ pull + restart, no config-file change needed.
 | `skew_q_norm` (20.0) | Normalizes inventory shares into skew units: the harness passes `q / skew_q_norm` to the quote engine and divides `unit_skew_x` the same way (2026-08-13 bleed-2 fix -- raw shares pinned the skew cap with 3-5 shares) | `1.0` restores legacy raw-share skew exactly |
 | `post_only_margin_ticks` (1) | Post-only book clamp (`spread_builder.post_only_clamp`, applied post-PAV): desired bid capped at `best_ask - N*tick`, desired ask floored at `best_bid + N*tick`; clamp displacement journaled as `post_only_bid`/`post_only_ask` terms keys | `<= 0` disables the clamp exactly (0 is deliberately disabled -- margin 0 would match/take) |
 | `bankroll_update_temper` (0.1) | Tempers each region's per-tick Bayes factor (`factors ** t`) before the bankroll weight update in `fair_value_anchor.compute_fair_value` (Market Making 4.7) | `1.0` restores legacy (untempered) Bayes speed |
+| `belly_score_mode` ("shadow") | C1 mid-drift belly Bayes scoring (Market Making 4.8): "shadow" journals drift + control factors and hypothetical trajectories without touching applied weights; "live" makes the drift factors the belly update | `"legacy"` restores current belly Bayes exactly |
+| `belly_drift_horizon_s` (3600) / `belly_drift_interval_s` (900) / `belly_drift_max_slack_s` (900) | C1 scoring lag horizon, event cadence, and lag-entry acceptance window | n/a (only consulted when `belly_score_mode` != "legacy") |
+| `belly_drift_temper` (0.3) | Tempering for C1 drift/control factors (placeholder, calibrated from shadow data; speed levers in order: temper toward 1.0, then cadence) | `1.0` = untempered drift factors |
 
 ## Checking status
 
