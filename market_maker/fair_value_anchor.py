@@ -503,6 +503,35 @@ def _belly_drift_temper(config) -> float:
     return t
 
 
+def _smooth_buckets(v: np.ndarray, eps: float) -> np.ndarray:
+    """Additive-smoothing regularizer for a bucket probability vector:
+    (v + eps) / (1 + len(v)*eps). 2026-08-21 acceptance-review fix for the
+    measured 31% non_finite scoring-event skip rate (zero buckets from flat
+    ladder segments zeroed the c_lag divisor). Preserves full support (no
+    zero buckets -> finite Bayes ratios), preserves sum == 1, and keeps the
+    full-support mass-cancellation property intact: smoothed normalized
+    vectors still each sum to 1, so dMass == 0 and martingale data still
+    always favors the market model (module docstring C1 law). eps <= 0
+    returns `v` unchanged (legacy: a zero bucket -> non_finite skip).
+    Consumed ONLY by the C1 drift/control block -- never by the legacy
+    applied Bayes loop, whose step-3.3 divisor skip rules are load-bearing.
+    """
+    e = _finite_scalar(eps)
+    if e <= 0.0:
+        return v
+    return (v + e) / (1.0 + v.size * e)
+
+
+def _finite_scalar(v) -> float:
+    """Coerce to a finite float (0.0 on garbage) -- local guard for the
+    smoothing epsilon so a NaN config value disables rather than poisons."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return 0.0
+    return f if np.isfinite(f) else 0.0
+
+
 def _belly_lag_precondition(
     belly_lag_forecasts: Optional[Dict[str, np.ndarray]],
     belly_lag_consensus: Optional[np.ndarray],
@@ -802,21 +831,30 @@ def compute_fair_value(
             if shape_reason is not None:
                 belly_score_skip = shape_reason
             else:
-                market_now_bucket = forecasts[MARKET_MODEL_ID]
+                # 2026-08-21 acceptance-review fix: additive-smooth every
+                # bucket vector entering the drift/control ratios (see
+                # _smooth_buckets; config.belly_drift_bucket_eps, <= 0 =
+                # legacy skip-on-zero). Smoothing ALL vectors -- divisor
+                # and numerators alike -- keeps each normalized, so the
+                # full-support dMass == 0 cancellation survives.
+                eps = getattr(config, "belly_drift_bucket_eps", 0.0)
+                c_lag_s = _smooth_buckets(c_lag, eps)
+                lag_s = {mid: _smooth_buckets(lag_per_model[mid], eps) for mid in model_ids}
+                market_now_bucket = _smooth_buckets(forecasts[MARKET_MODEL_ID], eps)
                 # PRE-update whole-ladder consensus (control track target,
                 # review NEW-2): its OWN computation here, deliberately not
                 # reusing the applied loop's `consensus_new_bucket` local
                 # (which may not even have run this tick) -- instruction a.
-                control_target = ladder_to_buckets(
+                control_target = _smooth_buckets(ladder_to_buckets(
                     _ladder_space_consensus(weight_dicts_pre, region_of_strike, recon, model_ids)
-                )
+                ), eps)
                 with np.errstate(divide="ignore", invalid="ignore"):
                     drift_arr = np.array([
-                        float(np.sum(market_now_bucket * lag_per_model[mid] / c_lag))
+                        float(np.sum(market_now_bucket * lag_s[mid] / c_lag_s))
                         for mid in model_ids
                     ])
                     control_arr = np.array([
-                        float(np.sum(control_target * lag_per_model[mid] / c_lag))
+                        float(np.sum(control_target * lag_s[mid] / c_lag_s))
                         for mid in model_ids
                     ])
                 if not (np.all(np.isfinite(drift_arr)) and np.all(np.isfinite(control_arr))):
@@ -828,10 +866,12 @@ def compute_fair_value(
                     # s_tail_frac (review NEW-1): d_j = M_lag[j] - P_lag[j]
                     # over the FULL lag pair (not this tick's market/
                     # pricer); S = sum_j(d_j^2 / c_lag_j); share of S from
-                    # the two open-tail buckets (0 and n).
-                    d = lag_per_model[MARKET_MODEL_ID] - lag_per_model[PRICER_MODEL_ID]
+                    # the two open-tail buckets (0 and n). Uses the same
+                    # smoothed vectors as the factors (consistency: the
+                    # diagnostic must describe the S actually scored).
+                    d = lag_s[MARKET_MODEL_ID] - lag_s[PRICER_MODEL_ID]
                     with np.errstate(divide="ignore", invalid="ignore"):
-                        s_terms = d * d / c_lag
+                        s_terms = d * d / c_lag_s
                     S = float(np.sum(s_terms))
                     tail_frac = 0.0 if S == 0.0 else float((s_terms[0] + s_terms[-1]) / S)
 

@@ -481,6 +481,25 @@ class MMConfig:
     belly_drift_interval_s: float = 900.0  # scoring-event cadence (harness-owned event gate)
     belly_drift_max_slack_s: float = 900.0  # max staleness of a lag-h buffer entry still accepted as an event
     belly_drift_temper: float = 0.3  # EXPLICIT PLACEHOLDER pending shadow calibration; see speed law above
+    # Additive-smoothing epsilon for the C1 drift/control bucket ratios
+    # (2026-08-21 acceptance-review fix): the first 7d of shadow measured a
+    # 31% scoring-event skip rate, all `non_finite` -- flat adjacent ladder
+    # values (deep wings pinned at p_clamp, quantized plateaus) produce ZERO
+    # buckets, and a zero c_lag divisor made the whole event skip. Each
+    # bucket vector consumed by the drift/control ratios (c_lag, the lagged
+    # per-model forecasts, market_now, control target) is smoothed as
+    # (v + eps) / (1 + len(v)*eps): full support restored (no zero
+    # divisors), sum stays 1, and the full-support mass-cancellation that
+    # makes martingale data favor the market model (dMass == 0) is
+    # PRESERVED -- smoothed normalized vectors still each sum to 1. A
+    # genuinely dead bucket contributes an eps-scale term instead of
+    # killing the event. Distortion is (n+1)*eps ~ 1e-5 on a 12-bucket
+    # ladder -- far below the per-event noise floor. Sentinel: <= 0
+    # DISABLES smoothing exactly (legacy zero-bucket -> non_finite skip).
+    # Applied ONLY in the drift/control block -- the legacy applied Bayes
+    # loop's divisor discipline is untouched (its per-region skip rules are
+    # load-bearing, module docstring step 3.3).
+    belly_drift_bucket_eps: float = 1.0e-6
 
 
 def in_belly_band(p: float, belly_band: Tuple[float, float]) -> bool:

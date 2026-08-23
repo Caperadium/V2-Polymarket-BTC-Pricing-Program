@@ -117,7 +117,7 @@ def test_level_shift_response_full_support_vs_subset_regression_guard():
     m_lag_bucket = c_lag.copy()  # any valid bucket vector; unused by the pricer-only assertions below
     p_base_p = np.array([0.90, 0.65, 0.45, 0.30, 0.15])
 
-    cfg = MMConfig(belly_score_mode="shadow")
+    cfg = MMConfig(belly_score_mode="shadow", belly_drift_bucket_eps=0.0)  # exact-golden: unsmoothed algebra
     factors = {}
     subset_idx = [1, 2, 3, 4]  # belly-only interior buckets (v1 form)
     subset = {}
@@ -158,7 +158,7 @@ def test_martingale_market_never_loses_to_pricer():
     p_lag = ladder_to_buckets(np.array(pricer_lag))
     c_lag = 0.5 * (m_lag + p_lag)
 
-    cfg = MMConfig(belly_score_mode="shadow")
+    cfg = MMConfig(belly_score_mode="shadow", belly_drift_bucket_eps=0.0)  # exact-golden: unsmoothed algebra
     res = compute_fair_value(
         _snapshot(strikes, mids_lag), _mids(strikes, mids_lag), _states(), cfg,
         belly_lag_forecasts={MARKET_MODEL_ID: m_lag, PRICER_MODEL_ID: p_lag},
@@ -819,3 +819,97 @@ def test_bayes_score_log_migration_on_pre_existing_db(tmp_path):
     assert len(got) == 1
     assert got[0].model_id == "pricer"
     s2.close()
+
+
+# ---------------------------------------------------------------------------
+# Bucket-smoothing epsilon (2026-08-21 acceptance-review fix): zero buckets
+# no longer skip the event; legacy sentinel preserved; law invariants hold.
+# ---------------------------------------------------------------------------
+
+
+def _zero_bucket_inputs():
+    """Lag pair with a genuinely ZERO bucket (flat adjacent ladder values),
+    the measured cause of the 31% non_finite skip rate on the VPS."""
+    strikes = [1.0, 2.0, 3.0, 4.0]
+    # flat segment: p[0] == p[1] -> interior bucket 1 is exactly 0 in both
+    # the lag consensus and the lagged forecasts.
+    p_flat = np.array([0.90, 0.90, 0.40, 0.10])
+    c_lag = ladder_to_buckets(p_flat)
+    assert float(c_lag[1]) == 0.0  # precondition of the scenario
+    lag = {MARKET_MODEL_ID: ladder_to_buckets(p_flat),
+           PRICER_MODEL_ID: ladder_to_buckets(np.array([0.92, 0.91, 0.45, 0.12]))}
+    mids_p = p_flat
+    return strikes, mids_p, lag, c_lag
+
+
+def test_smooth_buckets_unit():
+    from market_maker.fair_value_anchor import _smooth_buckets
+    v = np.array([0.0, 0.5, 0.5, 0.0])
+    s = _smooth_buckets(v, 1e-6)
+    assert s.sum() == pytest.approx(1.0, abs=1e-12)
+    assert np.all(s > 0.0)
+    # sentinel: eps <= 0 (and NaN) return the input unchanged
+    assert _smooth_buckets(v, 0.0) is v
+    assert _smooth_buckets(v, -1.0) is v
+    assert _smooth_buckets(v, float("nan")) is v
+
+
+def test_zero_bucket_event_scores_with_default_eps():
+    strikes, mids_p, lag, c_lag = _zero_bucket_inputs()
+    cfg = MMConfig(belly_score_mode="shadow")  # default eps 1e-6
+    res = compute_fair_value(
+        _snapshot(strikes, mids_p), _mids(strikes, mids_p), _states(), cfg,
+        belly_lag_forecasts=lag, belly_lag_consensus=c_lag,
+    )
+    assert res.belly_score_skip is None
+    for f in res.belly_drift_factors.values():
+        assert np.isfinite(f) and 1e-3 <= f <= 1e3
+    for f in res.belly_control_factors.values():
+        assert np.isfinite(f)
+    assert res.belly_s_tail_frac is not None and np.isfinite(res.belly_s_tail_frac)
+
+
+def test_zero_bucket_event_skips_with_eps_sentinel_off():
+    strikes, mids_p, lag, c_lag = _zero_bucket_inputs()
+    cfg = MMConfig(belly_score_mode="shadow", belly_drift_bucket_eps=0.0)
+    res = compute_fair_value(
+        _snapshot(strikes, mids_p), _mids(strikes, mids_p), _states(), cfg,
+        belly_lag_forecasts=lag, belly_lag_consensus=c_lag,
+    )
+    assert res.belly_score_skip == "non_finite"
+    assert res.belly_drift_factors is None
+
+
+def test_martingale_invariant_survives_smoothing_with_zero_buckets():
+    # M_now == M_lag with a zero bucket present: market factor must still
+    # be >= pricer factor (the dMass == 0 cancellation must survive the
+    # smoothing -- all vectors smoothed, all stay normalized).
+    strikes, mids_p, lag, c_lag = _zero_bucket_inputs()
+    cfg = MMConfig(belly_score_mode="shadow")
+    res = compute_fair_value(
+        _snapshot(strikes, mids_p), _mids(strikes, mids_p), _states(), cfg,
+        belly_lag_forecasts=lag, belly_lag_consensus=c_lag,
+    )
+    assert res.belly_score_skip is None
+    assert res.belly_drift_factors["market"] >= res.belly_drift_factors["pricer"]
+
+
+def test_smoothing_distortion_negligible_without_zero_buckets():
+    # On a ladder with no zero buckets, eps 1e-6 must move the factors by
+    # less than 1e-4 vs the unsmoothed computation.
+    strikes = [1.0, 2.0, 3.0, 4.0, 5.0]
+    p_mid = np.array([0.90, 0.65, 0.45, 0.30, 0.15])
+    lag = {MARKET_MODEL_ID: ladder_to_buckets(p_mid),
+           PRICER_MODEL_ID: ladder_to_buckets(p_mid + 0.03)}
+    c_lag = ladder_to_buckets(p_mid + 0.015)
+    out = {}
+    for eps in (0.0, 1e-6):
+        cfg = MMConfig(belly_score_mode="shadow", belly_drift_bucket_eps=eps)
+        res = compute_fair_value(
+            _snapshot(strikes, p_mid), _mids(strikes, p_mid), _states(), cfg,
+            belly_lag_forecasts=lag, belly_lag_consensus=c_lag,
+        )
+        assert res.belly_score_skip is None
+        out[eps] = res.belly_drift_factors
+    for mid_ in ("pricer", "market"):
+        assert out[1e-6][mid_] == pytest.approx(out[0.0][mid_], abs=1e-4)
